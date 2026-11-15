@@ -1,0 +1,94 @@
+// type functions with logic in them, types as values, and generic structs with lets and nested types
+
+import std.io;
+import std.list;
+import std.heap;
+
+fn Int(comptime bits: u16) -> type {
+    if (bits <= 8) { return u8; }
+    if (bits <= 16) { return u16; }
+    if (bits <= 32) { return u32; }
+    return u64;
+}
+
+fn log2(n: usize) -> usize {
+    var k: usize = 0;
+    var x = n;
+    while (x > 1) { x /= 2; k += 1; }
+    return k;
+}
+
+// lets computed from the parameters are known at compile time, so types can use them
+fn BitSet(comptime n: usize) -> type {
+    let words = (n + 63) / 64;
+    let shift = log2(64);
+    return struct {
+        w: [words]u64 = @splat(0),
+        let count: usize = n;
+        let SHIFT: usize = shift;
+
+        fn set(self: *Self, i: usize) { self.w[i >> Self.SHIFT] |= (1 as u64) << ((i & 63) as u64); }
+        fn get(self: Self, i: usize) -> bool { return (self.w[i >> Self.SHIFT] >> ((i & 63) as u64)) & 1 == 1; }
+    };
+}
+
+fn Tree(comptime T: type) -> type {
+    return struct {
+        root: ?*Node = null,
+        let empty: []const u8 = "(empty)";
+
+        struct Node {
+            value: T,
+            left: ?*Node = null,
+            right: ?*Node = null,
+        }
+
+        fn depth(n: ?*Node) -> usize {
+            if (n) |x| {
+                let l = Self.depth(x.left);
+                let r = Self.depth(x.right);
+                return 1 + (if (l > r) l else r);
+            }
+            return 0;
+        }
+    };
+}
+
+fn Pick(comptime wide: bool) -> type {
+    if (wide) { return struct { a: u64, b: u64 }; }
+    return struct { a: u8 };
+}
+
+let IntList = list.ArrayList(i32);   // a type, named at the top level
+
+fn main() -> !void {
+    let T = Int(12);
+    let x: T = 4000;
+    try io.print("{s} {s} {s} {}\n", .{ @typeName(T), @typeName(Int(3)), @typeName(Int(40)), x });
+    comptime {
+        assert(Int(16) == u16);
+        assert(Int(17) != u16);
+    }
+
+    var b: BitSet(130) = .{};
+    b.set(3);
+    b.set(129);
+    try io.print("{} {} {} words={} count={}\n", .{ b.get(3), b.get(4), b.get(129), b.w.len, BitSet(130).count });
+
+    var n3 = Tree(i32).Node { value: 3 };
+    var n1: Tree(i32).Node = .{ value: 1, left: &n3 };
+    let t = Tree(i32) { root: &n1 };
+    try io.print("depth {} {s}\n", .{ Tree(i32).depth(t.root), Tree(i32).empty });
+    try io.print("{} {}\n", .{ @sizeOf(Pick(true)), @sizeOf(Pick(false)) });
+
+    var gpa = heap.DebugAllocator.init();
+    defer _ = gpa.deinit();
+    var xs = IntList.init(gpa.allocator());
+    defer xs.deinit();
+    try xs.append(5);
+    let L = list.ArrayList(u8);
+    var ys = L.init(gpa.allocator());
+    defer ys.deinit();
+    try ys.append('z');
+    try io.print("{} {s} {s}\n", .{ xs.items[0], ys.items, @typeName(L) });
+}

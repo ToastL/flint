@@ -1,0 +1,7 @@
+import std.io;
+
+fn main() -> !void {
+    let a: u64 = 3;
+    let b: usize = a;
+    try io.print("{}\n", .{b});
+}

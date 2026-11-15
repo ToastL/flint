@@ -1,0 +1,1 @@
+expected '(' after 'if': conditions are written if (cond) { ... }

@@ -1,0 +1,38 @@
+// comptime across modules: a pub type alias, a type function with lets, comptime results with pointers
+import std.io;
+import std.heap;
+import geo;
+
+fn twice(comptime T: type) -> usize { return comptime @sizeOf(T) * 2; }
+
+struct Entry { key: []const u8, next: ?*const Entry }
+
+let CHAIN = comptime makeChain();
+fn makeChain() -> [3]Entry {
+    var e: [3]Entry = undefined;
+    e[2] = .{ key: "c", next: null };
+    e[1] = .{ key: "b", next: null };
+    e[0] = .{ key: "a", next: null };
+    return e;
+}
+
+fn digits() -> [10]u8 {
+    var buf: [10]u8 = undefined;
+    for (0..10) |i| { buf[i] = '0' + (i as u8); }
+    return buf;
+}
+let DIGITS = comptime digits();
+let DSLICE: []const u8 = comptime DIGITS[2..5];
+
+fn main() -> !void {
+    try io.print("{} {}\n", .{ twice(u32), twice(geo.Point) });
+    var gpa = heap.DebugAllocator.init();
+    defer _ = gpa.deinit();
+    var ps = geo.Points.init(gpa.allocator());
+    defer ps.deinit();
+    try ps.append(.{ x: 1, y: 2 });
+    var g: geo.Grid(3) = .{};
+    try io.print("{} {} {} {s}\n", .{ ps.items[0].y, g.c.len, geo.Grid(3).size, CHAIN[1].key });
+    try io.print("{s} {s}\n", .{ DIGITS[..], DSLICE });
+}
+

@@ -1,0 +1,1 @@
+'as' converts numbers; use '@ptrToInt(p)' for a pointer's address

@@ -1,0 +1,249 @@
+// cimport.header - import c "stdio.h" as c;  (design.md section 4.15)
+//
+// The header goes through the system C preprocessor (`cc -E`), and cimport.cparse reads the
+// declarations it produces. `cc -dM -E` lists the macros; the ones that are simple constants
+// (numbers, strings) become constants. Nothing is translated to Flint until it's used (sema does
+// that), and a declaration Flint can't use (a va_list parameter, a bit field, a function-like
+// macro) is only an error if the program uses it.
+
+import std.fs;
+import std.heap;
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import modules.unit;
+import modules.load;
+import cimport.ctypes;
+import cimport.clex;
+import cimport.cparse;
+
+extern fn pipe(fds: *[2]i32) -> i32;
+extern fn fork() -> i32;
+extern fn dup2(a: i32, b: i32) -> i32;
+extern fn close(fd: i32) -> i32;
+extern fn open(path: cstr, flags: i32, ...) -> i32; // variadic in C: the mode goes on the stack
+extern fn execvp(file: cstr, argv: [*]?cstr) -> i32;
+extern fn _exit(code: i32) -> noreturn;
+extern fn read(fd: i32, buf: [*]u8, n: usize) -> isize;
+extern fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+extern fn strtod(s: cstr, end: *[*]u8) -> f64;
+
+// every header read so far (the same header with the same include directories is read once)
+var headers: alloc.Vec(*ctypes.CHeader) = @zeroes(alloc.Vec(*ctypes.CHeader));
+
+pub fn name(h: *ctypes.CHeader) -> []const u8 { return h.name; }
+
+// runs argv; its stdout comes back (null if it failed), its stderr goes to errfile
+fn runCapture(argv: []const []const u8, errfile: []const u8) -> ?[]const u8 {
+    var fds: [2]i32 = undefined;
+    if (pipe(&fds) != 0) { return null; }
+    let cargs = alloc.make(?cstr, argv.len + 1);
+    for (0..argv.len) |i| { cargs[i] = text.z(argv[i]); }
+    let efile = text.z(errfile);
+    let pid = fork();
+    if (pid == 0) {
+        let mode: i32 = 0o644;
+        let ef = open(efile, 0x601, mode); // O_WRONLY | O_CREAT | O_TRUNC
+        if (ef >= 0) { _ = dup2(ef, 2); }
+        _ = dup2(fds[1], 1);
+        _ = close(fds[0]);
+        _ = close(fds[1]);
+        _ = execvp(cargs[0].?, cargs.ptr);
+        _exit(127);
+    }
+    _ = close(fds[1]);
+    var out: text.Buf = .{};
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        let got = read(fds[0], &buf, buf.len);
+        if (got <= 0) { break; }
+        out.add(buf[0..got as usize]);
+    }
+    _ = close(fds[0]);
+    var st: i32 = 0;
+    _ = waitpid(pid, &st, 0);
+    if ((st & 0x7f) != 0 || ((st >> 8) & 0xff) != 0) { return null; }
+    return out.items;
+}
+
+fn isIdent(c: u8) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+fn readMacros(h: *ctypes.CHeader, src: []const u8) {
+    var p: usize = 0;
+    while (p < src.len) {
+        let e = if (text.indexOf(src[p..], '\n')) |i| p + i else src.len;
+        if (text.startsWith(src[p..e], "#define ")) {
+            let s = p + 8;
+            var q = s;
+            while (q < e && isIdent(src[q])) { q += 1; }
+            let nm = src[s..q];
+            var body: ?[]const u8 = null;
+            if (!(q < e && src[q] == '(')) { // not function-like
+                while (q < e && (src[q] == ' ' || src[q] == '\t')) { q += 1; }
+                body = src[q..e];
+            }
+            h.mnames.push(nm);
+            h.mbodies.push(body);
+        }
+        p = if (e < src.len) e + 1 else e;
+    }
+}
+
+// Reads a header (once per header and include directories).
+pub fn readHeader(header: []const u8, from: *unit.Unit, tok: *token.Token) -> *ctypes.CHeader {
+    var dir: []const u8 = ".";
+    if (from.file.len > 0 && from.file[0] != '<') {
+        if (text.lastIndexOf(from.file, '/')) |slash| { dir = from.file[0..slash]; }
+    }
+    var key = text.f("{s}|{s}", .{header, dir});
+    if (from.pkg) |pk| {
+        for (pk.cinc.items) |inc| { key = text.f("{s}|{s}", .{key, inc}); }
+    }
+    for (headers.items) |h| { if (text.eq(h.key, key)) { return h; } }
+    // a one-line C file that includes the header
+    var tbuf: [64]u8 = undefined;
+    let tdir = fs.makeTempDir("flint-cimport-", tbuf[..]) catch diag.at(tok, text.f("can't create a temp directory to read {s}", .{header}));
+    let tdir_s = alloc.dupe(u8, tdir);
+    let cfile = text.f("{s}/h.c", .{tdir_s});
+    fs.writeFile(cfile, text.f("#include \"{s}\"\n", .{header})) catch {};
+    var argv: alloc.Vec([]const u8) = .{};
+    argv.push(load.cc);
+    argv.push("-E");
+    argv.push("-P");
+    argv.push(text.f("-I{s}", .{dir}));
+    if (from.pkg) |pk| {
+        for (pk.cinc.items) |inc| { argv.push(text.f("-I{s}", .{inc})); }
+    }
+    argv.push(cfile);
+    let efile = text.f("{s}/err.txt", .{tdir_s});
+    let pre = runCapture(argv.items, efile);
+    var macros: ?[]const u8 = null;
+    if (pre != null) {
+        argv.items[1] = "-dM"; // the same, listing the macros instead
+        argv.items[2] = "-E";
+        macros = runCapture(argv.items, efile);
+    }
+    var errs: ?[]const u8 = null;
+    if (fs.readFile(heap.c_allocator, efile)) |e| { errs = e; } else |_| {}
+    fs.remove(cfile) catch {};
+    fs.remove(efile) catch {};
+    fs.removeDir(tdir_s) catch {};
+    if (pre == null || macros == null) { // show the C compiler's own complaint, without the temp file's name
+        if (errs) |es| {
+            if (find(es, "error: ")) |at| {
+                var why = es[at + 7..];
+                if (text.indexOf(why, '\n')) |nl| { why = why[0..nl]; }
+                diag.at(tok, text.f("the C preprocessor couldn't read \"{s}\": {s}", .{header, why}));
+            }
+        }
+        diag.at(tok, text.f("the C preprocessor couldn't read \"{s}\"", .{header}));
+    }
+    let h = alloc.new(ctypes.CHeader);
+    h.name = header;
+    h.key = key;
+    readMacros(h, macros.?);
+    let (toks, _) = clex.lex(pre.?);
+    cparse.parseDecls(h, toks);
+    headers.push(h);
+    return h;
+}
+
+// the first index of needle in s
+fn find(s: []const u8, needle: []const u8) -> ?usize {
+    if (needle.len > s.len) { return null; }
+    for (0..s.len - needle.len + 1) |i| { if (text.eq(s[i..i + needle.len], needle)) { return i; } }
+    return null;
+}
+
+fn hasMacro(h: *ctypes.CHeader, nm: []const u8) -> bool {
+    for (h.mnames.items) |m| { if (text.eq(m, nm)) { return true; } }
+    return false;
+}
+
+// a macro used as c.NAME: a number, a string, or another name
+fn macroDecl(h: *ctypes.CHeader, nm: []const u8) -> ?*ctypes.CDecl {
+    var fnlike = false;
+    let body0 = cparse.findMacro(h, nm, &fnlike);
+    if (fnlike) {
+        let d = cparse.addDecl(h, .Bad, nm).?;
+        d.why = "it's a function-like macro";
+        return d;
+    }
+    let body = body0 orelse return null;
+    let (toks, nt) = clex.lex(body);
+    if (cparse.macroValue(h, nm)) |iv| {
+        let d = cparse.addDecl(h, .ConstInt, nm).?;
+        d.ival = iv;
+        return d;
+    }
+    // a float, maybe negated or in parentheses
+    var i: usize = 0;
+    var cl: usize = 0;
+    var neg = false;
+    while (i < nt && toks[i].k == .P && text.eq(toks[i].s, "(")) {
+        i += 1;
+        cl += 1;
+    }
+    if (i < nt && toks[i].k == .P && text.eq(toks[i].s, "-")) {
+        neg = true;
+        i += 1;
+    }
+    if (i < nt && toks[i].k == .Num && i + 1 + cl == nt) {
+        let z = text.z(toks[i].s);
+        var end: [*]u8 = undefined;
+        var v: f64 = 0.0;
+        var used: usize = 0;
+        unsafe {
+            v = strtod(z, &end);
+            used = @ptrToInt(end) - @ptrToInt(z);
+        }
+        let s = toks[i].s;
+        if (used < s.len && (s[used] == 'f' || s[used] == 'F' || s[used] == 'l' || s[used] == 'L')) { used += 1; }
+        if (used == s.len) {
+            let d = cparse.addDecl(h, .ConstFloat, nm).?;
+            d.fval = if (neg) -v else v;
+            return d;
+        }
+    }
+    if (nt == 1 && toks[0].k == .Str) {
+        let d = cparse.addDecl(h, .ConstStr, nm).?;
+        d.sval = toks[0].str;
+        return d;
+    }
+    if (nt == 1 && toks[0].k == .Id && !text.eq(toks[0].s, nm) && cparse.depthIn()) { // #define stdin __stdinp
+        let d = lookup(h, toks[0].s);
+        cparse.depthOut();
+        if (d) |dd| { return dd; }
+    }
+    let d = cparse.addDecl(h, .Bad, nm).?;
+    d.why = text.f("it's a macro that isn't a simple constant (#define {s} {s})", .{nm, body});
+    return d;
+}
+
+// what the header declares under a name (c.struct_tm names `struct tm`), or null
+pub fn lookup(h: *ctypes.CHeader, nm: []const u8) -> ?*ctypes.CDecl {
+    if (cparse.findDecl(h, nm)) |d| { return d; }
+    let kinds = [_][]const u8 { "struct", "union", "enum" };
+    for (0..3) |i| { // c.struct_tm
+        let k = kinds[i];
+        if (!text.startsWith(nm, k) || nm.len <= k.len || nm[k.len] != '_') { continue; }
+        let display = text.f("{s} {s}", .{k, nm[k.len + 1..]});
+        for (cparse.tags.items) |t| {
+            if (text.eq(t.display, display)) {
+                let td = cparse.addDecl(h, .Type, nm).?;
+                let ct = ctypes.newType(.Struct);
+                ct.st = t;
+                td.t = ct;
+                return td;
+            }
+        }
+        if (i == 2) { // enum tags only matter as integers
+            let td = cparse.addDecl(h, .Type, nm).?;
+            td.t = ctypes.intType(4, true);
+            return td;
+        }
+    }
+    if (hasMacro(h, nm)) { return macroDecl(h, nm); }
+    return null;
+}

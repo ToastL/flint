@@ -1,0 +1,1 @@
+comptime code can't change the runtime global 'counter'

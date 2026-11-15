@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    let name = "ada";
+    try io.print("hi {}\n", .{name});
+}

@@ -1,0 +1,1 @@
+a C header needs a name to reach it by: import c "stdio.h" as c;

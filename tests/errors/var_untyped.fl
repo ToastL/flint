@@ -1,0 +1,3 @@
+fn main() -> !void {
+    var m = 42;
+}

@@ -1,0 +1,4 @@
+fn may_fail() -> !i64 { return 1; }
+fn main() -> !void {
+    may_fail();
+}

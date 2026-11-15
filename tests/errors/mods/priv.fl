@@ -1,0 +1,8 @@
+// a helper module for the module error tests
+pub struct Open {
+    x: i64,
+    fn inner(self: Open) -> i64 { return self.x; }
+}
+struct Hidden { x: i64 }
+fn secret() -> i64 { return 1; }
+pub fn visible() -> i64 { return secret(); }

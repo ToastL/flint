@@ -1,0 +1,1 @@
+comptime code can't call 'rt_write': there's no I/O, memory from the system or C at compile time

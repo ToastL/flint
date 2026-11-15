@@ -1,0 +1,1 @@
+'+=' needs a number ('+=' doesn't append to strings, since that would allocate: use an ArrayList(u8) or fmt.bufPrint)

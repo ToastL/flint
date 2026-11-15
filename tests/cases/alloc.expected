@@ -1,0 +1,9 @@
+c: 81 7 81 20 0
+page: 81 7 81 20 0
+arena: 81 7 81 20 0
+arena total 50005000 7
+fixed: 81 7 81 20 0
+fixed buffer full: error.OutOfMemory
+after reset 32
+debug: 81 7 81 20 0
+leaks: 0

@@ -1,0 +1,492 @@
+// sema.access - places (lvalues): variables, fields, array/slice/pointer elements, dereferences,
+// module and type globals, C globals; bounds checks; packed struct bit fields; extern union reads.
+
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import cimport.ctypes;
+import cimport.header;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.ops;
+import sema.members;
+import sema.globals;
+import sema.cdecls;
+
+pub fn isLvalueNode(n: *ast.Node) -> bool {
+    if (n.k == .Name) {
+        let v = names.findVar(n.name) orelse return false;
+        return v.kind != .Const;
+    }
+    if (n.k == .FieldAcc && names.unitRef(n.a.?) != null) {
+        let v = members.moduleVar(n) orelse return false;
+        return v.kind != .Const;
+    }
+    if (n.k == .FieldAcc) {
+        if (names.headerRef(n.a.?)) |h| {
+            let d = header.lookup(h, n.name) orelse return false;
+            return d.k == .Var;
+        }
+    }
+    if (n.k == .FieldAcc) {
+        if (!members.isStaticRef(n.a.?)) { return true; }
+        return globals.staticVar(members.staticType(n.a.?).?, n.name) != null;
+    }
+    if (n.k == .Index) { return true; }
+    if (n.k == .Deref) { return true; }
+    return false;
+}
+
+pub struct LV {
+    a: b.Addr,
+    t: *ty.Type,
+    ro: bool,    // read-only location
+    temp: bool,  // field of a temporary value (not addressable)
+    bits: i32,   // a packed struct field: these bits of the integer at `a`
+    bitoff: i32,
+    sbits: bool,
+    backing: ?*ty.Type,
+    union_tok: ?*token.Token, // a field of an extern union: reading it needs unsafe
+}
+
+pub fn newLV() -> LV {
+    return LV { a: b.aReg(-1, 0), t: ty.void_, ro: false, temp: false, bits: 0, bitoff: 0, sbits: false, backing: null, union_tok: null };
+}
+
+pub fn optMisuse(tok: ?*token.Token, t: *ty.Type) -> noreturn {
+    diag.at(tok, text.f("this is {s}, which might be null; unwrap it first with 'if (x) |v| {{ ... }}' or 'x.?'", .{ty.tname(t)}));
+}
+
+pub fn euMisuse(tok: ?*token.Token, t: *ty.Type) -> noreturn {
+    diag.at(tok, text.f("this is {s}, which might be an error; handle it first with 'try' or 'catch'", .{ty.tname(t)}));
+}
+
+pub fn elemAddr(p: i32, idx: b.Val, es: i32) -> b.Addr {
+    if (idx.isconst) { return b.aReg(p, idx.ival *% es as i64); }
+    let off = if (es == 1) b.R(idx.reg) else b.R(b.op2(.Mul, .I, b.R(idx.reg), b.IMM(es as i64)));
+    return b.aReg(b.op2(.Add, .I, b.R(p), off), 0);
+}
+
+pub fn boundsCheck(idx: ir.Opd, len: ir.Opd) {
+    let c = b.cmp(.LO, idx, len);
+    let ok = b.newBlock();
+    let fail = b.newColdBlock();
+    b.br(b.R(c), ok, fail);
+    b.setBlk(fail);
+    _ = b.callI("_rt_oob", .None, &[_]ir.Opd { idx, len });
+    b.trap();
+    b.setBlk(ok);
+}
+
+// an index, slice bound or count: a usize (literals and narrower unsigned integers widen to it)
+pub fn usizeVal(e: *ast.Node, what: []const u8) -> b.Val {
+    let v = expr.expr(e, ty.usize_);
+    if (v.t == ty.usize_) { return v; }
+    if (v.t.k == .LitInt) {
+        if (v.ival < 0) { diag.at(e.tok, text.f("{s} can't be negative ({})", .{what, v.ival})); }
+        return b.vInt(ty.usize_, v.ival);
+    }
+    if (!ty.isInt(v.t)) { diag.at(e.tok, text.f("{s} must be an integer (usize), found {s}", .{what, ty.tname(v.t)})); }
+    if (ty.isSigned(v.t)) { diag.at(e.tok, text.f("{s} must be usize, found {s}; convert it with 'as usize'", .{what, ty.tname(v.t)})); }
+    return cv.coerce(v, ty.usize_, e.tok, what);
+}
+
+fn indexVal(n: *ast.Node) -> b.Val { return usizeVal(n.b.?, "an index"); }
+
+// element i of the array [N]T at `ba`: constant indexes are checked at compile time
+fn arrayElem(at: *ty.Type, ba: b.Addr, ro: bool, tmp: bool, n: *ast.Node) -> LV {
+    var r = newLV();
+    r.t = at.E();
+    r.ro = ro;
+    r.temp = tmp;
+    let iv = indexVal(n);
+    let es = at.E().size;
+    if (iv.isconst) {
+        if (@bitcast(u64, iv.ival) >= @bitcast(u64, at.alen)) {
+            diag.at(n.b.?.tok, text.f("index {} is out of bounds for {s}", .{@bitcast(u64, iv.ival), ty.tname(at)}));
+        }
+        r.a = b.aAdd(ba, iv.ival *% es as i64);
+        return r;
+    }
+    if (st.boundsChecked()) { boundsCheck(b.opdOf(iv), b.IMM(at.alen)); }
+    r.a = elemAddr(b.addrReg(ba), iv, es);
+    return r;
+}
+
+// a[i]; indexing into a field of an extern union reads the union
+pub fn indexLv(n: *ast.Node) -> LV {
+    var ut: ?*token.Token = null;
+    var r = indexLvAt(n, &ut);
+    if (r.union_tok == null) { r.union_tok = ut; }
+    return r;
+}
+
+fn indexLvAt(n: *ast.Node, union_tok: *?*token.Token) -> LV {
+    var bt: *ty.Type = undefined;
+    var ba = b.aReg(-1, 0);
+    var p: i32 = -1;
+    var bro = false;
+    var btmp = false;
+    if (isLvalueNode(n.a.?)) {
+        let l = lval(n.a.?);
+        bt = l.t;
+        bro = l.ro;
+        btmp = l.temp;
+        union_tok.* = l.union_tok;
+        if (ty.isPtr(bt)) { p = b.load(bt, l.a); } else { ba = l.a; }
+    } else {
+        let v = expr.expr(n.a.?, null);
+        bt = v.t;
+        btmp = true;
+        if (ty.isPtr(bt)) { p = b.regOf(v); } else { ba = v.a; }
+    }
+    var r = newLV();
+    if (bt.k == .Opt) { optMisuse(n.tok, bt); }
+    if (bt.k == .ErrUnion) { euMisuse(n.tok, bt); }
+    if (ty.isArray(bt)) {
+        ty.layout(bt, n.tok);
+        return arrayElem(bt, ba, bro, btmp, n);
+    }
+    if (ty.isArrayPtr(bt)) { // *[N]T indexes like the array it points at
+        ty.layout(bt.E(), n.tok);
+        return arrayElem(bt.E(), b.aReg(p, 0), bt.is_const, false, n);
+    }
+    if (ty.isPtr(bt)) {
+        if (bt.E() == ty.void_) { diag.at(n.tok, "can't index *void; cast it first"); }
+        if (!bt.many) {
+            diag.at(n.tok, text.f("can't index {s}: it points at a single item (a pointer to many items is [*]{s}{s})",
+                                  .{ty.tname(bt), if (bt.is_const) "const " else "", ty.tname(bt.E())}));
+        }
+        names.requireUnsafe(n.tok, text.f("indexing {s} (it has no length to check against)", .{ty.tname(bt)}));
+        let iv = indexVal(n);
+        r.t = bt.E();
+        r.ro = bt.is_const;
+        r.a = elemAddr(p, iv, r.t.size);
+        return r;
+    }
+    if (ty.isSlice(bt)) {
+        r.t = bt.E();
+        r.ro = bt.is_const;
+        let iv = indexVal(n);
+        let ptr = b.load(ty.ptrTo(r.t), ba);
+        if (st.boundsChecked()) { boundsCheck(b.opdOf(iv), b.R(b.load(ty.i64_, b.aAdd(ba, 8)))); }
+        r.a = elemAddr(ptr, iv, r.t.size);
+        return r;
+    }
+    diag.at(n.tok, text.f("can't index into {s}", .{ty.tname(bt)}));
+}
+
+// member access on a struct / str / slice located at `base`
+pub fn member(bt: *ty.Type, base: b.Addr, ro: bool, n: *ast.Node) -> LV {
+    if (bt.k == .Opt) { optMisuse(n.tok, bt); }
+    if (bt.k == .ErrUnion) { euMisuse(n.tok, bt); }
+    var r = newLV();
+    r.ro = ro;
+    if (ty.isArray(bt)) { // .len is a constant; it lives in a scratch slot so it can be read like a field
+        if (!text.eq(n.name, "len")) { diag.at(n.tok, text.f("{s} has no field '{s}' (arrays have .len)", .{ty.tname(bt), n.name})); }
+        r.t = ty.usize_;
+        r.a = b.temp(ty.usize_);
+        b.store(ty.usize_, r.a, b.IMM(bt.alen));
+        r.ro = true;
+        return r;
+    }
+    if (ty.isSlice(bt)) {
+        let f = n.name;
+        if (text.eq(f, "len")) {
+            r.t = ty.usize_;
+            r.a = b.aAdd(base, 8);
+        } else if (text.eq(f, "ptr")) {
+            r.t = ty.manyPtrQ(bt.E(), bt.is_const);
+            r.a = base;
+        } else {
+            diag.at(n.tok, text.f("{s} has no field '{s}' (a slice has .ptr and .len)", .{ty.tname(bt), f}));
+        }
+        return r;
+    }
+    if (bt.k != .Struct) { diag.at(n.tok, text.f("{s} has no fields", .{ty.tname(bt)})); }
+    for (bt.fields.items) |*fd| {
+        if (text.eq(fd.name, n.name)) {
+            r.t = fd.t;
+            r.a = b.aAdd(base, fd.off as i64);
+            if (bt.is_union) { r.union_tok = n.tok; }
+            if (bt.is_packed) {
+                ty.layout(bt, n.tok);
+                r.bits = fd.bits;
+                r.bitoff = fd.bitoff;
+                r.sbits = fd.sbits;
+                r.backing = bt.tagt;
+            }
+            return r;
+        }
+    }
+    if (names.findMethod(bt, n.name) != null) { diag.at(n.tok, text.f("'{s}' is a method; call it with ()", .{n.name})); }
+    if (bt.tuple) {
+        diag.at(n.tok, text.f("{s} has no element .{s} (its elements are .0 to .{})", .{ty.tname(bt), n.name, bt.fields.items.len as i64 - 1}));
+    }
+    diag.at(n.tok, text.f("struct '{s}' has no field '{s}'", .{bt.name, n.name}));
+}
+
+pub fn lval(n: *ast.Node) -> LV {
+    let su = st.CU;
+    if (n.unit) |u| { st.CU = u; }
+    let r = lvalIn(n);
+    st.CU = su;
+    return r;
+}
+
+fn globalLv(v: *st.Var) -> LV {
+    var r = newLV();
+    r.t = v.t.?;
+    r.ro = v.is_const;
+    r.a = b.aReg(b.addrSymQ(v.sym, v.ext), 0);
+    return r;
+}
+
+fn lvalIn(n: *ast.Node) -> LV {
+    var r = newLV();
+    if (n.k == .Name) {
+        let v = names.lookup(n.name, n.tok);
+        r.t = v.t orelse ty.void_;
+        r.ro = v.is_const;
+        switch (v.kind) {
+            .Slot => { r.a = b.aSlot(v.slot, 0); }
+            .Ref => { r.a = b.aReg(v.reg, 0); }
+            .Global => { r.a = b.aReg(b.addrSymQ(v.sym, v.ext), 0); }
+            .Type => { diag.at(n.tok, text.f("'{s}' is a type, not a variable", .{n.name})); }
+            else => { diag.at(n.tok, text.f("can't assign to '{s}': it's immutable (use 'var' to declare a mutable variable)", .{n.name})); }
+        }
+        return r;
+    }
+    if (n.k == .FieldAcc) {
+        if (names.headerRef(n.a.?)) |h| { // c.some_global
+            let d = cdecls.cNeed(h, n.name, n.tok);
+            if (d.k != .Var) { diag.at(n.tok, text.f("'{s}' from {s} isn't a variable", .{n.name, header.name(h)})); }
+            return cdecls.cVar(h, d, n.tok);
+        }
+    }
+    if (n.k == .FieldAcc) {
+        if (names.unitRef(n.a.?)) |mu| { // mod.counter
+            let v = members.moduleVar(n) orelse members.noMember(mu, n);
+            if (v.kind != .Global) { diag.at(n.tok, text.f("can't assign to '{s}': it's a constant", .{n.name})); }
+            return globalLv(v);
+        }
+    }
+    if (n.k == .FieldAcc) {
+        if (members.isStaticRef(n.a.?)) {
+            let stt = members.staticType(n.a.?).?;
+            if (globals.staticVar(stt, n.name)) |v| {
+                if (v.kind != .Global) { diag.at(n.tok, text.f("can't assign to '{s}': it's a constant", .{v.name})); }
+                return globalLv(v);
+            }
+            diag.at(n.tok, text.f("'{s}.{s}' must be called: {s}.{s}(...)", .{ty.tname(stt), n.name, ty.tname(stt), n.name}));
+        }
+        var bt: *ty.Type = undefined;
+        var ba = b.aReg(-1, 0);
+        var ro = false;
+        var tmp = false;
+        var outer = newLV(); // a packed struct inside a packed struct: its bits sit inside the outer integer
+        if (isLvalueNode(n.a.?)) {
+            let l = lval(n.a.?);
+            outer = l;
+            bt = l.t;
+            ba = l.a;
+            ro = l.ro;
+            tmp = l.temp;
+            if (ty.isPtr(bt)) {
+                if (bt.many) { diag.at(n.tok, text.f("{s} points at many items; index it first: p[i].{s}", .{ty.tname(bt), n.name})); }
+                ro = bt.is_const;
+                ba = b.aReg(b.load(bt, l.a), 0);
+                bt = bt.E();
+                tmp = false;
+            }
+        } else {
+            let v = expr.expr(n.a.?, null);
+            bt = v.t;
+            tmp = true;
+            if (ty.isPtr(bt)) {
+                if (bt.many) { diag.at(n.tok, text.f("{s} points at many items; index it first: p[i].{s}", .{ty.tname(bt), n.name})); }
+                ro = bt.is_const;
+                ba = b.aReg(b.regOf(v), 0);
+                bt = bt.E();
+                tmp = false;
+            } else if (ty.isAgg(bt)) {
+                ba = v.a;
+            } else {
+                diag.at(n.tok, text.f("{s} has no fields", .{ty.tname(bt)}));
+            }
+        }
+        r = member(bt, ba, ro, n);
+        r.temp = tmp;
+        if (r.union_tok == null) { r.union_tok = outer.union_tok; } // u.s.x reads the union
+        if (outer.bits != 0 && r.bits != 0) {
+            r.bitoff += outer.bitoff;
+            r.backing = outer.backing;
+        }
+        return r;
+    }
+    if (n.k == .Index) { return indexLv(n); }
+    if (n.k == .Deref) {
+        let p = expr.expr(n.a.?, null);
+        if (p.t.k == .Opt) { optMisuse(n.tok, p.t); }
+        if (!ty.isPtr(p.t)) { diag.at(n.tok, text.f("can't dereference {s}: not a pointer", .{ty.tname(p.t)})); }
+        if (p.t.E() == ty.void_) { diag.at(n.tok, "can't dereference *void; cast it first"); }
+        if (p.t.many) { diag.at(n.tok, text.f("{s} points at many items, so '.*' is ambiguous; index it: p[0]", .{ty.tname(p.t)})); }
+        r.t = p.t.E();
+        r.ro = p.t.is_const;
+        r.a = b.aReg(b.regOf(p), 0);
+        return r;
+    }
+    diag.at(n.tok, "can't assign to this expression");
+}
+
+// ---------- packed struct fields ----------
+
+fn mask(bits: i32) -> u64 { return if (bits >= 64) 0xffffffffffffffff else (@bitcast(u64, 1 as i64) << bits as u64) - 1; }
+
+fn bitsLoad(l: LV) -> b.Val {
+    var r = b.load(l.backing.?, l.a); // zero-extended
+    if (l.bits < 64) {
+        if (l.sbits) {
+            let sh = 64 - l.bitoff - l.bits;
+            if (sh != 0) { r = b.op2(.Shl, .I, b.R(r), b.IMM(sh as i64)); }
+            r = b.op2(.Asr, .I, b.R(r), b.IMM((64 - l.bits) as i64));
+        } else {
+            if (l.bitoff != 0) { r = b.op2(.Lsr, .I, b.R(r), b.IMM(l.bitoff as i64)); }
+            r = b.op2(.And, .I, b.R(r), b.IMM(@bitcast(i64, mask(l.bits))));
+        }
+    }
+    if (l.t.k == .Struct) { // a nested packed struct
+        let a = b.temp(l.t);
+        b.store(l.t.tagt.?, a, b.R(r));
+        return b.vAgg(l.t, a, true);
+    }
+    return b.vReg(l.t, r);
+}
+
+pub fn bitsStore(l: LV, v: b.Val, tok: ?*token.Token) {
+    let m = mask(l.bits);
+    var nv = b.IMM(0);
+    if (v.isconst && !ty.isAgg(v.t)) {
+        var fits = true;
+        if (l.bits < 64) {
+            if (l.sbits) {
+                let half = @bitcast(i64, @bitcast(u64, 1 as i64) << (l.bits - 1) as u64);
+                fits = v.ival >= 0 -% half && v.ival < half;
+            } else {
+                fits = @bitcast(u64, v.ival) <= m;
+            }
+        }
+        if (!fits) { diag.at(tok, text.f("{} doesn't fit in this {}-bit field", .{v.ival, l.bits})); }
+        nv = b.IMM(@bitcast(i64, (@bitcast(u64, v.ival) & m) << l.bitoff as u64));
+    } else {
+        var r = if (ty.isAgg(v.t)) b.load(v.t.tagt.?, v.a) else b.regOf(v);
+        if (l.bits < 64 && ty.isInt(v.t)) { // like 'as': a value that doesn't fit traps
+            let msg = text.f("value doesn't fit in this {}-bit field", .{l.bits});
+            if (l.sbits) {
+                let s = b.op2(.Asr, .I, b.R(b.op2(.Shl, .I, b.R(r), b.IMM((64 - l.bits) as i64))), b.IMM((64 - l.bits) as i64));
+                ops.panicIf(b.cmp(.NE, b.R(s), b.R(r)), msg);
+            } else {
+                ops.panicIf(b.cmp(.HI, b.R(r), b.IMM(@bitcast(i64, m))), msg);
+            }
+        }
+        if (l.bits < 64) { r = b.op2(.And, .I, b.R(r), b.IMM(@bitcast(i64, m))); }
+        if (l.bitoff != 0) { r = b.op2(.Shl, .I, b.R(r), b.IMM(l.bitoff as i64)); }
+        nv = b.R(r);
+    }
+    if (l.bits >= 64) {
+        b.store(l.backing.?, l.a, nv);
+        return;
+    }
+    var raw = b.load(l.backing.?, l.a);
+    raw = b.op2(.And, .I, b.R(raw), b.IMM(@bitcast(i64, ~(m << l.bitoff as u64))));
+    raw = b.op2(.Or, .I, b.R(raw), nv);
+    b.store(l.backing.?, l.a, b.R(raw));
+}
+
+pub fn unionRead(l: LV) {
+    if (l.union_tok) |ut| { names.requireUnsafe(ut, "reading a field of an extern union"); }
+}
+
+pub fn lvLoad(l: LV) -> b.Val {
+    unionRead(l);
+    return if (l.bits != 0) bitsLoad(l) else b.loadVal(l.t, l.a);
+}
+
+pub fn lvStore(l: LV, v: b.Val, tok: ?*token.Token) {
+    if (l.bits != 0) { bitsStore(l, v, tok); } else { b.storeVal(l.t, l.a, v); }
+}
+
+// ---------- slicing ----------
+
+// arr[lo..hi]: a slice pointing into the array at `ba` (nothing is copied)
+fn sliceArray(n: *ast.Node, at: *ty.Type, ba: b.Addr, ro: bool) -> b.Val {
+    ty.layout(at, n.tok);
+    let lo = if (n.b) |x| usizeVal(x, "a slice bound") else b.vInt(ty.usize_, 0);
+    let hi = if (n.c) |x| usizeVal(x, "a slice bound") else b.vInt(ty.usize_, at.alen);
+    if (lo.isconst && hi.isconst) {
+        if (@bitcast(u64, hi.ival) > @bitcast(u64, at.alen)) {
+            diag.at(n.c.?.tok, text.f("slice end {} is out of bounds for {s}", .{@bitcast(u64, hi.ival), ty.tname(at)}));
+        }
+        if (@bitcast(u64, lo.ival) > @bitcast(u64, hi.ival)) {
+            diag.at(n.tok, text.f("slice start {} is after its end {}", .{@bitcast(u64, lo.ival), @bitcast(u64, hi.ival)}));
+        }
+    } else if (st.boundsChecked()) {
+        _ = b.callI("_rt_range", .None, &[_]ir.Opd { b.opdOf(lo), b.opdOf(hi), b.IMM(at.alen) });
+    }
+    let sl = ty.sliceOfQ(at.E(), ro);
+    let t = b.temp(sl);
+    b.store(ty.ptrTo(at.E()), t, b.R(b.addrReg(elemAddr(b.addrReg(ba), lo, at.E().size))));
+    if (lo.isconst && hi.isconst) {
+        b.store(ty.usize_, b.aAdd(t, 8), b.IMM(hi.ival -% lo.ival));
+    } else {
+        b.store(ty.usize_, b.aAdd(t, 8), b.R(b.op2(.Sub, .I, b.R(b.regOf(hi)), b.opdOf(lo))));
+    }
+    return b.vAgg(sl, t, true);
+}
+
+pub fn exSlice(n: *ast.Node) -> b.Val {
+    var base: b.Val = undefined;
+    if (isLvalueNode(n.a.?)) { // an array is sliced where it lives
+        let l = lval(n.a.?);
+        if (ty.isArray(l.t)) {
+            if (l.temp) { diag.at(n.tok, "can't slice a temporary array; store it in a variable first"); }
+            return sliceArray(n, l.t, l.a, l.ro);
+        }
+        unionRead(l);
+        base = b.loadVal(l.t, l.a);
+    } else {
+        base = expr.expr(n.a.?, null);
+    }
+    let bt = base.t;
+    if (ty.isArray(bt)) { diag.at(n.tok, "can't slice a temporary array; store it in a variable first"); }
+    if (ty.isArrayPtr(bt)) { return sliceArray(n, bt.E(), b.aReg(b.regOf(base), 0), bt.is_const); }
+    let lo = if (n.b) |x| usizeVal(x, "a slice bound") else b.vInt(ty.usize_, 0);
+    if (ty.isPtr(bt)) {
+        if (!bt.many) { diag.at(n.tok, text.f("can't slice {s}: it points at a single item (use [*]T)", .{ty.tname(bt)})); }
+        let hc = n.c orelse diag.at(n.tok, "slicing a pointer needs an end: p[a..b]");
+        names.requireUnsafe(n.tok, text.f("slicing {s} (it has no length to check against)", .{ty.tname(bt)}));
+        let hi = usizeVal(hc, "a slice bound");
+        let sl = ty.sliceOfQ(bt.E(), bt.is_const);
+        let t = b.temp(sl);
+        b.store(ty.ptrTo(bt.E()), t, b.R(b.addrReg(elemAddr(b.regOf(base), lo, bt.E().size))));
+        let hr = if (b.opdOf(hi).k == .Imm) b.R(b.regOf(hi)) else b.R(hi.reg);
+        b.store(ty.i64_, b.aAdd(t, 8), b.R(b.op2(.Sub, .I, hr, b.opdOf(lo))));
+        return b.vAgg(sl, t, true);
+    }
+    if (!ty.isSlice(bt)) { diag.at(n.tok, text.f("can't slice {s}", .{ty.tname(bt)})); }
+    let et = bt.E();
+    let ptr = b.load(ty.ptrTo(et), base.a);
+    let len = b.load(ty.i64_, b.aAdd(base.a, 8));
+    let hi = if (n.c) |x| usizeVal(x, "a slice bound") else b.vReg(ty.usize_, len);
+    if (st.boundsChecked()) { _ = b.callI("_rt_range", .None, &[_]ir.Opd { b.opdOf(lo), b.opdOf(hi), b.R(len) }); }
+    let t = b.temp(bt);
+    b.store(ty.ptrTo(et), t, b.R(b.addrReg(elemAddr(ptr, lo, et.size))));
+    b.store(ty.i64_, b.aAdd(t, 8), b.R(b.op2(.Sub, .I, b.R(b.regOf(hi)), b.opdOf(lo))));
+    return b.vAgg(bt, t, true);
+}

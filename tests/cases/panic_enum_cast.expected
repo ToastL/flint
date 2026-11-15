@@ -1,0 +1,5 @@
+South
+North
+--- stderr
+panic: integer doesn't match any enum value in 'as'
+--- exit 101

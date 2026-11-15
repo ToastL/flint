@@ -1,0 +1,27 @@
+hello Ada, 3 + 3 = 6, pi ~ 3.14159, ok=true
+Hi Grace, you are 85! 21
+types: 255 -128 0.1 0.3333333333333333 -0.5 1e+21 null
+braces: {} line one
+line two
+str is eq, a literal is []const u8
+foobar! 7
+lt gt true false
+true true
+4 null true true true false
+4 10 true
+[hi there] [hi there 
+] [  	 hi there]
+[a][b][][c]
+0 one 3
+1 two 3
+2 three 5
+a.b.c.<x><y><>
+ababab HELLO world
+a+b+c a+b-c bbbbbb a|b||c
+43 -17 5 123 0.25
+255 -255 -128 error.Overflow error.Overflow
+0.5 error.NotANumber
+true true true 9
+0 1 4 9 16
+Hey 3 486579
+to C 4

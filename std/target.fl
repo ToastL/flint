@@ -1,0 +1,13 @@
+// std.target: the platform this program is being compiled for, known at compile time.
+//
+//     import std.target;
+//     if (comptime target.os == .linux) { ... } else { ... }
+//
+// Only the branch for this target is type-checked (the other must still name things that exist).
+
+pub enum Os { macos, linux, windows }
+pub enum Arch { aarch64, x86_64 }
+
+pub let os: Os = .macos;
+pub let arch: Arch = .aarch64;
+pub let pointer_size: usize = 8;

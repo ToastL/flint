@@ -1,0 +1,7 @@
+import std.io;
+
+fn get(x: i32) -> i32 { return x; }
+fn main() -> !void {
+    unsafe { @assume(get(1) == 2); }
+    try io.print("unreachable in Debug\n", .{});
+}

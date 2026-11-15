@@ -1,0 +1,29 @@
+// cstr is a NUL-terminated C string ([*]const u8 plus a promise), for C interop only.
+
+import std.io;
+import std.mem;
+
+extern fn puts(s: cstr) -> i32;
+extern fn printf(fmt: cstr, ...) -> i32;
+extern fn getenv(name: cstr) -> ?cstr;
+extern fn strchr(s: cstr, c: i32) -> ?cstr;
+extern fn fflush(f: ?*void) -> i32;
+
+fn greet(who: cstr) {
+    _ = printf("hello, %s\n", who);
+}
+
+fn main() -> !void {
+    _ = puts("a literal goes straight to C");
+    greet("world");
+    let c: cstr = "flint";
+    let s = mem.span(c);            // cstr -> str: counts the bytes up to the NUL
+    try io.print("{s} {} {s} {} {s}!\n", .{ c, s.len, s, s[0], c });
+    if (getenv("FLINT_SURELY_UNSET_VAR")) |v| { try io.print("set: {}\n", .{v}); } else { try io.print("unset\n", .{}); }
+    if (getenv("HOME")) |home| { try io.print("{}\n", .{mem.span(home).len > 0}); }
+    let comma = strchr("key,value", ',').?;
+    try io.print("{s}\n", .{mem.span(comma)});
+    let raw: [*]const u8 = c;       // a cstr is a [*]const u8
+    unsafe { try io.print("{}\n", .{raw[4]}); }
+    _ = fflush(null);
+}

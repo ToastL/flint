@@ -1,0 +1,5 @@
+fn main() {
+    var arr = [_]i32 { 1 };
+    var xs: []i32 = &arr;
+    xs.push(2);
+}

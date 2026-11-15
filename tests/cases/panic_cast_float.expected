@@ -1,0 +1,4 @@
+2147483647
+--- stderr
+panic: value doesn't fit in i32 in 'as'
+--- exit 101

@@ -1,0 +1,1 @@
+'as' doesn't reinterpret pointers; use '@ptrCast(*u32, p)' inside an 'unsafe' block

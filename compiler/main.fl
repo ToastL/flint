@@ -1,0 +1,22 @@
+// The `flint` command: the self-hosted Flint compiler.
+//
+// Layout (each directory is one stage; see its files' header comments):
+//   base/     memory, strings, compile errors
+//   syntax/   tokens, lexer, AST, parser
+//   modules/  loading files and the standard library
+//   cimport/  reading C headers
+//   sema/     type checking and lowering the AST to IR (sema/program.fl is the entry point)
+//   ir/       the IR, and printing it
+//   interp/   running IR at compile time (comptime)
+//   opt/      IR optimizations
+//   arm64/    IR -> ARM64 assembly
+//   driver/   the command line, flint.toml, assembling and linking
+
+import std.io;
+import driver.cli;
+
+fn main() -> u8 {
+    let status = cli.main(args());
+    _ = io.flush() catch {};
+    return status;
+}

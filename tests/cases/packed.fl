@@ -1,0 +1,62 @@
+// packed struct: fields are bit ranges of one integer, first field in the lowest bits (like C bitfields).
+
+import std.io;
+
+enum Mode: u8 { Off, Read, Write, Both }
+
+packed struct Perm {
+    read: bool,
+    write: bool,
+    exec: bool,
+    _pad: u5 = 0,
+}
+
+packed struct Reg {
+    enable: bool,
+    mode: u2,
+    delta: i5,          // signed: -16..15
+    perm: Perm,         // a nested packed struct takes 8 bits
+    level: u16,
+}
+
+// a C union: every field starts at offset 0
+extern union Word {
+    f: f64,
+    u: u64,
+    bytes: [8]u8,
+}
+
+fn flip(r: Reg) -> Reg {
+    var c = r;
+    c.enable = !c.enable;
+    return c;
+}
+
+fn main() -> !void {
+    var r = Reg { enable: true, mode: 2, delta: -3, perm: .{ read: true, write: false, exec: true }, level: 513 };
+    try io.print("{} {} {} {} {} {} {} {} {}\n", .{ @sizeOf(Reg), @sizeOf(Perm), r.enable, r.mode, r.delta, r.perm.read, r.perm.write, r.perm.exec, r.level });
+    try io.print("{}\n", .{@bitcast(u32, r)});
+
+    r.mode = 3;
+    r.delta += 10;
+    r.perm.write = true;
+    r.level = 65535;
+    try io.print("{} {} {} {} {} {}\n", .{ r.enable, r.mode, r.delta, r.perm.write, r.perm.exec, r.level });
+
+    let low: u8 = 0xff;
+    r.mode = @truncate(u8, low) & 3;
+    try io.print("{} {}\n", .{ r.mode, r.delta });
+
+    let r2 = flip(r);
+    try io.print("{} {} {}\n", .{ r2.enable, r.enable, r2.level });
+
+    let p = @bitcast(Perm, 0b101);
+    try io.print("{} {} {} {}\n", .{ p.read, p.write, p.exec, @bitcast(u8, p) });
+
+    var w = Word { f: 1.0 };
+    unsafe { try io.print("{} {} {}\n", .{ w.u, w.bytes[7], w.bytes[6] }); } // reading a union field reinterprets bits
+    w.u = 0x4000000000000000;                       // writing one is safe
+    unsafe { try io.print("{}\n", .{w.f}); }
+    let w2 = w;
+    unsafe { try io.print("{} {}\n", .{ w2.f, @sizeOf(Word) }); }
+}

@@ -1,0 +1,1 @@
+unions exist only for C interop: write 'extern union'; use an enum with payloads for a tagged union

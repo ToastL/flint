@@ -1,0 +1,8 @@
+import std.fmt;
+import std.io;
+
+fn main() -> !void {
+    try io.print("before\n", .{});
+    let n = try fmt.parseInt(i64, "12x", 10);
+    try io.print("never printed {}\n", .{n});
+}

@@ -1,0 +1,66 @@
+// The syntax from docs/design.md.
+
+import std.io;
+
+struct Counter {
+    hits: i64 = 0,
+    name: str = "anon",
+
+    fn bump(self: *Self, by: i64) { self.hits += by; }
+    fn peek(self: *const Self) -> i64 { return self.hits; }
+    fn make(name: str) -> Self { return Self { name: name }; }
+}
+
+export fn twice(x: i32) -> i32 { return x * 2; }
+
+fn main() -> !void {
+    // labeled loops
+    var found: i64 = -1;
+    outer: for (0..10) |i| {
+        for (0..10) |j| {
+            if (j > i) { continue :outer; }
+            if (i * j == 42) {
+                found = (i * 10 + j) as i64;
+                break :outer;
+            }
+        }
+    }
+    try io.print("found {}\n", .{found});
+
+    // pointer captures modify in place; inclusive ranges
+    var xs = [_]i64 { 1, 2, 3, 4 };
+    for (xs) |*x| { x.* *= 10; }
+    var total: usize = 0;
+    for (1..=4) |i| { total += i; }
+    try io.print("xs {} {} total {}\n", .{ xs[0], xs[3], total });
+
+    // precedence: bitwise binds tighter than comparison (C gets this wrong)
+    let flags: u32 = 6;
+    try io.print("prec {} {} {}\n", .{ flags & 1 == 0, flags & 2 == 2, 1 + 2 << 1 });
+
+    // if-expression, sizes, zero values
+    let size = if (flags > 4) "big" else "small";
+    let z = @zeroes(Counter);
+    try io.print("{s} {} {} {} {} {}\n", .{ size, @sizeOf(Counter), @alignOf(u16), @sizeOf([]u8), z.hits, z.name.len });
+
+    // field defaults, Self, methods through pointers, const pointers
+    var c = Counter.make("clicks");
+    c.bump(2);
+    Counter.bump(&c, 3);           // the method call above is exactly this
+    let cp: *const Counter = &c;
+    try io.print("{s} {} {} {}\n", .{ c.name, c.hits, cp.peek(), cp.hits });
+
+    // explicit dereference
+    var n: i32 = 5;
+    let np = &n;
+    np.* = np.* + 1;
+    try io.print("deref {} {}\n", .{ n, twice(n) });
+
+    // wrapping arithmetic, undefined, discarding a result
+    var big: i64 = 9223372036854775807;
+    big +%= 1;
+    var later: i64 = undefined;
+    later = 7;
+    _ = twice(later as i32);
+    try io.print("wrap {} {}\n", .{ big, later });
+}

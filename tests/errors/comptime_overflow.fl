@@ -1,0 +1,6 @@
+fn f() -> u8 {
+    var x: u8 = 250;
+    x += 10;
+    return x;
+}
+fn main() { let y = comptime f(); }

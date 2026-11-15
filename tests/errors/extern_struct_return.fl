@@ -1,0 +1,4 @@
+struct P { a: i32, b: i32 }
+extern fn get_p() -> P;
+
+fn main() {}

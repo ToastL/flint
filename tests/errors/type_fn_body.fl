@@ -1,0 +1,7 @@
+fn Box(comptime T: type) -> type {
+    var n: usize = 3;
+    return struct { v: [n]T };
+}
+fn main() {
+    var b: Box(i32) = undefined;
+}

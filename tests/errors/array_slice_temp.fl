@@ -1,0 +1,7 @@
+fn make() -> [3]i32 {
+    var a: [3]i32 = undefined;
+    return a;
+}
+fn main() -> !void {
+    let s = make()[0..2];
+}

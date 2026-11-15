@@ -1,0 +1,3 @@
+struct Header { magic: u32, len: u64 }
+comptime { assert(@sizeOf(Header) == 12); }
+fn main() {}

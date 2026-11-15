@@ -1,0 +1,6 @@
+import mods.priv;
+
+fn main() {
+    let h = priv.Hidden { x: 1 };
+    _ = h;
+}

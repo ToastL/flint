@@ -1,0 +1,35 @@
+// extern let/var: globals defined in C. export let/var: globals C code can see.
+
+import std.io;
+
+extern let __stdoutp: *void;   // C's stdout (FILE *) on macOS
+extern var optind: i32;        // getopt's index, a plain global in libc
+extern fn fputs(s: cstr, f: *void) -> i32;
+extern fn fflush(f: ?*void) -> i32;
+extern fn dlsym(handle: *void, name: cstr) -> ?*void;
+
+export var flint_counter: u64 = 41;
+export let flint_version: i32 = 2;
+export var flint_table: [4]u16 = @splat(0);
+
+fn main() -> !void {
+    _ = fflush(null);
+    _ = fputs("written by fputs\n", __stdoutp);
+    _ = fflush(__stdoutp);
+    try io.print("{}\n", .{optind});
+    optind = 7;
+    try io.print("{}\n", .{optind});
+
+    flint_counter += 1;
+    flint_table[2] = 9;
+    try io.print("{} {} {}\n", .{ flint_counter, flint_version, flint_table[2] });
+
+    // the exported names are real symbols: look them up the way C would
+    unsafe {
+        let any = @intToPtr(*void, 0xfffffffffffffffe);   // RTLD_DEFAULT
+        if (dlsym(any, "flint_counter")) |p| {
+            try io.print("C sees {}\n", .{@ptrCast(*u64, p).*});
+        }
+        if (dlsym(any, "flint_version")) |p| { try io.print("version {}\n", .{@ptrCast(*i32, p).*}); }
+    }
+}

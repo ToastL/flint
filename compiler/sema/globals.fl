@@ -1,0 +1,385 @@
+// sema.globals - global variables and constants: declared lazily and made on first use (so their
+// order doesn't matter), initial values that must be constant (literals, struct and array literals,
+// strings, function names, &other_global, comptime results), and integer constant evaluation.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.calls;
+import sema.members;
+import sema.literals;
+import sema.builtins;
+import sema.ctexec;
+import sema.ctdata;
+import sema.program;
+
+// Type.name, a `let`/`var` declared inside a type
+pub fn staticVar(t: *ty.Type, name: []const u8) -> ?*st.Var {
+    if (t.unit == null) { return null; }
+    return names.globalIn(t.unit, text.f("{s}.{s}", .{t.name, name}));
+}
+
+// a global's first use (or the end of the program): make its data now
+pub fn materialize(i: usize) -> ?*st.Var {
+    let g = st.gvars.items[i];
+    if (g.busy) { diag.at(g.lazy.?.tok, text.f("'{s}' depends on itself", .{g.name})); }
+    g.busy = true;
+    let ln = g.lazy.?;
+    let lo = g.lazy_owner;
+    let u = g.unit;
+    let name = g.name;
+    let ste = st.TE;
+    let scalls = diag.calls;
+    st.TE = g.lazy_te;
+    diag.calls = @zeroes(alloc.Vec(*token.Token));
+    let sc = st.C; // a global's initializer sees no function's locals
+    st.C = null;
+    globalLetIn(ln, lo);
+    st.C = sc;
+    st.TE = ste;
+    diag.calls = scalls;
+    g.name = ""; // the real one was added at the end
+    return names.globalIn(u, name);
+}
+
+// evaluate a global initializer in a scratch function; it must fold to a constant
+pub fn constEval(e: *ast.Node, t: ?*ty.Type, what: []const u8) -> b.Val {
+    let ctx = alloc.new(st.Ctx);
+    ctx.f = alloc.new(ir.IRFunc);
+    let saved = st.C;
+    st.C = ctx;
+    b.setBlk(b.newBlock());
+    var val = expr.expr(e, t);
+    if (t) |tt| { val = cv.coerce(val, tt, e.tok, what); }
+    st.C = saved;
+    return val;
+}
+
+pub fn dataItem(g: *ir.GlobalVar, off: i32, size: i32, val: i64, sym: []const u8) {
+    g.items.push(ir.DataItem { off: off, size: size, val: val, sym: sym });
+}
+
+pub fn rawBits(v: b.Val, t: *ty.Type) -> i64 {
+    if (t.k == .F64) { return @bitcast(i64, v.fval); }
+    if (t.k == .F32) { return @bitcast(i32, v.fval as f32) as i64; }
+    return v.ival;
+}
+
+// a constant aggregate for a global's initial data: struct and array literals, string literals,
+// function names, &other_global, null, undefined (zero) and constant numbers
+fn staticInit(g: *ir.GlobalVar, t: *ty.Type, off: i32, e: *ast.Node) {
+    if (e.k == .Undefined) { return; } // globals start zeroed: a stable value
+    if (t.k == .Struct && !t.is_packed && !t.is_union && (e.k == .StructLit || e.k == .AnonLit)) {
+        if (e.k == .StructLit) {
+            let lt = if (e.a) |a| members.staticType(a) else names.findStruct(e.name);
+            if (lt != t) { diag.at(e.tok, text.f("type mismatch: expected {s}, found another struct", .{ty.tname(t)})); }
+        }
+        ty.layout(t, e.tok);
+        let nf = t.fields.items.len;
+        if (t.tuple) {
+            if (e.count() != nf) { diag.at(e.tok, text.f("{s} has {} elements, but {} are given", .{ty.tname(t), nf, e.count()})); }
+            for (0..e.count()) |i| { staticInit(g, t.fields.items[i].t, off + t.fields.items[i].off, e.at(i)); }
+            return;
+        }
+        if (e.k == .AnonLit && e.flag == 0 && e.count() > 0) { diag.at(e.tok, text.f("{s}'s fields need names: .{{ field: value, ... }}", .{ty.tname(t)})); }
+        for (t.fields.items) |*fd| {
+            var v = fd.def;
+            for (e.list.items) |x| { if (text.eq(x.name, fd.name)) { v = x.a; } }
+            let vv = v orelse diag.at(e.tok, text.f("missing field '{s}' in {s} literal", .{fd.name, ty.tname(t)}));
+            staticInit(g, fd.t, off + fd.off, vv);
+        }
+        for (e.list.items) |x| {
+            var found = false;
+            for (t.fields.items) |*fd| { found = found || text.eq(fd.name, x.name); }
+            if (!found) { diag.at(x.tok, text.f("struct '{s}' has no field '{s}'", .{ty.tname(t), x.name})); }
+        }
+        return;
+    }
+    if (ty.isBytes(t) && t.is_const && (e.k == .Str || builtins.isEmbed(e))) {
+        let data = if (e.k == .Str) e.str else builtins.embedFile(e);
+        let k = b.addStr(data);
+        dataItem(g, off, 8, 0, st.M.strs.items[k as usize].label);
+        dataItem(g, off + 8, 8, data.len as i64, "");
+        return;
+    }
+    let bt = if (t.k == .Opt) t.E() else t;
+    if (t.k == .Opt && e.k == .Null && (ty.isFn(bt) || ty.isPtr(bt))) { return; }
+    if (ty.isFn(bt)) {
+        var f: ?*st.FnInfo = null;
+        if (e.k == .Name && names.findVar(e.name) == null) {
+            f = names.findFn(e.name);
+        } else if (e.k == .FieldAcc && names.unitRef(e.a.?) != null) {
+            f = members.calleeFn(e);
+        } else if (e.k == .FieldAcc && members.isStaticRef(e.a.?)) {
+            f = names.findMethod(members.staticType(e.a.?).?, e.name);
+        }
+        let fi = f orelse diag.at(e.tok, "a function pointer in a global's initial value must be a function's name");
+        let ctx = alloc.new(st.Ctx);
+        ctx.f = alloc.new(ir.IRFunc);
+        let saved = st.C;
+        st.C = ctx;
+        b.setBlk(b.newBlock());
+        let fv = calls.fnValue(fi, e.tok); // lowers it; the instructions land in a scratch function
+        st.C = saved;
+        if (fv.t != bt) { diag.at(e.tok, text.f("type mismatch: expected {s}, found {s}", .{ty.tname(bt), ty.tname(fv.t)})); }
+        dataItem(g, off, 8, 0, fi.sym);
+        return;
+    }
+    if (ty.isPtr(bt)) {
+        if (e.k == .Unary && text.eq(e.name, "&")) {
+            let x = e.a.?;
+            var v: ?*st.Var = null;
+            if (x.k == .Name) {
+                v = names.findVar(x.name);
+            } else if (x.k == .FieldAcc && names.unitRef(x.a.?) != null) {
+                v = members.moduleVar(x);
+            } else if (x.k == .FieldAcc && members.isStaticRef(x.a.?)) {
+                v = staticVar(members.staticType(x.a.?).?, x.name);
+            }
+            if (v) |gv| {
+                if (gv.kind == .Global && !gv.ext) {
+                    let pt = ty.ptrToQ(gv.t.?, gv.is_const);
+                    let ok = pt == bt || (pt.elem == bt.elem && bt.is_const && !bt.many) || (bt.E() == ty.void_ && !pt.is_const);
+                    if (!ok) { diag.at(e.tok, text.f("type mismatch: expected {s}, found {s}", .{ty.tname(bt), ty.tname(pt)})); }
+                    dataItem(g, off, 8, 0, gv.sym);
+                    return;
+                }
+            }
+        }
+        diag.at(e.tok, "a pointer in a global's initial value must be null or the address of another global (&name)");
+    }
+    if (ty.isArray(t) && (e.k == .ArrayLit || (e.k == .AnonLit && e.flag == 0))) { // [_]T { a, b }
+        if (e.k == .ArrayLit && literals.arraylitType(e) != t) {
+            diag.at(e.tok, text.f("type mismatch: expected {s}, found {s}", .{ty.tname(t), ty.tname(literals.arraylitType(e))}));
+        }
+        ty.layout(t, e.tok);
+        let n = e.count();
+        if (n as i64 != t.alen) {
+            diag.at(e.tok, text.f("{s} needs {} element(s), but {} {s} given", .{ty.tname(t), t.alen, n, if (n == 1) "is" else "are"}));
+        }
+        for (0..n) |i| { staticInit(g, t.E(), off + i as i32 * t.E().size, e.at(i)); }
+        return;
+    }
+    if (ty.isAgg(t)) { diag.at(e.tok, text.f("a global's initial value can't contain {s} (yet)", .{ty.tname(t)})); }
+    let v = constEval(e, t, "initial value");
+    if (!v.isconst) { diag.at(e.tok, "global initializers must be constants (compute it at compile time with 'comptime')"); }
+    dataItem(g, off, t.size, rawBits(v, t), "");
+}
+
+// a global, or (owner given) a `let`/`var` declared inside a type, named Owner.name
+pub fn globalLetIn(n: *ast.Node, owner: ?*ty.Type) {
+    let su = st.CU;
+    if (n.unit) |u| { st.CU = u; }
+    globalLetAt(n, owner);
+    st.CU = su;
+}
+
+fn dupGlobal(name: []const u8) -> bool {
+    for (st.gvars.items) |g| { if (g.unit == st.CU && g.kind != .Lazy && text.eq(g.name, name)) { return true; } }
+    return false;
+}
+
+fn pushVar(v: st.Var) {
+    let p = alloc.new(st.Var);
+    p.* = v;
+    st.gvars.push(p);
+}
+
+fn newVar() -> st.Var {
+    var v = @zeroes(st.Var);
+    v.slot = -1;
+    v.reg = -1;
+    return v;
+}
+
+fn globalLetAt(n: *ast.Node, owner: ?*ty.Type) {
+    if (n.count() > 0) { diag.at(n.tok, "destructuring only works inside functions"); }
+    let name = if (owner) |o| text.f("{s}.{s}", .{o.name, n.name}) else n.name;
+    if (n.is_extern) { // extern var name: T;  storage lives in C
+        if (dupGlobal(name)) { diag.at(n.tok, text.f("'{s}' is already defined", .{name})); }
+        var v = newVar();
+        v.unit = st.CU;
+        v.is_pub = n.is_pub;
+        v.name = n.name;
+        v.is_const = n.flag != 0;
+        v.kind = .Global;
+        let t = names.resolve(n.a.?);
+        ty.layout(t, n.a.?.tok);
+        if (t == ty.void_) { diag.at(n.a.?.tok, "a variable can't be void"); }
+        v.t = t;
+        v.sym = text.f("_{s}", .{n.name});
+        v.ext = true;
+        pushVar(v);
+        return;
+    }
+    if (dupGlobal(name)) { diag.at(n.tok, text.f("'{s}' is already defined", .{name})); }
+    let type_ann = n.a != null && n.a.?.k == .TName && text.eq(n.a.?.name, "type");
+    var t: ?*ty.Type = if (type_ann) ty.type_ else if (n.a) |a| names.resolve(a) else null;
+    if (t != null && !type_ann) { ty.layout(t.?, n.a.?.tok); }
+    var v = newVar();
+    v.unit = st.CU;
+    v.is_pub = n.is_pub;
+    v.name = name;
+    v.is_const = n.flag != 0;
+    var g = @zeroes(ir.GlobalVar);
+    g.sym = if (n.exported) text.f("_{s}", .{n.name})
+            else if (owner) |o| text.f("_g_{s}_{s}", .{program.mangle(o), n.name})
+            else text.f("_g_{s}{s}", .{st.cu().prefix, n.name});
+    g.exported = n.exported;
+    g.is_const = n.flag != 0;
+    g.name = name;
+    let init = n.b;
+    if (init != null && (init.?.k == .Str || builtins.isEmbed(init))) {
+        let e = init.?;
+        if (t != null && t != ty.str_) { diag.at(e.tok, text.f("type mismatch: expected {s}, found []const u8", .{ty.tname(t.?)})); }
+        t = ty.str_;
+        g.kind = .Str;
+        let data = if (e.k == .Str) e.str else builtins.embedFile(e);
+        g.sidx = b.addStr(data);
+    } else if (init != null && t != null && init.?.k == .Builtin && ty.isAgg(t.?) &&
+               ((text.eq(init.?.name, "@splat") && init.?.count() == 1 && init.?.at(0).k == .Int && init.?.at(0).ival == 0) ||
+                text.eq(init.?.name, "@zeroes"))) {
+        let e = init.?;
+        if (text.eq(e.name, "@zeroes") && names.resolve(e.b.?) != t) { diag.at(e.tok, text.f("type mismatch: expected {s}", .{ty.tname(t.?)})); }
+        if (text.eq(e.name, "@splat") && !ty.isArray(t.?)) { diag.at(e.tok, text.f("@splat makes an array, but '{s}' is {s}", .{n.name, ty.tname(t.?)})); }
+        g.kind = .Zero; // all-zero aggregate: .zerofill
+    } else if (init != null && init.?.k == .Undefined) { // globals start zeroed
+        if (n.flag != 0) { diag.at(init.?.tok, "a 'let' needs a real value; 'undefined' is only for 'var'"); }
+        if (t == null) { diag.at(n.tok, text.f("'{s}' needs a type to be undefined: 'var {s}: T = undefined;'", .{n.name, n.name})); }
+        g.kind = if (st.MODE == .Debug) .Fill else .Zero;
+    } else if (init != null && init.?.k == .Comptime) { // let TABLE = comptime crcTable();
+        var o = @zeroes(ctdata.CtOut);
+        let vt = ctexec.ctCompute(init.?.a.?, false, t, text.f("'{s}'", .{name}), &o);
+        if (vt == ty.type_) {
+            if (n.flag == 0) { diag.at(n.tok, text.f("'{s}' would hold a type, which only exists at compile time: use 'let'", .{name})); }
+            v.kind = .Type;
+            v.t = ty.typeFromId(o.ival);
+            pushVar(v);
+            return;
+        }
+        if (o.isconst) {
+            let val = if (ty.isFloat(vt)) b.vFlt(vt, o.fval) else b.vInt(vt, o.ival);
+            t = vt;
+            if (n.flag != 0 && !n.exported) {
+                v.kind = .Const;
+                v.t = vt;
+                v.cival = val.ival;
+                v.cfval = val.fval;
+                pushVar(v);
+                return;
+            }
+            g.kind = .Int;
+            g.ival = rawBits(val, vt);
+        } else { // the data comptime made becomes this global
+            let cg = &st.M.globals.items[o.g];
+            cg.sym = g.sym;
+            cg.exported = g.exported;
+            cg.is_const = g.is_const;
+            cg.name = g.name;
+            v.kind = .Global;
+            v.t = vt;
+            v.sym = g.sym;
+            pushVar(v);
+            return;
+        }
+    } else if (init != null && (init.?.k == .ArrayLit || (init.?.k == .AnonLit && t != null && ty.isArray(t.?)))) {
+        if (t == null) { t = literals.arraylitType(init.?); }
+        ty.layout(t.?, init.?.tok);
+        g.kind = .Data;
+        staticInit(&g, t.?, 0, init.?);
+    } else if (init != null && (init.?.k == .StructLit || (init.?.k == .AnonLit && t != null && t.?.k == .Struct))) {
+        let e = init.?;
+        if (t == null) { t = if (e.a) |a| members.staticType(a) else names.findStruct(e.name); }
+        ty.layout(t.?, e.tok);
+        g.kind = .Data;
+        staticInit(&g, t.?, 0, e);
+    } else if (init) |e| {
+        var val = constEval(e, t, text.f("'{s}'", .{name}));
+        if (val.t == ty.type_) { // let IntList = List(i32);
+            if (n.flag == 0) { diag.at(n.tok, text.f("'{s}' would hold a type, which only exists at compile time: use 'let'", .{name})); }
+            if (n.exported) { diag.at(n.tok, "a type can't be exported"); }
+            v.kind = .Type;
+            v.t = ty.typeFromId(val.ival);
+            pushVar(v);
+            return;
+        }
+        if (!val.isconst || ty.isAgg(val.t)) {
+            diag.at(e.tok, "global initializers must be constants (compute it at compile time with 'comptime', or assign it at the start of main)");
+        }
+        val = cv.defaulted(val);
+        if (val.t == ty.null_) { diag.at(n.tok, text.f("can't infer a type for '{s}' from null; add ': type'", .{name})); }
+        t = val.t;
+        if (n.flag != 0 && !n.exported) { // const scalar: inline it everywhere (an exported one needs storage)
+            v.kind = .Const;
+            v.t = val.t;
+            v.cival = val.ival;
+            v.cfval = val.fval;
+            pushVar(v);
+            return;
+        }
+        g.kind = .Int;
+        g.ival = rawBits(val, val.t);
+    } else {
+        g.kind = .Zero;
+    }
+    let tt = t.?;
+    g.size = tt.size;
+    g.align = tt.align;
+    st.M.globals.push(g);
+    v.kind = .Global;
+    v.t = tt;
+    v.sym = g.sym;
+    pushVar(v);
+}
+
+pub fn evalConstInt(e: *ast.Node, what: []const u8) -> i64 {
+    let ctx = alloc.new(st.Ctx);
+    ctx.f = alloc.new(ir.IRFunc);
+    ctx.ct_scratch = true; // it sees the constants around it, not the variables
+    ctx.outer = st.C;
+    let saved = st.C;
+    st.C = ctx;
+    b.setBlk(b.newBlock());
+    let v = expr.expr(e, null);
+    st.C = saved;
+    if (!v.isconst || !ty.isInt(v.t)) { diag.at(e.tok, text.f("{s} must be an integer constant", .{what})); }
+    return v.ival;
+}
+
+// an initializer made only of literals, names and operators: safe to fold before any type is laid out
+pub fn simpleConst(m: ?*ast.Node) -> bool {
+    let e = m orelse return true;
+    switch (e.k) {
+        .Int, .Float, .Bool, .Name => { return true; }
+        .Unary => { return !text.eq(e.name, "&") && simpleConst(e.a); }
+        .Binary => { return simpleConst(e.a) && simpleConst(e.b); }
+        else => { return false; }
+    }
+}
+
+// a global (or a type's let) waiting for its first use
+pub fn declareLazy(ln: *ast.Node, owner: ?*ty.Type) {
+    let name = if (owner) |o| text.f("{s}.{s}", .{o.name, ln.name}) else ln.name;
+    for (st.gvars.items) |g| { if (g.unit == st.CU && text.eq(g.name, name)) { diag.at(ln.tok, text.f("'{s}' is already defined", .{name})); } }
+    if (owner == null && (names.aliasUnit(name) != null || names.aliasHeader(name) != null)) {
+        diag.at(ln.tok, text.f("'{s}' is already the name of an import", .{name}));
+    }
+    var v = newVar();
+    v.name = name;
+    v.kind = .Lazy;
+    v.lazy = ln;
+    v.lazy_owner = owner;
+    v.lazy_te = st.TE;
+    v.unit = st.CU;
+    v.is_pub = ln.is_pub;
+    pushVar(v);
+}

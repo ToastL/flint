@@ -1,0 +1,243 @@
+// sema.optional - optionals and the |captures| of `if`/`while`: the subject of a capture (an
+// optional or an error union), binding |v|, |*v| and else |err|, if-expressions, `.?` and `orelse`.
+
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.expr;
+import sema.stmt;
+import sema.ctbranch;
+
+// The subject of `if (x) |v| ... else |err| ...`: an optional or an error union. With |*v| (loc
+// given) the subject must be a variable: loc gets where it lives.
+pub fn capSubjectAt(n: *ast.Node, capture: []const u8, ecapture: []const u8, loc: ?*access.LV) -> b.Val {
+    var v: b.Val = undefined;
+    if (loc) |l| {
+        if (!access.isLvalueNode(n)) {
+            diag.at(n.tok, text.f("|*{s}| points into the value, so it needs a variable, not a temporary", .{capture}));
+        }
+        l.* = access.lval(n);
+        if (l.temp) { diag.at(n.tok, text.f("|*{s}| points into the value, so it needs a variable, not a temporary", .{capture})); }
+        v = b.loadVal(l.t, l.a);
+    } else {
+        v = expr.expr(n, null);
+    }
+    if (v.t.k == .Opt) {
+        if (ecapture.len > 0) {
+            diag.at(n.tok, text.f("'else |{s}|' captures an error, but this is an optional ({s})", .{ecapture, ty.tname(v.t)}));
+        }
+        return v;
+    }
+    if (v.t.k == .ErrUnion) {
+        if (capture.len > 0 && v.t.E() == ty.void_ && !text.eq(capture, "_")) {
+            diag.at(n.tok, text.f("there's no value to capture in |{s}|: this is {s} (write 'if (x) {{ ... }} else |err| {{ ... }}')", .{capture, ty.tname(v.t)}));
+        }
+        return v;
+    }
+    if (capture.len > 0) {
+        diag.at(n.tok, text.f("'|{s}|' unwraps an optional (?T) or error union (!T), but this is {s}", .{capture, ty.tname(v.t)}));
+    }
+    diag.at(n.tok, text.f("'else |{s}|' captures an error, but this is {s}", .{ecapture, ty.tname(v.t)}));
+}
+
+pub fn capSubject(n: *ast.Node, capture: []const u8, ecapture: []const u8) -> b.Val {
+    return capSubjectAt(n, capture, ecapture, null);
+}
+
+// |*v|: v points at the value inside the optional / error union (which sits at offset 0)
+pub fn bindPtr(name: []const u8, tok: ?*token.Token, loc: access.LV) {
+    if (text.eq(name, "_")) { return; }
+    let et = loc.t.E();
+    if (et == ty.void_) { diag.at(tok, text.f("there's no value to point at in |*{s}|: this is {s}", .{name, ty.tname(loc.t)})); }
+    let pt = ty.ptrToQ(et, loc.ro);
+    let v = stmt.newLocal(name, pt, tok, true);
+    b.store(pt, b.aSlot(v.slot, 0), b.R(b.addrReg(loc.a)));
+}
+
+// 1 when the subject holds a value
+pub fn capOk(v: b.Val) -> i32 {
+    if (v.t.k == .Opt) { return cv.optHas(v); }
+    return b.cmp(.EQ, cv.euErr(v), b.IMM(0));
+}
+
+pub fn bindErr(name: []const u8, tok: ?*token.Token, v: b.Val) {
+    if (text.eq(name, "_")) { return; }
+    let ev = stmt.newLocal(name, v.t.eset.?, tok, true);
+    b.store(v.t.eset.?, b.aSlot(ev.slot, 0), cv.euErr(v));
+}
+
+// binds the value inside an optional or (successful) error union
+pub fn bindOpt(name: []const u8, tok: ?*token.Token, ov: b.Val) {
+    if (text.eq(name, "_")) { return; }
+    let et = ov.t.E();
+    let inner = if (ov.t.k == .Opt) cv.optValue(ov) else cv.euValue(ov);
+    let v = stmt.newLocal(name, et, tok, true);
+    b.storeVal(et, b.aSlot(v.slot, 0), inner);
+}
+
+pub fn exTernary(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let cnd = n.a.?;
+    if (cnd.k == .Comptime && n.name.len == 0 && n.name2.len == 0) { // if (comptime c) a else b
+        let take = ctbranch.comptimeCond(cnd);
+        ctbranch.checkNames(if (take) n.c.? else n.b.?);
+        return expr.expr(if (take) n.b.? else n.c.?, want);
+    }
+    let ta = b.newBlock();
+    let tb = b.newBlock();
+    let join = b.newBlock();
+    var ov = b.vVoid();
+    let caps = n.name.len > 0 || n.name2.len > 0;
+    var loc = access.newLV();
+    if (caps) {
+        ov = capSubjectAt(cnd, n.name, n.name2, if (n.flag2 != 0) &loc else null);
+        b.br(b.R(capOk(ov)), ta, tb);
+    } else {
+        expr.cond(cnd, ta, tb);
+    }
+    b.setBlk(ta);
+    names.pushScope(false, -1, -1);
+    if (n.name.len > 0 && n.flag2 != 0) {
+        bindPtr(n.name, n.tok, loc);
+    } else if (n.name.len > 0) {
+        bindOpt(n.name, n.tok, ov);
+    }
+    let a = expr.expr(n.b.?, want);
+    names.popScope();
+    let ea = st.c().blk;
+    b.setBlk(tb);
+    names.pushScope(false, -1, -1);
+    if (n.name2.len > 0) { bindErr(n.name2, n.tok, ov); }
+    let c = expr.expr(n.c.?, if (want) |w| w else if (ty.isLit(a.t)) null else a.t);
+    names.popScope();
+    let eb = st.c().blk;
+    var t: *ty.Type = undefined;
+    if (a.t == ty.noreturn_) {
+        t = c.t;
+    } else if (c.t == ty.noreturn_) {
+        t = a.t;
+    } else if (a.t == c.t) {
+        t = a.t;
+    } else if (want != null && want.?.k == .Opt) {
+        t = want.?;
+    } else if (ty.isNum(a.t) && ty.isNum(c.t)) {
+        t = cv.unify(a.t, c.t, n.tok, "?:");
+    } else if (a.t == ty.null_ && (ty.isPtr(c.t) || ty.isFn(c.t))) { // null or a pointer: ?*T
+        t = ty.optOf(c.t);
+    } else if (c.t == ty.null_ && (ty.isPtr(a.t) || ty.isFn(a.t))) {
+        t = ty.optOf(a.t);
+    } else if (c.t.k == .Opt && (c.t.elem == a.t || (ty.isLit(a.t) && ty.isNum(c.t.E())))) { // T or ?T
+        t = c.t;
+    } else if (a.t.k == .Opt && (a.t.elem == c.t || (ty.isLit(c.t) && ty.isNum(a.t.E())))) {
+        t = a.t;
+    } else if (a.t == ty.null_ && c.t.k == .Opt) { // null or ?T
+        t = c.t;
+    } else if (c.t == ty.null_ && a.t.k == .Opt) {
+        t = a.t;
+    } else if (ty.isSlice(a.t) && ty.isSlice(c.t) && a.t.elem == c.t.elem) {
+        t = ty.sliceOfQ(a.t.E(), true); // []T and []const T
+    } else if (ty.isPtr(a.t) && ty.isPtr(c.t) && !a.t.many && !c.t.many && a.t.elem == c.t.elem) {
+        t = ty.ptrToQ(a.t.E(), true);
+    } else {
+        diag.at(n.tok, text.f("both branches of ?: must have the same type ({s} vs {s})", .{ty.tname(a.t), ty.tname(c.t)}));
+    }
+    if (want) |w| {
+        if (ty.isLit(t) && ty.isNum(w) && !(t.k == .LitFloat && ty.isInt(w))) { t = w; } // let a: u8 = if (c) 'A' else 'a';
+    }
+    t = ty.defaultT(t);
+    if (t == ty.void_ || t == ty.noreturn_) { diag.at(n.tok, "an if-expression's branches must produce values"); }
+    if (ty.isAgg(t)) {
+        let res = b.temp(t);
+        b.setBlk(ea);
+        b.copyAgg(t, res, cv.coerce(a, t, n.b.?.tok, "if-expression branch").a);
+        b.jmp(join);
+        b.setBlk(eb);
+        b.copyAgg(t, res, cv.coerce(c, t, n.c.?.tok, "if-expression branch").a);
+        b.jmp(join);
+        b.setBlk(join);
+        return b.vAgg(t, res, true);
+    }
+    let r = b.newVreg(ty.clsOf(t));
+    b.setBlk(ea);
+    b.mov(r, ty.clsOf(t), b.opdOf(cv.coerce(a, t, n.b.?.tok, "?: branch")));
+    b.jmp(join);
+    b.setBlk(eb);
+    b.mov(r, ty.clsOf(t), b.opdOf(cv.coerce(c, t, n.c.?.tok, "?: branch")));
+    b.jmp(join);
+    b.setBlk(join);
+    return b.vReg(t, r);
+}
+
+pub fn exUnwrap(n: *ast.Node) -> b.Val {
+    let v = expr.expr(n.a.?, null);
+    if (v.t.k != .Opt) { diag.at(n.tok, text.f("'.?' needs an optional value (?T), found {s}", .{ty.tname(v.t)})); }
+    let ok = b.newBlock();
+    let fail = b.newColdBlock();
+    b.br(b.R(cv.optHas(v)), ok, fail);
+    b.setBlk(fail);
+    let msg = b.strLit("unwrapped a null value with .?");
+    _ = b.callI("_rt_panic", .None, &[_]ir.Opd { b.R(b.load(ty.ptrTo(ty.u8_), msg.a)), b.IMM(30) });
+    b.trap();
+    b.setBlk(ok);
+    return cv.optValue(v);
+}
+
+pub fn exOrelse(n: *ast.Node) -> b.Val {
+    let v = expr.expr(n.a.?, null);
+    if (v.t.k != .Opt) { diag.at(n.tok, text.f("'orelse' needs an optional (?T) on its left, found {s}", .{ty.tname(v.t)})); }
+    let et = v.t.E();
+    let has = b.newBlock();
+    let none = b.newBlock();
+    let join = b.newBlock();
+    b.br(b.R(cv.optHas(v)), has, none);
+    b.setBlk(none);
+    var d: b.Val = undefined;
+    let rhs = n.b.?;
+    if (rhs.k == .Block) { // x orelse { ...; return; }: the block has no value, so it must leave
+        names.pushScope(false, -1, -1);
+        stmt.blockBody(rhs);
+        names.popScope();
+        if (!b.terminated()) {
+            diag.at(rhs.tok, "an orelse block has no value to give, so it must leave with return, break or continue");
+        }
+        d = b.vReg(ty.noreturn_, -1);
+    } else {
+        d = expr.expr(rhs, et);
+    }
+    let dend = st.c().blk;
+    let chain = d.t == v.t;
+    let dead = d.t == ty.noreturn_;
+    let rt = if (chain) v.t else et;
+    if (!dead && !chain) { d = cv.coerce(d, et, rhs.tok, "the 'orelse' default"); }
+    if (ty.isAgg(rt)) {
+        let ra = b.temp(rt);
+        b.setBlk(has);
+        b.copyAgg(rt, ra, if (chain) v.a else cv.optValue(v).a);
+        b.jmp(join);
+        if (!dead) {
+            b.setBlk(dend);
+            b.copyAgg(rt, ra, d.a);
+            b.jmp(join);
+        }
+        b.setBlk(join);
+        return b.vAgg(rt, ra, true);
+    }
+    let r = b.newVreg(ty.clsOf(rt));
+    b.setBlk(has);
+    b.mov(r, ty.clsOf(rt), b.opdOf(if (chain) v else cv.optValue(v)));
+    b.jmp(join);
+    if (!dead) {
+        b.setBlk(dend);
+        b.mov(r, ty.clsOf(rt), b.opdOf(d));
+        b.jmp(join);
+    }
+    b.setBlk(join);
+    return b.vReg(rt, r);
+}

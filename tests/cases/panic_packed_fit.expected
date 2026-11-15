@@ -1,0 +1,4 @@
+-16 3
+--- stderr
+panic: value doesn't fit in this 5-bit field
+--- exit 101

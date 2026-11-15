@@ -1,0 +1,34 @@
+// where: constraints on comptime parameters, checked at the call
+
+import std.io;
+
+fn isNumber(comptime T: type) -> bool { return @isInt(T) || @isFloat(T); }
+
+fn sum(comptime T: type, xs: []const T) -> T where isNumber(T) {
+    var s: T = 0;
+    for (xs) |x| { s += x; }
+    return s;
+}
+
+fn Matrix(comptime T: type, comptime n: usize) -> type where isNumber(T) && n > 0 {
+    return struct { m: [n][n]T };
+}
+
+fn printArea(x: anytype) -> !void where @hasMethod(@TypeOf(x), "area") {
+    try io.print("area {}\n", .{x.area()});
+}
+
+struct Square {
+    side: i32,
+    fn area(self: Square) -> i32 { return self.side * self.side; }
+}
+
+fn main() -> !void {
+    let a = [_]i32 { 1, 2, 3 };
+    let f = [_]f64 { 0.5, 0.25 };
+    try io.print("{} {d}\n", .{ sum(i32, a[..]), sum(f64, f[..]) });
+    var m: Matrix(f32, 2) = undefined;
+    m.m[1][1] = 1.5;
+    try io.print("{d} {} {}\n", .{ m.m[1][1], @hasField(Square, "side"), @hasField(Square, "len") });
+    try printArea(Square { side: 4 });
+}

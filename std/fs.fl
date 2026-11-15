@@ -1,0 +1,256 @@
+// std.fs - files and directories.
+//
+// Paths are []const u8. The OS wants NUL-terminated paths, so each call copies the path into a
+// buffer on its own stack (a path longer than MAX_PATH is error.NameTooLong). Nothing here
+// allocates unless you hand it an Allocator.
+//
+//   let text = try fs.readFile(alloc, "data.txt");
+//   defer alloc.free(text);
+//
+//   var f = try fs.createFile("out.txt");
+//   defer f.close();
+//   var bw = fs.BufferedWriter.init(f);
+//   try fmt.format(bw.writer(), "{}\n", .{42});
+//   try bw.flush();
+
+import std.mem;
+import std.fmt;
+
+extern fn open(path: cstr, flags: i32, ...) -> i32; // variadic in C: the mode goes on the stack
+extern fn close(fd: i32) -> i32;
+extern fn read(fd: i32, buf: [*]u8, n: usize) -> isize;
+extern fn write(fd: i32, buf: [*]const u8, n: usize) -> isize;
+extern fn lseek(fd: i32, off: i64, whence: i32) -> i64;
+extern fn unlink(path: cstr) -> i32;
+extern fn mkdir(path: cstr, mode: u16) -> i32;
+extern fn rmdir(path: cstr) -> i32;
+extern fn access(path: cstr, mode: i32) -> i32;
+extern fn mkdtemp(template: [*]u8) -> ?[*]u8;
+extern fn realpath(path: cstr, out: [*]u8) -> ?[*]u8;
+extern fn getcwd(buf: [*]u8, n: usize) -> ?[*]u8;
+extern fn __error() -> *i32;
+
+// macOS values
+let O_RDONLY: i32 = 0;
+let O_WRONLY: i32 = 1;
+let O_CREAT: i32 = 0x200;
+let O_TRUNC: i32 = 0x400;
+let ENOENT: i32 = 2;
+let EINTR: i32 = 4;
+let EACCES: i32 = 13;
+let EEXIST: i32 = 17;
+let EISDIR: i32 = 21;
+let ENOTDIR: i32 = 20;
+let ENOTEMPTY: i32 = 66;
+
+// The longest path these functions accept (PATH_MAX on macOS, minus the terminating NUL).
+pub let MAX_PATH: usize = 1023;
+
+pub error FsError {
+    FileNotFound, AccessDenied, IsDir, NotDir, AlreadyExists, DirNotEmpty, NameTooLong,
+    ReadFailed, WriteFailed, OpenFailed, Failed,
+}
+
+fn errnoError(fallback: FsError) -> FsError {
+    let e = __error().*;
+    if (e == ENOENT) { return error.FileNotFound; }
+    if (e == EACCES) { return error.AccessDenied; }
+    if (e == EISDIR) { return error.IsDir; }
+    if (e == ENOTDIR) { return error.NotDir; }
+    if (e == EEXIST) { return error.AlreadyExists; }
+    if (e == ENOTEMPTY) { return error.DirNotEmpty; }
+    return fallback;
+}
+
+// path plus a NUL, in `buf`
+fn toC(path: []const u8, buf: *[1024]u8) -> FsError!cstr {
+    if (path.len > MAX_PATH) { return error.NameTooLong; }
+    for (0..path.len) |i| {
+        if (path[i] == 0) { return error.FileNotFound; }
+        buf[i] = path[i];
+    }
+    buf[path.len] = 0;
+    unsafe { return @ptrCast(cstr, &buf[0]); }
+}
+
+// An open file: just the descriptor.
+pub struct File {
+    fd: i32,
+
+    // Reads up to buf.len bytes; 0 means the end of the file.
+    pub fn read(self: File, buf: []u8) -> FsError!usize {
+        while (true) {
+            let n = read(self.fd, buf.ptr, buf.len);
+            if (n >= 0) { return n as usize; }
+            if (__error().* != EINTR) { return error.ReadFailed; }
+        }
+    }
+
+    // Writes all of bytes.
+    pub fn writeAll(self: File, bytes: []const u8) -> FsError!void {
+        var done: usize = 0;
+        while (done < bytes.len) {
+            var n: isize = 0;
+            unsafe { n = write(self.fd, bytes.ptr + done, bytes.len - done); }
+            if (n < 0) {
+                if (__error().* == EINTR) { continue; }
+                return error.WriteFailed;
+            }
+            done += n as usize;
+        }
+    }
+
+    // The file's size in bytes (it moves the file position back to the start).
+    pub fn size(self: File) -> FsError!usize {
+        let end = lseek(self.fd, 0, 2);
+        if (end < 0 || lseek(self.fd, 0, 0) < 0) { return error.ReadFailed; }
+        return end as usize;
+    }
+
+    pub fn close(self: File) { _ = close(self.fd); }
+
+    // An unbuffered Writer: every write is a system call (see BufferedWriter).
+    pub fn writer(self: *File) -> fmt.Writer { return fmt.Writer { ctx: self, writeFn: File.writeFn }; }
+
+    fn writeFn(ctx: *void, bytes: []const u8) -> !void {
+        var f: *File = undefined;
+        unsafe { f = @ptrCast(*File, ctx); }
+        return f.writeAll(bytes);
+    }
+}
+
+// Opens an existing file for reading.
+pub fn openFile(path: []const u8) -> FsError!File {
+    var buf: [1024]u8 = undefined;
+    let fd = open(try toC(path, &buf), O_RDONLY, 0);
+    if (fd < 0) { return errnoError(error.OpenFailed); }
+    return File { fd: fd };
+}
+
+// Creates a file for writing (emptied if it exists), with mode 0644.
+pub fn createFile(path: []const u8) -> FsError!File {
+    var buf: [1024]u8 = undefined;
+    let fd = open(try toC(path, &buf), O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    if (fd < 0) { return errnoError(error.OpenFailed); }
+    return File { fd: fd };
+}
+
+// The whole file, in memory from `a` (free it with a.free).
+pub fn readFile(a: mem.Allocator, path: []const u8) -> ![]u8 {
+    let f = try openFile(path);
+    defer f.close();
+    let n = try f.size();
+    let out = try a.alloc(u8, n);
+    errdefer a.free(out);
+    var got: usize = 0;
+    while (got < n) {
+        let k = try f.read(out[got..]);
+        if (k == 0) { return error.ReadFailed; } // it shrank while we read it
+        got += k;
+    }
+    return out;
+}
+
+// Creates (or empties) the file and writes bytes to it.
+pub fn writeFile(path: []const u8, bytes: []const u8) -> FsError!void {
+    let f = try createFile(path);
+    defer f.close();
+    try f.writeAll(bytes);
+}
+
+// Collects writes in a fixed buffer and writes them to the file when it fills up, and on flush().
+pub struct BufferedWriter {
+    file: File,
+    buf: [8192]u8,
+    len: usize,
+
+    pub fn init(file: File) -> BufferedWriter {
+        return BufferedWriter { file: file, buf: undefined, len: 0 };
+    }
+
+    pub fn write(self: *Self, bytes: []const u8) -> FsError!void {
+        if (self.len + bytes.len > self.buf.len) {
+            try self.flush();
+            if (bytes.len > self.buf.len) { return self.file.writeAll(bytes); }
+        }
+        for (bytes) |b| {
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+    }
+
+    pub fn flush(self: *Self) -> FsError!void {
+        if (self.len == 0) { return; }
+        let n = self.len;
+        self.len = 0;
+        try self.file.writeAll(self.buf[0..n]);
+    }
+
+    pub fn writer(self: *Self) -> fmt.Writer { return fmt.Writer { ctx: self, writeFn: BufferedWriter.writeFn }; }
+
+    fn writeFn(ctx: *void, bytes: []const u8) -> !void {
+        var w: *BufferedWriter = undefined;
+        unsafe { w = @ptrCast(*BufferedWriter, ctx); }
+        return w.write(bytes);
+    }
+}
+
+// Deletes a file.
+pub fn remove(path: []const u8) -> FsError!void {
+    var buf: [1024]u8 = undefined;
+    if (unlink(try toC(path, &buf)) != 0) { return errnoError(error.Failed); }
+}
+
+// Creates a directory (mode 0755).
+pub fn makeDir(path: []const u8) -> FsError!void {
+    var buf: [1024]u8 = undefined;
+    if (mkdir(try toC(path, &buf), 0o755) != 0) { return errnoError(error.Failed); }
+}
+
+// Deletes an empty directory.
+pub fn removeDir(path: []const u8) -> FsError!void {
+    var buf: [1024]u8 = undefined;
+    if (rmdir(try toC(path, &buf)) != 0) { return errnoError(error.Failed); }
+}
+
+// Does something exist at path?
+pub fn exists(path: []const u8) -> bool {
+    var buf: [1024]u8 = undefined;
+    let c = toC(path, &buf) catch return false;
+    return access(c, 0) == 0;
+}
+
+// Creates a new, empty directory /tmp/<prefix>XXXXXX and writes its path into out.
+pub fn makeTempDir(prefix: []const u8, out: []u8) -> FsError![]u8 {
+    let base = "/tmp/";
+    let need = base.len + prefix.len + 6;
+    if (need + 1 > out.len) { return error.NameTooLong; }
+    mem.copy(u8, out[0..base.len], base);
+    mem.copy(u8, out[base.len..base.len + prefix.len], prefix);
+    for (base.len + prefix.len..need) |i| { out[i] = 'X'; }
+    out[need] = 0;
+    if (mkdtemp(out.ptr) == null) { return errnoError(error.Failed); }
+    return out[0..need];
+}
+
+// The absolute path with no symbolic links or `..`, written into out.
+pub fn realPath(path: []const u8, out: []u8) -> FsError![]u8 {
+    var buf: [1024]u8 = undefined;
+    var res: [1024]u8 = undefined;
+    if (realpath(try toC(path, &buf), &res) == null) { return errnoError(error.Failed); }
+    unsafe { return copyC(@ptrCast(cstr, &res[0]), out); }
+}
+
+// The current directory, written into out.
+pub fn cwd(out: []u8) -> FsError![]u8 {
+    var res: [1024]u8 = undefined;
+    if (getcwd(&res, res.len) == null) { return error.Failed; }
+    unsafe { return copyC(@ptrCast(cstr, &res[0]), out); }
+}
+
+fn copyC(c: cstr, out: []u8) -> FsError![]u8 {
+    let s = mem.span(c);
+    if (s.len > out.len) { return error.NameTooLong; }
+    mem.copy(u8, out[0..s.len], s);
+    return out[0..s.len];
+}

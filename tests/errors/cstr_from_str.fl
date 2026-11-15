@@ -1,0 +1,5 @@
+extern fn puts(s: cstr) -> i32;
+fn main() -> !void {
+    let s = "hi";
+    _ = puts(s);
+}

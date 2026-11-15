@@ -1,0 +1,6 @@
+fn main() {
+    comptime {
+        var i: u64 = 0;
+        while (true) { i += 1; }
+    }
+}

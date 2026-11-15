@@ -1,0 +1,71 @@
+// syntax.ast - the syntax tree the parser builds.
+//
+// One node type for everything, as in the C compiler: which fields mean what depends on `k`
+// (documented on the fields). An absent name is "", an absent child is null.
+
+import base.alloc;
+import syntax.token;
+import modules.unit;
+
+pub enum NodeKind {
+    Fn, Struct, Extern, Param, Field,
+    TName, TPtr, TSlice,
+    Block, Let, Assign, Incr, ExprStmt, If, While, ForRange, ForEach,
+    Return, Break, Continue, Defer,
+    Int, Float, Str, Bool, Null, Name, Unary, Binary, Ternary, Cast,
+    Call, Index, Slice, FieldAcc, StructLit, Array,
+    Deref, Discard, Undefined, Builtin,
+    Enum, Variant, DotTag, Switch, Arm, Pattern, Fallthrough,
+    TOpt, Unwrap, Orelse, Unreachable,
+    ErrSet, ErrLit, TErrU, Try, Catch,
+    TFn, TArray, ArrayLit, TTuple, AnonLit,
+    TGeneric,  // List(i32) in a type position: name, args in list
+    TTypeOf,   // @TypeOf(expr): a = the expression
+    TypeExpr,  // a type written where an expression goes (a type argument): a = the type node
+    Test,      // test "name" { ... }: str = the name, c = the body
+    Comptime,  // comptime expr / comptime { ... } (flag = 1: a block, run for its effects): a = it
+    TVector,   // @Vector(N, T): c = N, a = T
+}
+
+pub struct Node {
+    k: NodeKind,
+    tok: *token.Token,
+    name: []const u8,   // identifier / operator / declared name
+    name2: []const u8,  // method receiver (display name) / loop index variable
+    // if / while / if-expression: `name` is the |capture| of the value, `name2` the else |err| capture
+    a: ?*Node,
+    b: ?*Node,
+    c: ?*Node,
+    list: alloc.Vec(*Node), // statements, args, params, fields, items
+    ival: u64,
+    fval: f64,
+    str: []const u8,    // string literal bytes, or extern header
+    flag: i32,          // let (immutable) / inclusive range / variadic / const pointee / pointer capture
+    flag2: i32,         // type nodes: [*]T (many-item pointer). if/while: the capture is |*v|
+    exported: bool,     // export fn/let/var: C ABI, unmangled, visible to the linker
+    is_extern: bool,    // extern let/var: a global defined in C
+    is_unsafe: bool,    // unsafe fn, or an unsafe { } block
+    label: []const u8,  // loop label, or the label named by break/continue
+    unit: ?*unit.Unit,  // the module (file) it was written in
+    is_pub: bool,       // pub: visible to other modules
+    wherec: ?*Node,     // fn ... where cond: the constraint on its comptime parameters
+    wbeg: ?*token.Token, // ... its first token and the one after it (to quote the clause in errors)
+    wend: ?*token.Token,
+
+    // how many children are in `list`
+    pub fn count(self: *const Node) -> usize { return self.list.items.len; }
+
+    // child i of `list`
+    pub fn at(self: *const Node, i: usize) -> *Node { return self.list.items[i]; }
+
+    pub fn add(self: *Node, c: *Node) { self.list.push(c); }
+}
+
+// A new node; every other field is zero / empty / null.
+pub fn new(k: NodeKind, t: *token.Token, u: ?*unit.Unit) -> *Node {
+    let n = alloc.new(Node);
+    n.k = k;
+    n.tok = t;
+    n.unit = u;
+    return n;
+}

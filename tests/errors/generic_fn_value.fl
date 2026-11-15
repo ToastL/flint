@@ -1,0 +1,4 @@
+fn id(comptime T: type, x: T) -> T { return x; }
+fn main() {
+    let f = id;
+}

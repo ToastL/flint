@@ -1,0 +1,4 @@
+before
+--- stderr
+panic: integer overflow
+--- exit 101

@@ -1,0 +1,6 @@
+import c "mods/cdefs.h" as c;
+
+fn main() {
+    let x = c.ADDR;
+    _ = x;
+}

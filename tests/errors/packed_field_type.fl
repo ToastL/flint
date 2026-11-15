@@ -1,0 +1,4 @@
+packed struct F { a: u3, s: str }
+fn main() -> !void {
+    var f = F { a: 1, s: "x" };
+}

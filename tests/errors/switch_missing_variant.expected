@@ -1,0 +1,1 @@
+switch doesn't handle Shape.Rect, Shape.Empty (add them or an 'else' case)

@@ -1,0 +1,1 @@
+'Bad(1)' needs itself while it's being made (inside its own struct, use Self)

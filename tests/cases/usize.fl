@@ -1,0 +1,20 @@
+// usize/isize are their own types: lengths and indexes are usize
+
+import std.io;
+
+fn main() -> !void {
+    var arr: [5]i32 = @splat(0);
+    let xs: []i32 = &arr;
+    let small: u32 = 3;
+    let n: usize = small;          // u32 -> usize: always fits
+    let wide: u64 = xs.len;        // usize -> u64: always fits
+    let d: isize = -2;
+    let back: i64 = d;             // isize -> i64
+    xs[n] = 7;
+    var sum: usize = 0;
+    for (xs) |x, i| { sum += i; }
+    for (0..xs.len) |i| { xs[i] += 1; }
+    try io.print("{} {} {} {} {} {} {} {}\n", .{ n, wide, back, sum, xs[3], xs[4], @sizeOf(usize), xs.len - 1 });
+    let big: u64 = 10;
+    try io.print("{}\n", .{xs[big as usize - 6]});
+}

@@ -1,0 +1,22 @@
+// std.hash - what @hash and @eql call (HashMap's keys).
+
+extern fn memcmp(a: [*]const u8, b: [*]const u8, n: usize) -> i32;
+
+// an integer's bits, mixed (splitmix64's finalizer)
+pub fn int(x: u64) -> u64 {
+    var z = x +% 0x9e3779b97f4a7c15;
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+    return z ^ (z >> 31);
+}
+
+// FNV-1a over the bytes, then mixed
+pub fn bytes(b: []const u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (b) |c| { h = (h ^ c) *% 0x100000001b3; }
+    return int(h);
+}
+
+pub fn eqlBytes(a: []const u8, b: []const u8) -> bool {
+    return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
+}

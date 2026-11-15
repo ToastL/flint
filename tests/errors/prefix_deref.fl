@@ -1,0 +1,7 @@
+import std.io;
+
+fn main() -> !void {
+    var n: i64 = 1;
+    let p = &n;
+    try io.print("{}\n", .{*p});
+}

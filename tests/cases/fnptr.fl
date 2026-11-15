@@ -1,0 +1,83 @@
+// Function pointer types: fn(params) -> result. A function name is a value.
+
+import std.io;
+
+extern fn labs(x: i64) -> i64;
+extern fn qsort(base: *void, n: usize, size: usize, cmp: fn(*const void, *const void) -> i32);
+
+fn double(x: i32) -> i32 { return x * 2; }
+fn square(x: i32) -> i32 { return x * x; }
+fn hello() { io.print("hello from a pointer\n", .{}) catch {}; }
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 { return f(x); }
+
+fn pick(big: bool) -> fn(i32) -> i32 {
+    if (big) { return square; }
+    return double;
+}
+
+fn by_desc(a: *const void, b: *const void) -> i32 {
+    var x: i32 = 0;
+    var y: i32 = 0;
+    unsafe { // qsort hands back the *void pointers we gave it
+        x = @ptrCast(*const i32, a).*;
+        y = @ptrCast(*const i32, b).*;
+    }
+    if (x < y) { return 1; }
+    if (x > y) { return -1; }
+    return 0;
+}
+
+struct Button {
+    label: str,
+    on_click: ?fn(*Button),
+    clicks: i32 = 0,
+
+    fn click(self: *Button) {
+        if (self.on_click) |f| { f(self); } else { io.print("{s} does nothing\n", .{self.label}) catch {}; }
+    }
+}
+
+fn count_click(b: *Button) {
+    b.clicks += 1;
+    io.print("{s} clicked {}\n", .{ b.label, b.clicks }) catch {};
+}
+
+struct Op { name: str, run: fn(f64, f64) -> f64 }
+fn add(a: f64, b: f64) -> f64 { return a + b; }
+fn mul(a: f64, b: f64) -> f64 { return a * b; }
+
+struct V { x: i32, fn neg(self: V) -> V { return V { x: -self.x }; } }
+
+fn main() -> !void {
+    let f: fn(i32) -> i32 = double;
+    try io.print("{} {} {} {} {}\n", .{ f(21), apply(square, 7), apply(f, 5), pick(true)(9), pick(false)(9) });
+    let g = hello;
+    g();
+    try io.print("{} {} {}\n", .{ f == double, f != square, pick(true) == square });
+
+    var ok = Button { label: "ok", on_click: count_click };
+    var cancel = Button { label: "cancel", on_click: null };
+    ok.click();
+    ok.click();
+    cancel.click();
+
+    let ops = [_]Op { Op { name: "add", run: add }, Op { name: "mul", run: mul } };
+    for (ops) |op| { try io.print("{s} {}\n", .{ op.name, op.run(3, 4) }); }
+    try io.print("{}\n", .{ops[1].run(2.5, 2)});
+
+    let neg: fn(V) -> V = V.neg;
+    try io.print("{}\n", .{neg(V { x: 4 }).x});
+
+    var maybe: ?fn(i32) -> i32 = null;
+    try io.print("{}\n", .{maybe == null});
+    maybe = square;
+    try io.print("{}\n", .{maybe.?(6)});
+
+    var xs = [_]i32 { 3, 9, 1, 7, 5 };
+    qsort(&xs as *void, xs.len, @sizeOf(i32), by_desc);
+    try io.print("{} {} {} {} {}\n", .{ xs[0], xs[1], xs[2], xs[3], xs[4] });
+
+    let c_fn: fn(i64) -> i64 = labs; // a C function as a value
+    try io.print("{}\n", .{c_fn(-12)});
+}

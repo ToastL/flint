@@ -1,0 +1,1 @@
+only a string literal converts to cstr for argument 's': other strings have no NUL terminator (use mem.dupeZ)

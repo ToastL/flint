@@ -1,0 +1,430 @@
+// syntax.parse_decl - declarations and the top level of a file: imports, functions, structs,
+// enums, error sets, extern/export, tests, comptime blocks. Also the entry points: parseImports
+// (just the import lines), prescan (type names from every file) and parse.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import syntax.parser;
+import syntax.parse_type;
+import syntax.parse_expr;
+import syntax.parse_stmt;
+import modules.unit;
+
+// fn name(params) -> T   (also `fn T.name(...)` for methods on built-in types)
+pub fn atFn(p: *parser.Parser) -> bool { return p.at("fn") || (p.at("unsafe") && p.atN(1, "fn")); }
+
+pub fn fnSig(p: *parser.Parser) -> *ast.Node {
+    let uns = p.accept("unsafe") != null;
+    _ = p.expect("fn", "");
+    var f: *ast.Node = undefined;
+    let in_std = if (p.cur_unit) |u| u.is_std else false;
+    if ((p.at("[") || p.at("*") || (p.cur().k == .Id && p.atN(1, "."))) && !in_std) {
+        diag.at(p.cur(), "methods are declared inside their type's body; for a built-in type (str, u8, slices) write a plain function in a module instead, like 'pub fn trim(s: []const u8) -> []const u8'");
+    }
+    if (p.at("[") || p.at("*")) {
+        p.in_receiver = true;
+        let rt = parse_type.type_(p);
+        p.in_receiver = false;
+        _ = p.expect(".", "'.' and a method name after the receiver type");
+        let name = p.ident("method name");
+        f = p.mk(.Fn, name);
+        f.name = name.s;
+        f.a = rt;
+        f.name2 = "receiver";
+    } else {
+        var name = p.ident("function name");
+        f = p.mk(.Fn, name);
+        f.name = name.s;
+        if (p.accept(".") != null) {
+            let rt = p.mk(.TName, name);
+            rt.name = name.s;
+            f.a = rt;
+            f.name2 = rt.name;
+            name = p.ident("method name");
+            f.name = name.s;
+            f.tok = name;
+        }
+    }
+    f.is_unsafe = uns;
+    _ = p.expect("(", "");
+    while (!p.at(")")) {
+        if (p.accept("...") != null) {
+            f.flag = 1;
+            break;
+        }
+        let ct = p.accept("comptime") != null;
+        let pn = p.ident("parameter name");
+        _ = p.expect(":", "':' and a type after the parameter name");
+        let prm = p.mk(.Param, pn);
+        prm.name = pn.s;
+        prm.flag = if (ct) 1 else 0; // comptime: known at compile time; each distinct value makes its own copy of the function
+        let pt = parse_type.type_(p);
+        prm.a = pt;
+        if (pt.k == .TName && text.eq(pt.name, "type") && !ct) {
+            diag.at(pn, text.f("a type parameter must be known at compile time: write 'comptime {s}: type'", .{pn.s}));
+        }
+        if (pt.k == .TName && text.eq(pt.name, "anytype") && ct) {
+            diag.at(pn, "'anytype' already takes its type from the argument; drop 'comptime'");
+        }
+        f.add(prm);
+        if (p.accept(",") == null) { break; }
+    }
+    _ = p.expect(")", "')' or ',' in the parameter list");
+    if (p.accept("->") != null) { f.b = parse_type.type_(p); }
+    if (p.accept("where") != null) { // fn sum(comptime T: type, ...) -> T where isNumber(T)
+        p.no_lit += 1;
+        f.wbeg = p.cur();
+        f.wherec = parse_expr.expr(p);
+        p.no_lit -= 1;
+        f.wend = p.cur();
+    }
+    return f;
+}
+
+pub fn fnBody(p: *parser.Parser, f: *ast.Node) -> *ast.Node {
+    if (!p.at("{")) { diag.at(p.cur(), text.f("expected '{{' to start the body of '{s}', found {s}", .{f.name, parser.desc(p.cur())})); }
+    f.c = parse_stmt.block(p);
+    return f;
+}
+
+// field: value, ...  up to and including the closing '}'
+pub fn fieldInits(p: *parser.Parser, into: *ast.Node, what: []const u8) {
+    while (!p.at("}")) {
+        let fname = p.ident("field name");
+        _ = p.expect(":", text.f("':' and a value after field '{s}'", .{fname.s}));
+        let f = p.mk(.Field, fname);
+        f.name = fname.s;
+        f.a = parse_expr.expr(p);
+        into.add(f);
+        if (p.accept(",") == null) { break; }
+    }
+    _ = p.expect("}", text.f("'}}' to close the {s}", .{what}));
+}
+
+fn methodIn(p: *parser.Parser, owner: *token.Token) -> *ast.Node {
+    let m = fnSig(p);
+    if (m.a != null) { diag.at(m.tok, text.f("methods inside a type don't name a receiver: write 'fn {s}(...)'", .{m.name})); }
+    let rt = p.mk(.TName, owner);
+    rt.name = owner.s;
+    m.a = rt;
+    m.name2 = owner.s;
+    return fnBody(p, m);
+}
+
+// enum Color: u8 { Red = 1, Green }    enum Shape { Circle(f32), Rect { w: f32, h: f32 }, Empty }
+fn enumDecl(p: *parser.Parser) -> *ast.Node {
+    _ = p.expect("enum", "");
+    let name = p.ident("enum name");
+    let e = p.mk(.Enum, name);
+    e.name = name.s;
+    if (p.accept(":") != null) { e.b = parse_type.type_(p); }
+    let saved = p.cur_struct;
+    p.cur_struct = name.s;
+    _ = p.expect("{", "");
+    while (!p.at("}")) {
+        if (p.cur().k == .Eof) { diag.at(name, text.f("unclosed body of enum '{s}'", .{name.s})); }
+        let pub_ = p.accept("pub") != null;
+        if (atFn(p)) {
+            let m = methodIn(p, name);
+            m.is_pub = pub_;
+            e.add(m);
+            continue;
+        }
+        if (pub_) { diag.at(p.cur(), "variants are always visible; 'pub' goes on the enum"); }
+        let vn = p.ident("a variant name or 'fn'");
+        let v = p.mk(.Variant, vn);
+        v.name = vn.s;
+        if (p.accept("(") != null) {
+            v.flag = 1;
+            while (!p.at(")")) {
+                v.add(parse_type.type_(p));
+                if (p.accept(",") == null) { break; }
+            }
+            _ = p.expect(")", "')' to close the payload types");
+            if (v.count() == 0) { diag.at(vn, text.f("empty payload; write just '{s}'", .{vn.s})); }
+        } else if (p.accept("{") != null) {
+            v.flag = 2;
+            while (!p.at("}")) {
+                let fname = p.ident("field name");
+                _ = p.expect(":", "':' and a type after the field name");
+                let f = p.mk(.Field, fname);
+                f.name = fname.s;
+                f.a = parse_type.type_(p);
+                v.add(f);
+                if (p.accept(",") == null) { break; }
+            }
+            _ = p.expect("}", "'}' to close the payload fields");
+        }
+        if (p.accept("=") != null) { v.c = parse_expr.expr(p); }
+        e.add(v);
+        if (p.accept(",") == null && !p.at("}") && !atFn(p) && !p.at("pub")) {
+            diag.at(p.cur(), text.f("expected ',' after variant '{s}', found {s}", .{v.name, parser.desc(p.cur())}));
+        }
+    }
+    _ = p.expect("}", "");
+    p.cur_struct = saved;
+    return e;
+}
+
+// The fields and methods of a struct, from '{' to '}'. `name` names the type inside
+// (Self for an anonymous struct).
+pub fn structMembers(p: *parser.Parser, s: *ast.Node, name: *token.Token, kw: []const u8) {
+    let saved = p.cur_struct;
+    p.cur_struct = name.s;
+    _ = p.expect("{", "");
+    while (!p.at("}")) {
+        if (p.cur().k == .Eof) { diag.at(name, text.f("unclosed body of {s} '{s}'", .{kw, name.s})); }
+        let pub_ = p.accept("pub") != null;
+        if (atFn(p)) {
+            let m = methodIn(p, name);
+            m.is_pub = pub_;
+            s.add(m);
+            continue;
+        }
+        if (p.at("struct") || p.at("enum") || (p.at("packed") && p.atN(1, "struct"))) { // a type inside a type: Outer.Inner
+            let pk = p.accept("packed") != null;
+            let en = p.at("enum");
+            _ = p.next();
+            let nm = p.ident(if (en) "enum name" else "struct name");
+            // let the declaration read the name again, renamed
+            p.pos -= 1;
+            p.toks[p.pos].s = text.f("{s}.{s}", .{name.s, nm.s});
+            p.pos -= 1;
+            let inner = if (en) enumDecl(p) else structDeclKw(p, "struct");
+            inner.flag = if (pk) 1 else 0;
+            inner.is_pub = pub_;
+            s.add(inner);
+            continue;
+        }
+        if (p.at("let") || p.at("var")) { // a constant or variable that belongs to the type: Type.name
+            let l = parse_stmt.letStmt(p);
+            p.semi("the declaration");
+            l.is_pub = pub_;
+            s.add(l);
+            continue;
+        }
+        if (pub_) { diag.at(p.cur(), "fields are always visible; 'pub' is for functions, constants and types"); }
+        let fname = p.ident("a field name, 'fn', 'let' or 'var'");
+        _ = p.expect(":", "':' and a type after the field name");
+        let f = p.mk(.Field, fname);
+        f.name = fname.s;
+        f.a = parse_type.type_(p);
+        if (p.accept("=") != null) { f.b = parse_expr.expr(p); }
+        s.add(f);
+        if (p.accept(",") == null && !p.at("}") && !atFn(p) && !p.at("pub")) {
+            diag.at(p.cur(), text.f("expected ',' after field '{s}', found {s}", .{f.name, parser.desc(p.cur())}));
+        }
+    }
+    _ = p.expect("}", "");
+    p.cur_struct = saved;
+}
+
+// struct Name { ... }, or (kw = "union") the body of an extern union
+fn structDeclKw(p: *parser.Parser, kw: []const u8) -> *ast.Node {
+    _ = p.expect(kw, "");
+    let name = p.ident(text.f("{s} name", .{kw}));
+    let s = p.mk(.Struct, name);
+    s.name = name.s;
+    structMembers(p, s, name, kw);
+    return s;
+}
+
+// import std.io;  import net.http as web;  import c "stdio.h" as c;
+fn importDecl(p: *parser.Parser, u: *unit.Unit) {
+    let kw = p.next();
+    var im = unit.Import { alias: "", mpath: "", header: "", u: null, c: null, tok: kw };
+    if (p.cur().k == .Id && text.eq(p.cur().s, "c") && p.peek(1).k == .Str) { // a C header
+        _ = p.next();
+        let h = p.next();
+        im.header = h.str;
+        if (p.accept("as") == null) {
+            diag.at(p.cur(), text.f("a C header needs a name to reach it by: import c \"{s}\" as c;", .{im.header}));
+        }
+        im.alias = p.ident("a name for the header").s;
+    } else {
+        let first = p.ident("a module path, like std.io");
+        im.tok = first;
+        var path = first.s;
+        var last = first.s;
+        while (p.accept(".") != null) {
+            last = p.ident("the next part of the module path").s;
+            path = text.f("{s}.{s}", .{path, last});
+        }
+        im.mpath = path;
+        im.alias = if (p.accept("as") != null) p.ident("a name for the module").s else last;
+    }
+    p.semi("the import");
+    for (u.imports.items) |*o| {
+        if (text.eq(o.alias, im.alias)) {
+            diag.at(im.tok, text.f("'{s}' is already the name of another import; use 'as' to pick a different name", .{im.alias}));
+        }
+    }
+    u.imports.push(im);
+}
+
+fn newParser(toks: []token.Token, names: *parser.Names, u: ?*unit.Unit) -> parser.Parser {
+    return parser.Parser { toks: toks, pos: 0, names: names, cur_struct: "", in_receiver: false, cur_unit: u, no_lit: 0 };
+}
+
+// just the `import` lines at the top
+pub fn parseImports(toks: []token.Token, names: *parser.Names, u: *unit.Unit) {
+    var ps = newParser(toks, names, u);
+    let p = &ps;
+    while (p.at("import")) { importDecl(p, u); }
+}
+
+// Type names from every file, so `Name {` parses before Name's file is read.
+pub fn prescan(toks: []token.Token, names: *parser.Names) {
+    var i: usize = 0;
+    while (toks[i].k != .Eof) {
+        if (toks[i].k == .Kw && toks[i + 1].k == .Id) {
+            let kw = toks[i].s;
+            if (text.eq(kw, "struct") || text.eq(kw, "union")) { names.structs.push(toks[i + 1].s); }
+            if (text.eq(kw, "enum")) { names.enums.push(toks[i + 1].s); }
+            if (text.eq(kw, "fn") && parser.isOp(&toks[i + 2], "(")) { // fn Name(...) -> type
+                var d: i32 = 0;
+                var j = i + 2;
+                while (toks[j].k != .Eof) {
+                    if (parser.isOp(&toks[j], "(")) {
+                        d += 1;
+                    } else if (parser.isOp(&toks[j], ")")) {
+                        d -= 1;
+                        if (d == 0) { break; }
+                    }
+                    j += 1;
+                }
+                if (toks[j].k != .Eof && parser.isOp(&toks[j + 1], "->") && toks[j + 2].k == .Id && text.eq(toks[j + 2].s, "type")) {
+                    names.type_fns.push(toks[i + 1].s);
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+// The file's declarations, into u.items.
+pub fn parse(toks: []token.Token, names: *parser.Names, u: *unit.Unit) {
+    var ps = newParser(toks, names, u);
+    let p = &ps;
+    while (p.at("import")) { // already read by parseImports
+        while (!p.at(";")) { _ = p.next(); }
+        _ = p.next();
+    }
+    var items: alloc.Vec(*ast.Node) = .{};
+    while (p.cur().k != .Eof) {
+        if (p.at("import")) { diag.at(p.cur(), "imports go at the top of the file, before any declaration"); }
+        let pub_tok = p.accept("pub");
+        let is_pub = pub_tok != null;
+        var it: *ast.Node = undefined;
+        if (p.at("test")) {
+            let t = p.next();
+            if (pub_tok) |pt| { diag.at(pt, "a test can't be 'pub'"); }
+            if (p.cur().k != .Str) { diag.at(p.cur(), "expected the test's name as a string: test \"what it checks\" { ... }"); }
+            let name = p.next();
+            it = p.mk(.Test, t);
+            it.str = name.str;
+            if (!p.at("{")) { diag.at(p.cur(), text.f("expected '{{' to start the test's body, found {s}", .{parser.desc(p.cur())})); }
+            it.c = parse_stmt.block(p);
+            items.push(it);
+            continue;
+        }
+        if (p.at("comptime")) { // comptime { assert(@sizeOf(Header) == 16); }
+            let t = p.next();
+            if (pub_tok) |pt| { diag.at(pt, "a comptime block can't be 'pub'"); }
+            if (!p.at("{")) { diag.at(p.cur(), text.f("expected '{{' after 'comptime' at top level, found {s}", .{parser.desc(p.cur())})); }
+            it = p.mk(.Comptime, t);
+            it.flag = 1;
+            it.a = parse_stmt.block(p);
+            items.push(it);
+            continue;
+        }
+        if (atFn(p)) {
+            it = fnBody(p, fnSig(p));
+        } else if (p.at("export")) {
+            _ = p.next();
+            if (p.at("let") || p.at("var")) { // export var counter: u64 = 0;
+                it = parse_stmt.letStmt(p);
+                p.semi("the declaration");
+                it.exported = true;
+                it.is_pub = is_pub;
+                items.push(it);
+                continue;
+            }
+            it = fnSig(p);
+            if (it.a != null) { diag.at(it.tok, "methods can't be exported"); }
+            it.exported = true;
+            _ = fnBody(p, it);
+        } else if (p.at("extern")) {
+            let t = p.next();
+            if (p.cur().k == .Str) {
+                if (!text.eq(p.cur().str, "C")) { diag.at(p.cur(), "only extern \"C\" is supported"); }
+                _ = p.next();
+            }
+            if (p.at("let") || p.at("var")) { // extern var optind: i32;  a global defined in C
+                let kw = p.next();
+                let name = p.ident("variable name");
+                it = p.mk(.Let, name);
+                it.name = name.s;
+                it.flag = if (text.eq(kw.s, "let")) 1 else 0;
+                it.is_extern = true;
+                _ = p.expect(":", "':' and a type: an extern variable needs its type");
+                it.a = parse_type.type_(p);
+                if (p.at("=")) { diag.at(p.cur(), "an extern variable is defined in C, so it has no value here"); }
+                p.semi("the extern declaration");
+                it.is_pub = is_pub;
+                items.push(it);
+                continue;
+            }
+            if (p.at("union")) { // extern union Value { i: i64, f: f64 }: a C union
+                it = structDeclKw(p, "union");
+                it.flag = 2;
+                it.is_pub = is_pub;
+                items.push(it);
+                continue;
+            }
+            if (!atFn(p)) { diag.at(p.cur(), text.f("expected 'fn' or 'union' after 'extern', found {s}", .{parser.desc(p.cur())})); }
+            let f = fnSig(p);
+            if (p.at("{")) { diag.at(p.cur(), "an extern function has no body; end the declaration with ';'"); }
+            p.semi("the extern declaration");
+            f.is_pub = is_pub;
+            it = p.mk(.Extern, t);
+            it.add(f);
+        } else if (p.at("packed")) { // packed struct Flags { ... }: bit fields in one integer
+            _ = p.next();
+            if (!p.at("struct")) { diag.at(p.cur(), text.f("expected 'struct' after 'packed', found {s}", .{parser.desc(p.cur())})); }
+            it = structDeclKw(p, "struct");
+            it.flag = 1;
+        } else if (p.at("union")) {
+            diag.at(p.cur(), "unions exist only for C interop: write 'extern union'; use an enum with payloads for a tagged union");
+        } else if (p.at("struct")) {
+            it = structDeclKw(p, "struct");
+        } else if (p.at("enum")) {
+            it = enumDecl(p);
+        } else if (p.at("error") && p.peek(1).k == .Id) {
+            _ = p.next();
+            let name = p.ident("error set name");
+            it = p.mk(.ErrSet, name);
+            it.name = name.s;
+            _ = p.expect("{", "");
+            while (!p.at("}")) {
+                let en = p.ident("an error name");
+                let e = p.mk(.Name, en);
+                e.name = en.s;
+                it.add(e);
+                if (p.accept(",") == null) { break; }
+            }
+            _ = p.expect("}", "'}' to close the error set");
+        } else if (p.at("let") || p.at("var")) {
+            it = parse_stmt.letStmt(p);
+            p.semi("the declaration");
+        } else {
+            diag.at(p.cur(), text.f("expected 'fn', 'struct', 'enum', 'error', 'extern', 'export', 'let', 'var' or 'test' at top level, found {s}", .{parser.desc(p.cur())}));
+        }
+        it.is_pub = is_pub;
+        items.push(it);
+    }
+    u.items = items.items;
+}

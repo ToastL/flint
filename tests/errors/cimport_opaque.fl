@@ -1,0 +1,6 @@
+import c "mods/cdefs.h" as c;
+
+fn main() {
+    var o: c.struct_opaque = undefined;
+    _ = o;
+}

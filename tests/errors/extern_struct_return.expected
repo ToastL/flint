@@ -1,0 +1,1 @@
+an extern function can't return P yet (C returns small structs in registers, which Flint's calls to C don't handle): have the C side write it through a pointer parameter

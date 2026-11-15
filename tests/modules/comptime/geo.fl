@@ -1,0 +1,7 @@
+import std.list;
+pub let Points = list.ArrayList(Point);
+pub struct Point { x: i32, y: i32 }
+pub fn Grid(comptime n: usize) -> type {
+    let cells = n * n;
+    return struct { c: [cells]u8 = @splat(0), let size: usize = cells; };
+}

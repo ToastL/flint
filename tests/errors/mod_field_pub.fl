@@ -1,0 +1,5 @@
+struct P {
+    pub x: i64,
+}
+
+fn main() {}

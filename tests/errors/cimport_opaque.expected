@@ -1,0 +1,1 @@
+struct opaque can only be used behind a pointer (C declares struct opaque without its fields)

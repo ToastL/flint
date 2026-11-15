@@ -1,0 +1,1 @@
+reading a field of an extern union is only allowed inside an 'unsafe' block

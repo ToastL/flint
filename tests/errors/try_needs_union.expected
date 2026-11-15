@@ -1,0 +1,1 @@
+'try' passes the error up, so 'main' must return an error union (like -> !void)

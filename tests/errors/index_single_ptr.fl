@@ -1,0 +1,7 @@
+import std.io;
+
+fn main() -> !void {
+    var x: i32 = 1;
+    let p = &x;
+    try io.print("{}\n", .{p[0]});
+}

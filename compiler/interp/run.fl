@@ -1,0 +1,434 @@
+// interp.run - runs IR at compile time (comptime code).
+//
+// The interpreter executes the same unoptimized IR that the backend compiles, with the backend's
+// semantics (see arm64/), so comptime code behaves exactly like runtime code: overflow checks,
+// bounds checks and panics are the same instructions, and a panic becomes a compile error.
+// It's deterministic (no I/O, no clock, no host addresses leak out) and stops after step_limit
+// instructions. Registers hold 64 bits; a float register holds a double's bits (an f32 value is
+// kept rounded to float precision).
+
+import base.alloc;
+import base.text;
+import syntax.token;
+import ir.ir;
+import interp.memory as mem;
+import interp.calls;
+
+
+pub var step_limit: i64 = 10000000;
+
+pub struct CtRegion {
+    kind: mem.CR,
+    sym: []const u8,
+    data: []u8,
+    size: i64,
+    id: i32,
+}
+
+fn D(x: i64) -> f64 { return @bitcast(f64, x); }
+fn B(d: f64) -> i64 { return @bitcast(i64, d); }
+
+// ---------- condition codes ----------
+
+fn ccHolds(cc: ir.CC, N: bool, Z: bool, Cf: bool, V: bool) -> bool {
+    switch (cc) {
+        .EQ => { return Z; }
+        .NE => { return !Z; }
+        .LT => { return N != V; }
+        .LE => { return Z || N != V; }
+        .GT => { return !Z && N == V; }
+        .GE => { return N == V; }
+        .LO => { return !Cf; }
+        .LS => { return !Cf || Z; }
+        .HI => { return Cf && !Z; }
+        .HS => { return Cf; }
+        .MI => { return N; }
+        .PL => { return !N; }
+    }
+}
+
+fn icmp(cc: ir.CC, a: i64, c: i64) -> bool {
+    let ua = @bitcast(u64, a);
+    let ub = @bitcast(u64, c);
+    let r = ua -% ub;
+    let N = @bitcast(i64, r) < 0;
+    let Z = r == 0;
+    let Cf = ua >= ub;
+    let V = ((a ^ c) & (a ^ @bitcast(i64, r))) < 0;
+    return ccHolds(cc, N, Z, Cf, V);
+}
+
+fn fcmpCC(cc: ir.CC, a: f64, c: f64) -> bool {
+    if (a != a || c != c) { return ccHolds(cc, false, false, true, true); }
+    if (a < c) { return ccHolds(cc, true, false, false, false); }
+    if (a == c) { return ccHolds(cc, false, true, true, false); }
+    return ccHolds(cc, false, false, true, false);
+}
+
+fn toF32(d: f64) -> f64 { return (d as f32) as f64; }
+
+fn roundCls(d: f64, cls: ir.Cls) -> f64 { return if (cls == .F32) toF32(d) else d; }
+
+fn fcvtS(d: f64) -> i64 {
+    if (d != d) { return 0; }
+    if (d >= 9223372036854775808.0) { return 0x7fffffffffffffff; }
+    if (d < -9223372036854775808.0) { return -0x7fffffffffffffff - 1; }
+    return d as i64;
+}
+
+fn fcvtU(d: f64) -> u64 {
+    if (d != d || d <= 0.0) { return 0; }
+    if (d >= 18446744073709551616.0) { return 0xffffffffffffffff; }
+    if (d < 1.0) { return 0; }
+    return d as u64;
+}
+
+// the high 64 bits of a 128-bit product
+fn umulh(a: u64, c: u64) -> u64 {
+    let al = a & 0xffffffff;
+    let ah = a >> 32;
+    let bl = c & 0xffffffff;
+    let bh = c >> 32;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid = (ll >> 32) + (lh & 0xffffffff) + (hl & 0xffffffff);
+    return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+
+fn smulh(a: i64, c: i64) -> i64 {
+    var h = umulh(@bitcast(u64, a), @bitcast(u64, c));
+    if (a < 0) { h -%= @bitcast(u64, c); }
+    if (c < 0) { h -%= @bitcast(u64, a); }
+    return @bitcast(i64, h);
+}
+
+fn sext(x: u64, size: usize, signed: bool) -> u64 {
+    if (size >= 8) { return x; }
+    let sh = (64 - 8 * size) as u64;
+    return if (signed) @bitcast(u64, @bitcast(i64, x << sh) >> sh) else (x << sh) >> sh;
+}
+
+// ---------- SIMD lanes ----------
+
+fn opv(o: ir.Opd, v: []i64) -> i64 { return if (o.k == .Imm) o.v else v[o.v as usize]; }
+
+fn f32bits(d: f64) -> u64 { return @bitcast(u32, d as f32) as u64; }
+fn f32of(bits: u64) -> f64 { return @bitcast(f32, @truncate(u32, bits)) as f64; }
+
+fn vecOp(in: *const ir.Inst, v: []i64) -> mem.CtFail!void {
+    let es = ir.vlEsize(in.imm) as usize;
+    let total = ir.vlTotal(in.imm) as usize;
+    let n = total / es;
+    let fl = ir.vlFloat(in.imm);
+    var a: [16]u8 = @splat(0);
+    var c: [16]u8 = @splat(0);
+    var out: [16]u8 = @splat(0);
+    let op = in.mem;
+    if (op == ir.Vop.Splat as i32) {
+        for (0..n) |l| {
+            if (fl && es == 4) {
+                mem.putBytes(out[..], 4 * l, f32bits(D(v[in.b.v as usize])), 4);
+            } else if (fl) {
+                mem.putBytes(out[..], 8 * l, @bitcast(u64, v[in.b.v as usize]), 8);
+            } else {
+                mem.putBytes(out[..], es * l, @bitcast(u64, opv(in.b, v)), es);
+            }
+        }
+        try mem.memWrite(@bitcast(u64, opv(in.a, v)), out[0..total]);
+        return;
+    }
+    let neg = op == ir.Vop.Neg as i32;
+    try mem.memRead(@bitcast(u64, opv(in.b, v)), a[0..total]);
+    if (!neg) { try mem.memRead(@bitcast(u64, opv(in.c, v)), c[0..total]); }
+    for (0..n) |l| {
+        if (fl) {
+            var x: f64 = 0.0;
+            var y: f64 = 0.0;
+            if (es == 4) {
+                x = f32of(mem.getBytes(a[..], 4 * l, 4));
+                if (!neg) { y = f32of(mem.getBytes(c[..], 4 * l, 4)); }
+            } else {
+                x = D(@bitcast(i64, mem.getBytes(a[..], 8 * l, 8)));
+                if (!neg) { y = D(@bitcast(i64, mem.getBytes(c[..], 8 * l, 8))); }
+            }
+            var r: f64 = 0.0;
+            if (op == ir.Vop.Add as i32) { r = x + y; }
+            if (op == ir.Vop.Sub as i32) { r = x - y; }
+            if (op == ir.Vop.Mul as i32) { r = x * y; }
+            if (op == ir.Vop.Div as i32) { r = x / y; }
+            if (neg) { r = -x; }
+            if (es == 4) { mem.putBytes(out[..], 4 * l, f32bits(r), 4); } else { mem.putBytes(out[..], 8 * l, @bitcast(u64, B(r)), 8); }
+        } else {
+            let x = mem.getBytes(a[..], es * l, es);
+            let y = if (neg) 0 else mem.getBytes(c[..], es * l, es);
+            var r: u64 = 0;
+            if (op == ir.Vop.Add as i32) { r = x +% y; }
+            if (op == ir.Vop.Sub as i32) { r = x -% y; }
+            if (op == ir.Vop.Mul as i32) { r = x *% y; }
+            if (op == ir.Vop.And as i32) { r = x & y; }
+            if (op == ir.Vop.Or as i32) { r = x | y; }
+            if (op == ir.Vop.Xor as i32) { r = x ^ y; }
+            if (neg) { r = 0 -% x; }
+            mem.putBytes(out[..], es * l, r, es);
+        }
+    }
+    try mem.memWrite(@bitcast(u64, opv(in.a, v)), out[0..total]);
+}
+
+// the backend's order: pairwise (faddp) for floats
+fn vecReduce(in: *const ir.Inst, v: []i64) -> mem.CtFail!i64 {
+    let es = ir.vlEsize(in.imm) as usize;
+    let total = ir.vlTotal(in.imm) as usize;
+    let n = total / es;
+    var a: [16]u8 = @splat(0);
+    try mem.memRead(@bitcast(u64, opv(in.a, v)), a[0..total]);
+    if (ir.vlFloat(in.imm)) {
+        var x: [4]f64 = @splat(0.0);
+        for (0..n) |l| {
+            x[l] = if (es == 4) f32of(mem.getBytes(a[..], 4 * l, 4)) else D(@bitcast(i64, mem.getBytes(a[..], 8 * l, 8)));
+        }
+        if (n == 4) {
+            let p = toF32(x[0] + x[1]);
+            let q = toF32(x[2] + x[3]);
+            return B(toF32(p + q));
+        }
+        return B(if (es == 4) toF32(x[0] + x[1]) else x[0] + x[1]);
+    }
+    var s: u64 = 0;
+    for (0..n) |l| { s +%= mem.getBytes(a[..], es * l, es); }
+    return @bitcast(i64, sext(s, es, ir.vlSigned(in.imm)));
+}
+
+// ---------- the interpreter loop ----------
+
+pub fn exec(f: *ir.IRFunc, args: []const i64, argcls: []const ir.Cls, nfixed: usize) -> mem.CtFail!i64 {
+    // where each argument went: x0-x7, d0-d7, or the stack (the backend's rules)
+    var ireg: [8]i64 = @splat(0);
+    var freg: [8]i64 = @splat(0);
+    let stk = alloc.make(i64, args.len + 1);
+    var ic: usize = 0;
+    var fc: usize = 0;
+    var ns: usize = 0;
+    for (0..args.len) |j| {
+        let fp = argcls[j] != .I;
+        let on_stack = j >= nfixed || (if (fp) fc else ic) >= 8;
+        if (on_stack) {
+            stk[ns] = args[j];
+            ns += 1;
+            if (j < nfixed) {
+                if (fp) { fc += 1; } else { ic += 1; }
+            }
+        } else if (fp) {
+            freg[fc] = args[j];
+            fc += 1;
+        } else {
+            ireg[ic] = args[j];
+            ic += 1;
+        }
+    }
+    let lay = mem.layoutOf(f);
+    let loff = lay.off;
+    let fr = mem.newRegion(.Frame, lay.size);
+    mem.regs.items[fr as usize].name = text.f("a local variable of '{s}'", .{if (f.name.len > 0) f.name else f.sym});
+    let v = alloc.make(i64, f.vcls.items.len + 1);
+    var blk: usize = 0;
+    var result: i64 = 0;
+    while (true) {
+        let bb = &f.blocks.items[blk];
+        var next: i32 = -1;
+        for (bb.insts.items) |*in| {
+            if (in.tok != null) { mem.cur_tok = in.tok; }
+            mem.steps += 1;
+            if (mem.steps > step_limit) {
+                return mem.fail(null, text.f("comptime evaluation took more than {} steps (an infinite loop?)", .{step_limit}));
+            }
+            let d: usize = if (in.dst >= 0) in.dst as usize else 0; // (-1: no result)
+            switch (in.op) {
+                .Nop => {}
+                .GetArg => {
+                    if (in.imm >= 1000) {
+                        v[d] = if (in.imm - 1000 < ns as i64) stk[(in.imm - 1000) as usize] else 0;
+                    } else {
+                        v[d] = if (in.cls == .I) ireg[(in.imm & 7) as usize] else freg[(in.imm & 7) as usize];
+                    }
+                    if (in.cls == .F32) { v[d] = B(toF32(D(v[d]))); }
+                }
+                .IConst => { v[d] = in.imm; }
+                .FConst => { v[d] = B(roundCls(in.fimm, in.cls)); }
+                .Mov => { v[d] = if (in.cls == .I) opv(in.a, v) else v[in.a.v as usize]; }
+                .Add => { v[d] = opv(in.a, v) +% opv(in.b, v); }
+                .Sub => { v[d] = opv(in.a, v) -% opv(in.b, v); }
+                .Mul => { v[d] = opv(in.a, v) *% opv(in.b, v); }
+                .SDiv => {
+                    let x = opv(in.a, v);
+                    let y = opv(in.b, v);
+                    v[d] = if (y == 0) 0 else if (y == -1) 0 -% x else x / y;
+                }
+                .UDiv => {
+                    let y = @bitcast(u64, opv(in.b, v));
+                    v[d] = if (y == 0) 0 else @bitcast(i64, @bitcast(u64, opv(in.a, v)) / y);
+                }
+                .SRem => {
+                    let x = opv(in.a, v);
+                    let y = opv(in.b, v);
+                    v[d] = if (y == 0) x else if (y == -1) 0 else x % y;
+                }
+                .URem => {
+                    let y = @bitcast(u64, opv(in.b, v));
+                    v[d] = if (y == 0) opv(in.a, v) else @bitcast(i64, @bitcast(u64, opv(in.a, v)) % y);
+                }
+                .And => { v[d] = opv(in.a, v) & opv(in.b, v); }
+                .Or => { v[d] = opv(in.a, v) | opv(in.b, v); }
+                .Xor => { v[d] = opv(in.a, v) ^ opv(in.b, v); }
+                .Shl => { v[d] = @bitcast(i64, @bitcast(u64, opv(in.a, v)) << (@bitcast(u64, opv(in.b, v)) & 63)); }
+                .Asr => { v[d] = opv(in.a, v) >> (@bitcast(u64, opv(in.b, v)) & 63); }
+                .Lsr => { v[d] = @bitcast(i64, @bitcast(u64, opv(in.a, v)) >> (@bitcast(u64, opv(in.b, v)) & 63)); }
+                .Neg => { v[d] = 0 -% opv(in.a, v); }
+                .Not => { v[d] = ~opv(in.a, v); }
+                .FAdd => { v[d] = B(roundCls(D(v[in.a.v as usize]) + D(v[in.b.v as usize]), in.cls)); }
+                .FSub => { v[d] = B(roundCls(D(v[in.a.v as usize]) - D(v[in.b.v as usize]), in.cls)); }
+                .FMul => { v[d] = B(roundCls(D(v[in.a.v as usize]) * D(v[in.b.v as usize]), in.cls)); }
+                .FDiv => { v[d] = B(roundCls(D(v[in.a.v as usize]) / D(v[in.b.v as usize]), in.cls)); }
+                .FNeg => { v[d] = B(-D(v[in.a.v as usize])); }
+                .FSqrt => { v[d] = B(roundCls(sqrt(D(v[in.a.v as usize])), in.cls)); }
+                .FAbs => { v[d] = v[in.a.v as usize] & 0x7fffffffffffffff; } // the sign bit cleared, like fabs
+                .Cmp => { v[d] = if (icmp(in.mem as ir.CC, opv(in.a, v), opv(in.b, v))) 1 else 0; }
+                .FCmp => { v[d] = if (fcmpCC(in.mem as ir.CC, D(v[in.a.v as usize]), D(v[in.b.v as usize]))) 1 else 0; }
+                .Sel => {
+                    if (in.cls == .I) {
+                        v[d] = if (opv(in.a, v) != 0) opv(in.b, v) else opv(in.c, v);
+                    } else {
+                        v[d] = if (opv(in.a, v) != 0) v[in.b.v as usize] else v[in.c.v as usize];
+                    }
+                }
+                .Ext => { v[d] = @bitcast(i64, sext(@bitcast(u64, opv(in.a, v)), (in.mem & 0x7f) as usize, (in.mem & 0x80) != 0)); }
+                .Scvtf => {
+                    let x = opv(in.a, v) as f64;
+                    v[d] = B(if (in.cls == .F32) toF32(x) else x);
+                }
+                .Ucvtf => {
+                    let x = @bitcast(u64, opv(in.a, v)) as f64;
+                    v[d] = B(if (in.cls == .F32) toF32(x) else x);
+                }
+                .Fcvtzs => { v[d] = fcvtS(D(v[in.a.v as usize])); }
+                .Fcvtzu => { v[d] = @bitcast(i64, fcvtU(D(v[in.a.v as usize]))); }
+                .Fcvt => { v[d] = B(roundCls(D(v[in.a.v as usize]), in.cls)); }
+                .Load, .Store => {
+                    let addr = if (in.slot >= 0) mem.mkptr(fr, loff[in.slot as usize] + in.imm) else @bitcast(u64, opv(in.a, v)) +% @bitcast(u64, in.imm);
+                    let size: usize = if (in.cls == .F32) 4 else if (in.cls == .F64) 8 else (in.mem & 0x7f) as usize;
+                    if (in.op == .Load) {
+                        if (in.cls == .F32) {
+                            v[d] = B(f32of(try mem.readU(addr, 4)));
+                        } else if (in.cls == .F64) {
+                            v[d] = @bitcast(i64, try mem.readU(addr, 8));
+                        } else {
+                            v[d] = try mem.loadInt(addr, in.mem);
+                        }
+                    } else {
+                        if (in.cls == .F32) {
+                            try mem.writeU(addr, f32bits(D(v[in.b.v as usize])), 4);
+                        } else if (in.cls == .F64) {
+                            try mem.writeU(addr, @bitcast(u64, v[in.b.v as usize]), 8);
+                        } else {
+                            try mem.writeU(addr, @bitcast(u64, opv(in.b, v)), size);
+                        }
+                    }
+                }
+                .AddrSlot => { v[d] = @bitcast(i64, mem.mkptr(fr, loff[in.slot as usize])); }
+                .AddrSym => { v[d] = @bitcast(i64, mem.mkptr(mem.regionForSym(in.sym, in.mem != 0, in.tok), 0)); }
+                .Call => {
+                    let r = try calls.doCall(in, v);
+                    if (in.dst >= 0) {
+                        v[d] = r;
+                        if (in.cls == .F32) { v[d] = B(toF32(D(r))); }
+                    }
+                }
+                .Memcpy => {
+                    let tmp = alloc.make(u8, in.imm as usize);
+                    try mem.memRead(@bitcast(u64, opv(in.b, v)), tmp);
+                    try mem.memWrite(@bitcast(u64, opv(in.a, v)), tmp);
+                }
+                .Memzero => {
+                    let p = try mem.memSpan(@bitcast(u64, opv(in.a, v)), in.imm, true);
+                    for (0..p.len) |i| { p[i] = 0; }
+                }
+                .SMulH => { v[d] = smulh(opv(in.a, v), opv(in.b, v)); }
+                .UMulH => { v[d] = @bitcast(i64, umulh(@bitcast(u64, opv(in.a, v)), @bitcast(u64, opv(in.b, v)))); }
+                .Vec => { try vecOp(in, v); }
+                .VReduce => { v[d] = try vecReduce(in, v); }
+                .Jmp => { next = in.t1; }
+                .Br => { next = if (opv(in.a, v) != 0) in.t1 else in.t2; }
+                .Ret => {
+                    if (in.a.k != .None) { result = if (in.cls == .I) opv(in.a, v) else v[in.a.v as usize]; }
+                    let reg = mem.regs.items[fr as usize];
+                    reg.dead = mem.depth > 1; // the outermost frame stays readable: the result may live there
+                    if (reg.dead) { reg.data = alloc.make(u8, 0); }
+                    return result;
+                }
+                .Trap => { return mem.fail(null, "comptime code reached unreachable code"); }
+            }
+            if (next >= 0) { break; }
+        }
+        if (next < 0) { return mem.fail(null, text.f("internal error: block b{} of {s} has no terminator", .{blk, f.sym})); }
+        blk = next as usize;
+    }
+}
+
+pub fn init(m: *ir.Module, lookup: fn([]const u8, *[]const u8) -> ?*ir.IRFunc) {
+    mem.MOD = m;
+    mem.LOOKUP = lookup;
+}
+
+// Runs f (which takes no arguments). True on success, with its x0 / d0 bits in ret; false with err
+// filled in on failure.
+pub fn run(f: *ir.IRFunc, ret: *u64, err: *mem.CtError) -> bool {
+    let saved_err = mem.ERR;
+    let saved_depth = mem.depth;
+    let saved_tok = mem.cur_tok;
+    mem.ERR = err;
+    err.* = @zeroes(mem.CtError);
+    mem.steps = 0; // the limit is per evaluation
+    mem.first_frame = if (mem.regs.items.len > 0) mem.regs.items.len else 1;
+    mem.cur_tok = null;
+    calls.pushFrame(f, null);
+    var ok = true;
+    if (exec(f, alloc.make(i64, 0), alloc.make(ir.Cls, 0), 0)) |r| {
+        ret.* = @bitcast(u64, r);
+    } else |_| {
+        ok = false;
+    }
+    mem.depth = saved_depth;
+    mem.ERR = saved_err;
+    mem.cur_tok = saved_tok;
+    return ok;
+}
+
+// what a comptime pointer points into
+pub fn region(ptr: u64, out: *CtRegion, off: *i64) -> bool {
+    let ri = ptr >> 32;
+    out.* = @zeroes(CtRegion);
+    if (ptr == 0 || ri == 0 || ri >= mem.regs.items.len as u64 || mem.regs.items[ri as usize].dead) { return false; }
+    let r = mem.regs.items[ri as usize];
+    out.kind = r.kind;
+    out.sym = r.sym;
+    out.data = r.data;
+    out.size = r.size;
+    out.id = ri as i32;
+    off.* = @bitcast(i64, ptr & 0xffffffff);
+    return true;
+}
+
+// frames of finished runs aren't needed once their results were copied out
+pub fn release() {
+    var i = mem.first_frame;
+    while (i < mem.regs.items.len) {
+        let r = mem.regs.items[i];
+        if (r.kind == .Frame && !r.dead) {
+            r.dead = true;
+            r.data = alloc.make(u8, 0);
+        }
+        i += 1;
+    }
+}

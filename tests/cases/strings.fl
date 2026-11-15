@@ -1,0 +1,114 @@
+// Strings are []const u8. Nothing allocates unless it's handed an allocator.
+
+import std.ascii;
+import std.fmt;
+import std.heap;
+import std.io;
+import std.list;
+import std.mem;
+
+struct User { name: str, age: i64 }
+
+fn greet(buf: []u8, u: User) -> ![]u8 { return fmt.bufPrint(buf, "Hi {s}, you are {}!", .{ u.name, u.age }); }
+
+fn main() -> !void {
+    var gpa = heap.DebugAllocator.init();
+    defer gpa.deinit();
+    let alloc = gpa.allocator();
+
+    // formatting
+    let name = "Ada";
+    let n: i64 = 3;
+    let pi = 3.14159;
+    try io.print("hello {s}, {} + {} = {}, pi ~ {}, ok={}\n", .{ name, n, n, n + n, pi, n > 2 });
+    var buf: [64]u8 = undefined;
+    let g = try greet(&buf, User { name: "Grace", age: 85 });
+    try io.print("{s} {}\n", .{ g, g.len });
+    let small: u8 = 255;
+    let neg: i8 = -128;
+    let tiny: f32 = 0.1;
+    let none: ?i32 = null;
+    try io.print("types: {} {} {} {} {} {} {}\n", .{ small, neg, tiny, 1.0 / 3.0, -0.5, 1e21, none });
+    try io.print("braces: {{}} {s}\n", .{"line one\nline two"});
+    try io.print("str is {s}, a literal is {s}\n", .{ @tagName(mem.Order.eq), "[]const u8" });
+
+    // joining strings allocates, so it's spelled out
+    let s = try fmt.allocPrint(alloc, "{s}{s}!", .{ "foo", "bar" });
+    defer alloc.free(s);
+    try io.print("{s} {}\n", .{ s, s.len });
+
+    // comparisons go through mem (they're loops over the bytes)
+    try io.print("{} {} {} {}\n", .{ mem.order(u8, "apple", "banana"), mem.order(u8, "b", "abc"), mem.eql(u8, "same", "same"), mem.eql(u8, "x", "y") });
+    try io.print("{} {}\n", .{ mem.compare("ab", "abc") < 0, mem.compare("b", "a") > 0 });
+
+    // searching
+    let text = "the quick brown fox";
+    try io.print("{} {} {} {} {} {}\n", .{ mem.find(text, "quick"), mem.find(text, "cat"), mem.contains(text, "fox"), mem.startsWith(u8, text, "the"), mem.endsWith(u8, text, "fox"), mem.endsWith(u8, text, "the") });
+    try io.print("{any} {any} {}\n", .{ mem.indexOf(u8, text, 'q'), mem.indexOfSlice(u8, text, "brown"), mem.startsWith(u8, text, "the") });
+
+    // trimming and splitting: views, no allocation
+    let padded = "  \t hi there \n";
+    try io.print("[{s}] [{s}] [{s}]\n", .{ mem.trim(padded), mem.trimStart(padded), mem.trimEnd(padded) });
+    var parts = mem.split("a,b,,c", ",");
+    while (parts.next()) |p| { try io.print("[{s}]", .{p}); }
+    try io.print("\n", .{});
+    var words = mem.split("one two three", " ");
+    var i: usize = 0;
+    while (words.next()) |w| {
+        try io.print("{} {s} {}\n", .{ i, w, w.len });
+        i += 1;
+    }
+    var chars = mem.split("abc", "");
+    while (chars.next()) |ch| { try io.print("{s}.", .{ch}); }
+    var lines = mem.splitScalar(u8, "x\ny\n", '\n');
+    while (lines.next()) |line| { try io.print("<{s}>", .{line}); }
+    try io.print("\n", .{});
+
+    // building new strings: each takes an allocator, and the caller frees the result
+    let rep = try mem.repeat(alloc, "ab", 3);
+    defer alloc.free(rep);
+    let up = try ascii.upperAlloc(alloc, "Hello");
+    defer alloc.free(up);
+    let low = try ascii.lowerAlloc(alloc, "WORLD");
+    defer alloc.free(low);
+    try io.print("{s} {s} {s}\n", .{ rep, up, low });
+    let r1 = try mem.replaceAll(alloc, "a-b-c", "-", "+");
+    defer alloc.free(r1);
+    let r2 = try mem.replace(alloc, "a-b-c", "-", "+");
+    defer alloc.free(r2);
+    let r3 = try mem.replaceAll(alloc, "aaa", "a", "bb");
+    defer alloc.free(r3);
+    let parts2 = [_]str { "a", "b", "", "c" };
+    let joined = try mem.join(alloc, parts2[..], "|");
+    defer alloc.free(joined);
+    try io.print("{s} {s} {s} {s}\n", .{ r1, r2, r3, joined });
+
+    // parsing and converting
+    let one: i64 = 123;
+    var numbuf: [32]u8 = undefined;
+    var numbuf2: [32]u8 = undefined;
+    try io.print("{} {} {} {s} {s}\n", .{ try fmt.parseInt(i64, "42", 10) + 1, try fmt.parseInt(i64, mem.trim(" -17 "), 10), try fmt.parseFloat(f64, "2.5") * 2, try fmt.bufPrint(&numbuf, "{}", .{one}), try fmt.bufPrint(&numbuf2, "{}", .{0.25}) });
+    try io.print("{} {} {} {!} {!}\n", .{ try fmt.parseInt(u8, "255", 10), try fmt.parseInt(i32, "-ff", 16), try fmt.parseInt(i8, "-128", 10), fmt.parseInt(u8, "256", 10), fmt.parseInt(u32, "-1", 10) });
+    try io.print("{} {!}\n", .{ try fmt.parseFloat(f32, "0.5"), fmt.parseFloat(f64, "x") });
+
+    // bytes
+    let c = "x9 "[1];
+    try io.print("{} {} {} {c}\n", .{ ascii.isDigit(c), ascii.isAlpha("x"[0]), ascii.isSpace(" "[0]), c });
+
+    // an ArrayList(u8) as a string builder
+    var b = list.ArrayList(u8).init(alloc);
+    defer b.deinit();
+    for (0..5) |k| { try b.writer().print("{} ", .{k * k}); }
+    try io.print("{s}\n", .{b.items[0 .. b.items.len - 1]});
+
+    // []u8 is a string you can change; it converts to []const u8 for free
+    var bytes = [_]u8 { 'h', 'e', 'y' };
+    let word: str = &bytes;
+    bytes[0] = 'H';
+    try io.print("{s} {} {x}\n", .{ word, word.len, word });
+
+    // C strings: a NUL-terminated copy, and back
+    let cs = try mem.dupeZ(alloc, "to C");
+    defer mem.freeZ(alloc, cs);
+    try io.print("{s} {}\n", .{ cs, mem.span(cs).len });
+}

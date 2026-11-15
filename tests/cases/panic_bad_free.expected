@@ -1,0 +1,4 @@
+
+--- stderr
+panic: DebugAllocator: free of memory it didn't allocate (or of a pointer into the middle of an allocation)
+--- exit 101

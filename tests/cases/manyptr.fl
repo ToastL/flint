@@ -1,0 +1,42 @@
+// [*]T points at an unknown number of items: it can be indexed, offset and sliced (in unsafe code).
+// *T points at exactly one item: it can only be dereferenced.
+
+import std.io;
+
+extern fn memset(p: [*]u8, c: i32, n: usize) -> [*]u8;
+
+struct P { x: i32, y: i32 }
+
+unsafe fn total(p: [*]const i32, n: usize) -> i32 { // the caller promises p has n items
+    var s: i32 = 0;
+    for (0..n) |i| { s += p[i]; }
+    return s;
+}
+
+fn main() -> !void {
+    var arr: [6]i32 = undefined;
+    let xs: []i32 = &arr;
+    for (0..xs.len) |i| { xs[i] = @truncate(i32, i) * 10; }
+    let p: [*]i32 = xs.ptr;
+    unsafe {
+        let q = p + 2;
+        try io.print("{} {} {} {} {}\n", .{ p[1], q[0], q[3], q - p, total(xs.ptr, xs.len) });
+        q[1] = -1;
+        let mid = (p + 1)[0..3];
+        try io.print("{} {} {} {}\n", .{ mid.len, mid[0], mid[1], mid[2] });
+        let cp: [*]const i32 = p; // adding const is free
+        try io.print("{}\n", .{cp[3]});
+    }
+    let maybe: ?[*]i32 = null;
+    try io.print("{}\n", .{maybe == null});
+
+    var four: [4]u8 = undefined;
+    let bytes: []u8 = &four;
+    _ = memset(bytes.ptr, 65, bytes.len);
+    try io.print("{} {}\n", .{ bytes[0], bytes[3] });
+
+    var pt = P { x: 1, y: 2 };
+    let one: *P = &pt;
+    one.x = 5;
+    try io.print("{} {}\n", .{ one.*.x, one.y });
+}

@@ -1,0 +1,6 @@
+import std.io;
+
+unsafe fn danger() -> i32 { return 1; }
+fn main() -> !void {
+    try io.print("{}\n", .{danger()});
+}

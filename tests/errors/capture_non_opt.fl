@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    let ok = true;
+    if (ok) |v| { try io.print("{}\n", .{v}); }
+}

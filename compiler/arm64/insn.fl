@@ -1,0 +1,215 @@
+// arm64.insn - the state of the function being emitted, and instruction helpers: register names,
+// loading constants, loads and stores of every width with the right addressing form, getting an
+// operand into a register (from its register or its spill slot), moves, branches and compares.
+//
+// Scratch registers never allocated: x16, x17, x8 and d29-d31. x0-x7 / d0-d7 are only used to
+// pass arguments and results.
+
+import base.alloc;
+import base.text;
+import ir.ir;
+
+pub var O: *text.Buf = undefined;     // the assembly being written
+pub var F: *ir.IRFunc = undefined;    // the function being emitted
+pub var FN: usize = 0;                // its index (labels are Lb<FN>_<block>)
+pub var order: alloc.Vec(i32) = @zeroes(alloc.Vec(i32)); // blocks in layout order
+pub var layout_idx: []i32 = @zeroes([]i32); // block -> index in order (-1 = not emitted)
+pub var vreg_reg: []i32 = @zeroes([]i32);   // vreg -> physical register, or -1 if spilled
+pub var vreg_off: []i32 = @zeroes([]i32);   // vreg -> spill offset below x29
+pub var slot_off: []i32 = @zeroes([]i32);   // slot -> offset below x29
+pub var usecnt: []i32 = @zeroes([]i32);
+pub var saved_int: alloc.Vec(i32) = @zeroes(alloc.Vec(i32));
+pub var saved_fp: alloc.Vec(i32) = @zeroes(alloc.Vec(i32));
+pub var frame_size: i32 = 0;
+
+pub let CCN = [_][]const u8 { "eq", "ne", "lt", "le", "gt", "ge", "lo", "ls", "hi", "hs", "mi", "pl" };
+pub let CCINV = [_]ir.CC { .NE, .EQ, .GE, .GT, .LE, .LT, .HS, .HI, .LS, .LO, .PL, .MI };
+
+var XN: [32][]const u8 = @zeroes([32][]const u8);
+var WN: [32][]const u8 = @zeroes([32][]const u8);
+var DN: [32][]const u8 = @zeroes([32][]const u8);
+var SN: [32][]const u8 = @zeroes([32][]const u8);
+
+pub fn initNames() {
+    for (0..32) |i| {
+        XN[i] = text.f("x{}", .{i});
+        WN[i] = text.f("w{}", .{i});
+        DN[i] = text.f("d{}", .{i});
+        SN[i] = text.f("s{}", .{i});
+    }
+    XN[31] = "xzr";
+    WN[31] = "wzr";
+}
+
+pub fn X(r: i32) -> []const u8 { return XN[r as usize]; }
+pub fn W(r: i32) -> []const u8 { return WN[r as usize]; }
+pub fn D(r: i32) -> []const u8 { return DN[r as usize]; }
+pub fn S(r: i32) -> []const u8 { return SN[r as usize]; }
+pub fn FR(r: i32, cls: ir.Cls) -> []const u8 { return if (cls == .F32) S(r) else D(r); }
+
+// one instruction line: a tab, the text, a newline
+pub fn E(comptime spec: []const u8, args: anytype) {
+    O.byte('\t');
+    O.addf(spec, args);
+    O.byte('\n');
+}
+
+pub fn movImm(r: i32, val: i64) {
+    let u = @bitcast(u64, val);
+    if (u <= 0xffff) {
+        E("mov {s}, #{}", .{X(r), u});
+        return;
+    }
+    if (~u <= 0xffff) {
+        E("movn {s}, #{}", .{X(r), ~u});
+        return;
+    }
+    var first = true;
+    var sh: u64 = 0;
+    while (sh < 64) {
+        let h = (u >> sh) & 0xffff;
+        if (h != 0) {
+            E("{s} {s}, #{}, lsl #{}", .{if (first) "movz" else "movk", X(r), h, sh});
+            first = false;
+        }
+        sh += 16;
+    }
+}
+
+// load/store `reg` from/to [base + off] with the right width
+pub fn memOp(ld: bool, mem: i32, cls: ir.Cls, reg: i32, base: i32, off: i64) {
+    let size: i64 = if (cls == .F32) 4 else if (cls == .F64) 8 else (mem & 0x7f) as i64;
+    let sg = (mem & 0x80) != 0 && cls == .I;
+    var sc: []const u8 = "";
+    var un: []const u8 = "";
+    var rn: []const u8 = "";
+    if (cls != .I) {
+        sc = if (ld) "ldr" else "str";
+        un = if (ld) "ldur" else "stur";
+        rn = FR(reg, cls);
+    } else if (ld) {
+        switch (size) {
+            1 => { sc = if (sg) "ldrsb" else "ldrb"; un = if (sg) "ldursb" else "ldurb"; rn = if (sg) X(reg) else W(reg); }
+            2 => { sc = if (sg) "ldrsh" else "ldrh"; un = if (sg) "ldursh" else "ldurh"; rn = if (sg) X(reg) else W(reg); }
+            4 => { sc = if (sg) "ldrsw" else "ldr"; un = if (sg) "ldursw" else "ldur"; rn = if (sg) X(reg) else W(reg); }
+            else => { sc = "ldr"; un = "ldur"; rn = X(reg); }
+        }
+    } else {
+        switch (size) {
+            1 => { sc = "strb"; un = "sturb"; rn = W(reg); }
+            2 => { sc = "strh"; un = "sturh"; rn = W(reg); }
+            4 => { sc = "str"; un = "stur"; rn = W(reg); }
+            else => { sc = "str"; un = "stur"; rn = X(reg); }
+        }
+    }
+    let bn = if (base == 31) "sp" else X(base);
+    if (off == 0) {
+        E("{s} {s}, [{s}]", .{sc, rn, bn});
+    } else if (off > 0 && off % size == 0 && off / size < 4096) {
+        E("{s} {s}, [{s}, #{}]", .{sc, rn, bn, off});
+    } else if (off >= -256 && off <= 255) {
+        E("{s} {s}, [{s}, #{}]", .{un, rn, bn, off});
+    } else {
+        let t: i32 = if (base == 17) 8 else 17; // the base may itself live in x17
+        movImm(t, off);
+        E("add {s}, {s}, {s}", .{X(t), bn, X(t)});
+        E("{s} {s}, [{s}]", .{sc, rn, X(t)});
+    }
+}
+
+pub fn spillSize(v: i32) -> i32 { return if (F.vcls.items[v as usize] == .F32) 4 else 8; }
+
+// integer operand -> register holding it
+pub fn gi(o: ir.Opd, scratch: i32) -> i32 {
+    if (o.k == .Imm) {
+        movImm(scratch, o.v);
+        return scratch;
+    }
+    let v = o.v as usize;
+    if (vreg_reg[v] >= 0) { return vreg_reg[v]; }
+    memOp(true, 8, .I, scratch, 29, 0 - vreg_off[v] as i64);
+    return scratch;
+}
+
+// float operand -> register holding it
+pub fn gf(o: ir.Opd, scratch: i32) -> i32 {
+    let v = o.v as usize;
+    if (vreg_reg[v] >= 0) { return vreg_reg[v]; }
+    memOp(true, spillSize(v as i32), F.vcls.items[v], scratch, 29, 0 - vreg_off[v] as i64);
+    return scratch;
+}
+
+pub fn di(v: i32) -> i32 { return if (vreg_reg[v as usize] >= 0) vreg_reg[v as usize] else 16; }
+pub fn df(v: i32) -> i32 { return if (vreg_reg[v as usize] >= 0) vreg_reg[v as usize] else 31; }
+
+// the result of an instruction in r: stored to its spill slot if the vreg has no register
+pub fn fin(v: i32, r: i32) {
+    if (vreg_reg[v as usize] < 0) { memOp(false, spillSize(v), F.vcls.items[v as usize], r, 29, 0 - vreg_off[v as usize] as i64); }
+}
+
+// move an integer operand into a specific register
+pub fn intoInt(target: i32, o: ir.Opd) {
+    if (o.k == .Imm) {
+        movImm(target, o.v);
+        return;
+    }
+    let v = o.v as usize;
+    if (vreg_reg[v] >= 0) {
+        if (vreg_reg[v] != target) { E("mov {s}, {s}", .{X(target), X(vreg_reg[v])}); }
+    } else {
+        memOp(true, 8, .I, target, 29, 0 - vreg_off[v] as i64);
+    }
+}
+
+pub fn intoFp(target: i32, o: ir.Opd, cls: ir.Cls) {
+    let v = o.v as usize;
+    if (vreg_reg[v] >= 0) {
+        if (vreg_reg[v] != target) { E("fmov {s}, {s}", .{FR(target, cls), FR(vreg_reg[v], cls)}); }
+    } else {
+        memOp(true, spillSize(v as i32), cls, target, 29, 0 - vreg_off[v] as i64);
+    }
+}
+
+pub fn label(b: i32) { O.addf("Lb{}_{}:\n", .{FN, b}); }
+
+pub fn nextBlock(b: i32) -> i32 {
+    let k = layout_idx[b as usize];
+    return if (k >= 0 && (k + 1) as usize < order.items.len) order.items[(k + 1) as usize] else -1;
+}
+
+pub fn branch(cc: ir.CC, t1: i32, t2: i32, b: i32) {
+    let nx = nextBlock(b);
+    if (t1 == nx) {
+        E("b.{s} Lb{}_{}", .{CCN[CCINV[cc as usize] as usize], FN, t2});
+    } else if (t2 == nx) {
+        E("b.{s} Lb{}_{}", .{CCN[cc as usize], FN, t1});
+    } else {
+        E("b.{s} Lb{}_{}", .{CCN[cc as usize], FN, t1});
+        E("b Lb{}_{}", .{FN, t2});
+    }
+}
+
+pub fn cmpOperands(a: ir.Opd, c: ir.Opd) {
+    let ra = gi(a, 16);
+    if (c.k == .Imm && c.v >= 0 && c.v <= 4095) {
+        E("cmp {s}, #{}", .{X(ra), c.v});
+    } else if (c.k == .Imm && c.v < 0 && c.v >= -4095) {
+        E("cmn {s}, #{}", .{X(ra), 0 - c.v});
+    } else {
+        E("cmp {s}, {s}", .{X(ra), X(gi(c, 8))});
+    }
+}
+
+pub fn addsubImm(add: bool, d: i32, ra: i32, v0: i64) {
+    let v = if (add) v0 else 0 -% v0; // (wraps for MIN, which is what sub means)
+    if (v >= 0 && v <= 4095) {
+        E("add {s}, {s}, #{}", .{X(d), X(ra), v});
+    } else if (v < 0 && v >= -4095) {
+        E("sub {s}, {s}, #{}", .{X(d), X(ra), 0 - v});
+    } else if (v > 0 && (v & 0xfff) == 0 && (v >> 12) <= 4095) {
+        E("add {s}, {s}, #{}, lsl #12", .{X(d), X(ra), v >> 12});
+    } else {
+        movImm(8, v);
+        E("add {s}, {s}, x8", .{X(d), X(ra)});
+    }
+}

@@ -1,0 +1,1 @@
+errdefer only runs when an error is returned, but 'main' doesn't return an error union

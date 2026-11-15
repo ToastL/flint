@@ -1,0 +1,77 @@
+// comptime: code that runs while compiling (an IR interpreter inside the compiler)
+
+import std.io;
+import std.fmt;
+
+fn fib(n: u64) -> u64 {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// a precomputed table: runs at compile time, stored as data
+fn crcTable() -> [256]u32 {
+    var t: [256]u32 = undefined;
+    for (0..256) |i| {
+        var c: u32 = i as u32;
+        for (0..8) |_| {
+            if (c & 1 != 0) { c = 0xEDB88320 ^ (c >> 1); } else { c = c >> 1; }
+        }
+        t[i] = c;
+    }
+    return t;
+}
+
+let CRC_TABLE = comptime crcTable();
+
+fn crc32(s: []const u8) -> u32 {
+    var c: u32 = 0xFFFFFFFF;
+    for (s) |b| { c = CRC_TABLE[((c ^ b) & 0xFF) as usize] ^ (c >> 8); }
+    return c ^ 0xFFFFFFFF;
+}
+
+// results that hold pointers: strings and slices become relocations in the data
+struct Keyword { name: []const u8, code: i32 }
+
+fn keywords() -> [3]Keyword {
+    return .{ .{ name: "fn", code: 1 }, .{ name: "let", code: 2 }, .{ name: "var", code: 3 } };
+}
+let KEYWORDS = comptime keywords();
+
+// formatting at compile time (no allocation: a fixed buffer)
+fn banner() -> [24]u8 {
+    var buf: [24]u8 = @splat(' ');
+    _ = fmt.bufPrint(buf[..], "v{}.{} pi={d:.2}", .{ 0, 6, 3.14159 }) catch unreachable;
+    return buf;
+}
+let BANNER = comptime banner();
+
+let BIG = comptime fib(22);
+let TABLE_SUM = comptime blk_sum();
+
+fn blk_sum() -> u64 {
+    var s: u64 = 0;
+    for (CRC_TABLE) |x| { s +%= x as u64; }   // comptime code can read `let` globals
+    return s;
+}
+
+struct Header { magic: u32, len: u32, flags: u64 }
+comptime {
+    assert(@sizeOf(Header) == 16);
+    assert(@alignOf(Header) == 8);
+}
+
+fn main() -> !void {
+    let f = comptime fib(15);
+    try io.print("fib(15) = {}, fib(22) = {}\n", .{ f, BIG });
+    try io.print("crc32 = {x}\n", .{crc32("hello world")});
+    for (KEYWORDS) |k| { try io.print("{s}={} ", .{ k.name, k.code }); }
+    try io.print("\n[{s}]\n", .{BANNER[..]});
+    try io.print("table sum {}\n", .{TABLE_SUM});
+    let n: usize = comptime @sizeOf(Header) * 4;   // a comptime value is an ordinary constant
+    var arr: [n]u8 = @splat(1);
+    try io.print("{}\n", .{arr.len});
+    comptime { assert(fib(10) == 55); }
+    let T = Header;                       // a type, named by a let
+    let h: T = .{ magic: 7, len: 1, flags: 0 };
+    try io.print("{} {s}\n", .{ h.magic, @typeName(T) });
+}

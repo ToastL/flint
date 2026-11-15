@@ -1,0 +1,129 @@
+// driver.cli - the `flint` command line: run, build, test, asm, ir (and the tokens/ast dumps used
+// to compare compilers), build modes, and package mode (a directory with flint.toml).
+
+import std.io;
+import std.fs;
+import base.alloc;
+import base.text;
+import base.diag;
+import modules.unit;
+import modules.load;
+import ir.ir;
+import ir.print;
+import sema.program;
+import opt.opt;
+import arm64.func;
+import driver.manifest;
+import driver.build;
+import driver.dumps;
+
+let USAGE: []const u8 = "usage:\n  flint run   file.fl [args...]   compile and run\n  flint build file.fl [-o out]    compile to a native executable\n  flint test  file.fl             run the file's `test` blocks (and those of the modules it imports)\n  flint asm   file.fl             print the generated ARM64 assembly\n  flint ir    file.fl             print the optimized IR\n  flint tokens file.fl            print the tokens (for comparing compilers)\nin a package (a directory with flint.toml), leave out the file:\n  flint build [-o out]            builds out/<name>\n  flint run [-- args...]\n  flint test                      runs the tests in every .fl file of the package\noptions:\n  -O Debug        all safety checks, undefined memory filled with 0xAA, no optimization (default)\n  -O ReleaseSafe  optimized, all safety checks\n  -O ReleaseFast  optimized; integer overflow wraps instead of trapping\n                  (bounds, null, cast and division checks stay: only 'unsafe' removes them)\n";
+
+fn usage(extra: []const u8) -> u8 {
+    _ = io.eprint("{s}{s}", .{extra, USAGE}) catch {};
+    return 2;
+}
+
+fn known(cmd: []const u8) -> bool {
+    return text.oneOf(cmd, &[_][]const u8 { "run", "build", "asm", "ir", "test", "tokens", "ast" });
+}
+
+fn dirname(p: []const u8) -> []const u8 {
+    let slash = text.lastIndexOf(p, '/') orelse return ".";
+    return if (slash == 0) "/" else p[0..slash];
+}
+
+// The whole command; returns the exit status.
+pub fn main(argv: []const []const u8) -> u8 {
+    var mode: ir.Mode = .Debug;
+    if (argv.len < 2 || !known(argv[1])) { return usage(""); }
+    let cmd = argv[1];
+    var path: []const u8 = "";
+    var out: []const u8 = "";
+    var prog_args: []const []const u8 = @zeroes([]const []const u8);
+    var i: usize = 2;
+    while (i < argv.len) {
+        let a = argv[i];
+        if (path.len > 0 && text.eq(cmd, "run")) { // everything after the file goes to the program
+            prog_args = argv[i..];
+            break;
+        }
+        if (text.eq(a, "--") && text.eq(cmd, "run")) {
+            prog_args = argv[i + 1..];
+            break;
+        }
+        if (text.eq(a, "-O") && i + 1 < argv.len) {
+            i += 1;
+            let m = argv[i];
+            if (text.eq(m, "Debug")) {
+                mode = .Debug;
+            } else if (text.eq(m, "ReleaseSafe")) {
+                mode = .Safe;
+            } else if (text.eq(m, "ReleaseFast")) {
+                mode = .Fast;
+            } else {
+                _ = io.eprint("flint: unknown build mode '{s}' (Debug, ReleaseSafe or ReleaseFast)\n", .{m}) catch {};
+                return 2;
+            }
+        } else if (text.eq(a, "-o") && i + 1 < argv.len) {
+            i += 1;
+            out = argv[i];
+        } else if (path.len == 0 && text.endsWith(a, ".fl")) {
+            path = a;
+        } else {
+            return usage(text.f("flint: unexpected argument '{s}'\n", .{a}));
+        }
+        i += 1;
+    }
+    let test_mode = text.eq(cmd, "test");
+    if (text.eq(cmd, "tokens") || text.eq(cmd, "ast")) {
+        if (path.len == 0) { return usage(""); }
+        return if (text.eq(cmd, "tokens")) dumps.tokens(path) else dumps.tree(path);
+    }
+    var pkg: *unit.Package = undefined;
+    var package_mode = false;
+    if (path.len > 0) { // a single file: its directory is the root that module paths start from
+        pkg = alloc.new(unit.Package);
+        pkg.dir = dirname(path);
+        pkg.rootdir = pkg.dir;
+        pkg.root = path;
+        let base = if (text.lastIndexOf(path, '/')) |s| path[s + 1..] else path;
+        pkg.name = if (text.lastIndexOf(base, '.')) |d| base[0..d] else base;
+    } else {
+        var cbuf: [1024]u8 = undefined;
+        let cwd = fs.cwd(cbuf[..]) catch return 1;
+        let dir = manifest.find(alloc.dupe(u8, cwd)) orelse return usage("flint: no file given, and no flint.toml in this directory or above it\n");
+        pkg = manifest.read(dir);
+        package_mode = true;
+    }
+    diag.path = pkg.root;
+    let units = load.loadProgram(pkg.root, pkg, test_mode && package_mode);
+    let m = program.lowerProgram(units, mode, test_mode);
+    if (mode != .Debug) { opt.optimize(m); }
+    if (text.eq(cmd, "ir")) {
+        print.dump(m, io.stdout) catch {};
+        return 0;
+    }
+    let asm_text = func.emit(m);
+    if (text.eq(cmd, "asm")) {
+        io.stdout.writeAll(asm_text) catch {};
+        return 0;
+    }
+    var exe: []const u8 = "";
+    if (text.eq(cmd, "build")) {
+        if (out.len > 0) {
+            exe = out;
+        } else if (package_mode) {
+            let od = text.f("{s}/out", .{pkg.dir});
+            fs.makeDir(od) catch {};
+            exe = text.f("{s}/{s}", .{od, pkg.name});
+        } else {
+            exe = pkg.name;
+        }
+    }
+    var job = build.Job {
+        asm_text: asm_text, pkg: pkg, mode: mode, out: exe, keep: text.eq(cmd, "build"),
+        run: text.eq(cmd, "run") || test_mode, prog_args: prog_args,
+    };
+    return build.build(&job);
+}

@@ -1,0 +1,9 @@
+import std.io;
+
+enum Shape { Circle(f64), Rect { w: f64, h: f64 }, Empty }
+fn main() -> !void {
+    let s = Shape.Circle(1.0);
+    switch (s) {
+        .Circle(r) => try io.print("{}\n", .{r}),
+    }
+}

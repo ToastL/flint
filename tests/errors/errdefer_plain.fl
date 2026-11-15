@@ -1,0 +1,5 @@
+import std.io;
+
+fn main() {
+    errdefer io.print("x\n", .{}) catch {};
+}

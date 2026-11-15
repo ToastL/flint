@@ -1,0 +1,6 @@
+import std.heap;
+
+fn main() {
+    let xs = heap.c_allocator.alloc(u8, 4);
+    xs[0] = 1;
+}

@@ -1,0 +1,5 @@
+fn main() -> !void {
+    var x: i32 = 1;
+    let p = @ptrCast(*u32, &x);
+    _ = p;
+}

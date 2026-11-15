@@ -1,0 +1,15 @@
+9 2.5 -3
+4 true true 4
+Pair(bool, i32){ first: true, second: 4 }
+true true false
+20 10 null
+1 2
+42 has 8 bytes
+7 has 1 bytes
+.{ 1, true } has 16 bytes
+Pair(i32, bool){ first: 4, second: true } has 8 bytes
+ababab
+ababab
+6 0.8
+-128 65535 18446744073709551615 -9223372036854775808
+1

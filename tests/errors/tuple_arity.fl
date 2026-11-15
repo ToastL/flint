@@ -1,0 +1,4 @@
+fn two() -> (i32, i32) { return .{ 1, 2 }; }
+fn main() -> !void {
+    let (a, b, c) = two();
+}

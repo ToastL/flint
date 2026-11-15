@@ -1,0 +1,12 @@
+# A package: `flint build`, `flint run` and `flint test` in this directory need no file name.
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+geometry = { path = "../geometry" }
+
+[c]
+sources = ["c/fastmath.c"]
+include = ["c"]
+link = ["m"]

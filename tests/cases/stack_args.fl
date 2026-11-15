@@ -1,0 +1,29 @@
+// More arguments than the 8 integer / 8 float registers: the rest go on the stack
+
+import std.heap;
+import std.io;
+import std.mem;
+
+struct S { a: i64, b: i64 }
+
+fn mix(a: i64, b: f64, c: S, d: S, e: i64, g: i64, h: f32, i: i64, j: i64, k: u8, l: S) -> S {
+    return S { a: a + c.a + d.b + e + g + i + j + (k as i64) + l.a + l.b, b: (b + h as f64) as i64 };
+}
+
+fn floats(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, i: f64, j: f32, k: i64) -> f64 {
+    return a + b + c + d + e + f + g + h + i + j as f64 + k as f64;
+}
+
+fn replaceTwice(s: str, alloc: mem.Allocator, a: str, b: str, c: str, d: str) -> ![]u8 {
+    let once = try mem.replaceAll(alloc, s, a, b);
+    defer alloc.free(once);
+    return mem.replaceAll(alloc, once, c, d);
+}
+
+fn main() -> !void {
+    let r = mix(1, 2.5, S { a: 10, b: 20 }, S { a: 30, b: 40 }, 5, 6, 0.5, 7, 8, 9, S { a: 100, b: 200 });
+    try io.print("{} {} {}\n", .{ r.a, r.b, floats(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11) });
+    let s = try replaceTwice("a-b_c", heap.c_allocator, "-", "+", "_", "=");
+    defer heap.c_allocator.free(s);
+    try io.print("{s}\n", .{s});
+}

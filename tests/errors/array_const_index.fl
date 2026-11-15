@@ -1,0 +1,4 @@
+fn main() -> !void {
+    var buf: [4]u8 = undefined;
+    buf[4] = 0;
+}

@@ -1,0 +1,1 @@
+ARM64 has no SIMD multiply for 64-bit integers (@Vector(2, u64))

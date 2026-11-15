@@ -1,0 +1,4 @@
+2147483648
+--- stderr
+panic: shift amount too large
+--- exit 101

@@ -1,0 +1,249 @@
+// sema.ctdata - turning what comptime code made into data. A scalar result becomes a constant;
+// anything else becomes read-only data: a global holding the bytes, with the pointers in it
+// turned into relocations (and the comptime memory they point at turned into globals of their own).
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import ir.ir;
+import interp.memory as imem;
+import interp.run as interp;
+import sema.state as st;
+import sema.types as ty;
+import sema.convert as cv;
+import sema.globals;
+
+struct CtRel {
+    off: i64,
+    sym: []const u8,
+    add: i64,
+}
+
+struct CtBuild {
+    g: usize,           // its global (index in M.globals)
+    bytes: []u8,        // a copy of the comptime memory
+    size: i64,
+    rel: alloc.Vec(CtRel),
+    region: i32,        // the comptime region it came from (-1: the result itself)
+}
+
+struct CtSeen {
+    b: usize,
+    off: i64,
+    t: *ty.Type,
+}
+
+var ctb: alloc.Vec(*CtBuild) = @zeroes(alloc.Vec(*CtBuild));
+var ctseen: alloc.Vec(CtSeen) = @zeroes(alloc.Vec(CtSeen));
+var ct_counter: i32 = 0;
+
+fn hasPtrs(t: *ty.Type) -> bool {
+    switch (t.k) {
+        .Ptr, .Fn, .Slice => { return true; }
+        .Opt, .ErrUnion, .Array => { return hasPtrs(t.E()); }
+        .Struct => {
+            if (t.is_packed || t.is_union) { return false; }
+            for (t.fields.items) |*f| { if (hasPtrs(f.t)) { return true; } }
+            return false;
+        }
+        .Enum => {
+            for (t.variants.items) |*v| {
+                if (v.payload) |p| { if (hasPtrs(p)) { return true; } }
+            }
+            return false;
+        }
+        else => { return false; }
+    }
+}
+
+fn newBuild(region: i32, data: ?[]const u8, size: i64, align: i32) -> usize {
+    if (size > 0x7fffffff) { diag.at(st.CUR_TOK, text.f("a value made at compile time is too big ({} bytes)", .{size})); }
+    var g = @zeroes(ir.GlobalVar);
+    ct_counter += 1;
+    g.sym = text.f("_fl_ct_{}", .{ct_counter});
+    g.kind = .Data;
+    g.size = if (size != 0) size as i32 else 1;
+    g.align = align;
+    g.is_const = true;
+    g.name = "a value made at compile time";
+    st.M.globals.push(g);
+    let bd = alloc.new(CtBuild);
+    bd.g = st.M.globals.items.len - 1;
+    bd.bytes = alloc.make(u8, if (size != 0) size as usize else 1);
+    if (data) |d| { for (0..size as usize) |i| { bd.bytes[i] = d[i]; } }
+    bd.size = size;
+    bd.region = region;
+    ctb.push(bd);
+    return ctb.items.len - 1;
+}
+
+fn get(bi: usize, off: i64, n: usize) -> u64 { return imem.getBytes(ctb.items[bi].bytes, off as usize, n); }
+
+// the pointer stored at [build bi + off], which points at `count` items of type elem (null: don't look inside)
+fn ctPtr(bi: usize, off: i64, elem: ?*ty.Type, count: i64, site: ?*token.Token) {
+    let p = get(bi, off, 8);
+    if (p == 0) { return; }
+    var r = @zeroes(interp.CtRegion);
+    var roff: i64 = 0;
+    if (!interp.region(p, &r, &roff)) {
+        diag.at(site, "the value made at compile time points at memory that's gone (a local variable of a function that returned)");
+    }
+    var sym = r.sym;
+    if (r.kind == .Frame || r.kind == .Const) { // comptime memory: it becomes data of its own
+        var tb: ?usize = null;
+        for (0..ctb.items.len) |k| { if (ctb.items[k].region == r.id) { tb = k; } }
+        let t = tb orelse newBuild(r.id, r.data, r.size, 16);
+        sym = st.M.globals.items[ctb.items[t].g].sym;
+        if (elem) |e| {
+            if (e.k != .Void && count > 0 && hasPtrs(e)) {
+                ty.layout(e, site);
+                var i: i64 = 0;
+                while (i < count) {
+                    let at = roff + i * e.size as i64;
+                    if (at + e.size as i64 > ctb.items[t].size) { break; }
+                    var seen = false;
+                    for (ctseen.items) |*sn| { if (sn.b == t && sn.off == at && sn.t == e) { seen = true; } }
+                    if (!seen) {
+                        ctseen.push(CtSeen { b: t, off: at, t: e });
+                        ctWalk(t, e, at, site);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    ctb.items[bi].rel.push(CtRel { off: off, sym: sym, add: roff });
+}
+
+// find the pointers in a value of type t at [build bi + off]
+fn ctWalk(bi: usize, t: *ty.Type, off: i64, site: ?*token.Token) {
+    switch (t.k) {
+        .Ptr => { ctPtr(bi, off, if (t.many) null else t.elem, 1, site); }
+        .Fn => { ctPtr(bi, off, null, 0, site); }
+        .Slice => { ctPtr(bi, off, t.elem, @bitcast(i64, get(bi, off + 8, 8)), site); }
+        .Opt => {
+            if (ty.isOptPtr(t)) {
+                ctWalk(bi, t.E(), off, site);
+            } else if (ctb.items[bi].bytes[(off + t.E().size as i64) as usize] != 0) {
+                ctWalk(bi, t.E(), off, site);
+            }
+        }
+        .ErrUnion => {
+            if (t.E() == ty.void_) { return; }
+            if (get(bi, off + ty.errOff(t) as i64, 2) == 0) { ctWalk(bi, t.E(), off, site); }
+        }
+        .Array => {
+            if (!hasPtrs(t.E())) { return; }
+            var i: i64 = 0;
+            while (i < t.alen) {
+                ctWalk(bi, t.E(), off + i * t.E().size as i64, site);
+                i += 1;
+            }
+        }
+        .Struct => {
+            if (t.is_packed || t.is_union) { return; }
+            for (t.fields.items) |*f| { ctWalk(bi, f.t, off + f.off as i64, site); }
+        }
+        .Enum => {
+            if (!t.has_payload) { return; }
+            let tg = t.tagt.?;
+            let tag = @bitcast(i64, get(bi, off, tg.size as usize));
+            for (t.variants.items) |*v| {
+                if (cv.truncExt(v.value, tg) == cv.truncExt(tag, tg)) {
+                    if (v.payload) |p| { ctWalk(bi, p, off + t.payload_off as i64, site); }
+                }
+            }
+        }
+        else => {}
+    }
+}
+
+// the builds become the globals' data: relocations, and the other bytes in aligned pieces (zeros are gaps)
+fn emitBuilds() {
+    for (ctb.items) |bd| {
+        // sort the relocations by offset (insertion sort: there are few, and it's stable)
+        let rel = bd.rel.items;
+        for (1..rel.len) |i| {
+            let x = rel[i];
+            var j = i;
+            while (j > 0 && rel[j - 1].off > x.off) {
+                rel[j] = rel[j - 1];
+                j -= 1;
+            }
+            rel[j] = x;
+        }
+        let g = &st.M.globals.items[bd.g];
+        var ri: usize = 0;
+        var o: i64 = 0;
+        while (o < bd.size) {
+            if (ri < rel.len && rel[ri].off == o) {
+                globals.dataItem(g, o as i32, 8, rel[ri].add, rel[ri].sym);
+                o += 8;
+                ri += 1;
+                continue;
+            }
+            let lim = if (ri < rel.len) rel[ri].off else bd.size;
+            var sz: i64 = 1;
+            var c: i64 = 8;
+            while (c > 1) {
+                if (o % c == 0 && o + c <= lim) {
+                    sz = c;
+                    break;
+                }
+                c /= 2;
+            }
+            let v = imem.getBytes(bd.bytes, o as usize, sz as usize);
+            if (v != 0) { globals.dataItem(g, o as i32, sz as i32, @bitcast(i64, v), ""); }
+            o += sz;
+        }
+    }
+    ctb.truncate(0);
+    ctseen.truncate(0);
+}
+
+pub struct CtOut {
+    isconst: bool,
+    ival: i64,
+    fval: f64,
+    g: usize, // otherwise: the global holding it
+}
+
+fn ptrLike(t: *ty.Type) -> bool { return t.k == .Ptr || t.k == .Fn || ty.isOptPtr(t); }
+
+// the value comptime code returned (its register's bits; for an aggregate, its address)
+pub fn ctResult(t: *ty.Type, bits: u64, site: ?*token.Token, out: *CtOut) {
+    out.* = @zeroes(CtOut);
+    if (!ty.isAgg(t) && !ptrLike(t)) {
+        out.isconst = true;
+        let raw = @bitcast(i64, bits);
+        if (ty.isFloat(t)) {
+            out.fval = @bitcast(f64, raw);
+        } else if (t.k == .Enum) {
+            out.ival = cv.truncExt(raw, t.tagt.?);
+        } else if (ty.isInt(t)) {
+            out.ival = cv.truncExt(raw, t);
+        } else if (t == ty.bool_) {
+            out.ival = raw & 1;
+        } else {
+            out.ival = raw;
+        }
+        return;
+    }
+    var bi: usize = 0;
+    if (ptrLike(t)) {
+        var b8: [8]u8 = undefined;
+        imem.putBytes(b8[..], 0, bits, 8);
+        bi = newBuild(-1, b8[..], 8, 8);
+        ctWalk(bi, t, 0, site);
+    } else {
+        ty.layout(t, site);
+        var r = @zeroes(interp.CtRegion);
+        var off: i64 = 0;
+        if (!interp.region(bits, &r, &off) || off + t.size as i64 > r.size) { diag.at(site, "internal error: lost the comptime result"); }
+        bi = newBuild(-1, r.data[off as usize..(off + t.size as i64) as usize], t.size as i64, t.align);
+        ctWalk(bi, t, 0, site);
+    }
+    out.g = ctb.items[bi].g;
+    emitBuilds();
+}

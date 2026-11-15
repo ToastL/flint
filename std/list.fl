@@ -1,0 +1,106 @@
+// std.list - ArrayList: a growable array. It allocates through the Allocator it is given.
+
+import std.fmt;
+import std.mem;
+
+// A growable array.
+//
+//   var xs = list.ArrayList(i32).init(alloc);
+//   defer xs.deinit();
+//   try xs.append(5);
+//   for (xs.items) |x| { ... }
+pub fn ArrayList(comptime T: type) -> type {
+    return struct {
+        items: []T,       // the elements, to read and change in place
+        capacity: usize,  // how many fit before it has to grow
+        alloc: mem.Allocator,
+
+        pub fn init(alloc: mem.Allocator) -> Self { return .{ items: mem.Allocator.empty(T), capacity: 0, alloc: alloc }; }
+
+        pub fn deinit(self: *Self) {
+            self.alloc.free(self.allocatedSlice());
+            self.items = mem.Allocator.empty(T);
+            self.capacity = 0;
+        }
+
+        fn allocatedSlice(self: *Self) -> []T {
+            unsafe { return self.items.ptr[0..self.capacity]; }
+        }
+
+        // Makes room for n elements in all.
+        pub fn ensureTotalCapacity(self: *Self, n: usize) -> mem.AllocError!void {
+            if (n <= self.capacity) { return; }
+            var cap = if (self.capacity == 0) 8 else self.capacity * 2;
+            if (cap < n) { cap = n; }
+            let len = self.items.len;
+            let buf = try self.alloc.realloc(T, self.allocatedSlice(), cap);
+            self.items = buf[0..len];
+            self.capacity = cap;
+        }
+
+        pub fn append(self: *Self, x: T) -> mem.AllocError!void {
+            if (self.items.len == self.capacity) { try self.ensureTotalCapacity(self.items.len + 1); }
+            self.items.len += 1;
+            self.items[self.items.len - 1] = x;
+        }
+
+        pub fn appendSlice(self: *Self, xs: []const T) -> mem.AllocError!void {
+            try self.ensureTotalCapacity(self.items.len + xs.len);
+            let base = self.items.len;
+            self.items.len += xs.len;
+            for (xs) |x, i| { self.items[base + i] = x; }
+        }
+
+        // Puts x at index i, moving the later elements up.
+        pub fn insert(self: *Self, i: usize, x: T) -> mem.AllocError!void {
+            if (i > self.items.len) { panic("ArrayList.insert: index out of bounds"); }
+            try self.append(x);
+            var j = self.items.len - 1;
+            while (j > i) {
+                self.items[j] = self.items[j - 1];
+                j -= 1;
+            }
+            self.items[i] = x;
+        }
+
+        // Removes and returns element i, moving the later elements down.
+        pub fn orderedRemove(self: *Self, i: usize) -> T {
+            let x = self.items[i];
+            for (i..self.items.len - 1) |j| { self.items[j] = self.items[j + 1]; }
+            self.items.len -= 1;
+            return x;
+        }
+
+        // Removes and returns element i, putting the last element in its place (O(1)).
+        pub fn swapRemove(self: *Self, i: usize) -> T {
+            let x = self.items[i];
+            self.items[i] = self.items[self.items.len - 1];
+            self.items.len -= 1;
+            return x;
+        }
+
+        // Removes and returns the last element, or null if there's none.
+        pub fn pop(self: *Self) -> ?T {
+            if (self.items.len == 0) { return null; }
+            self.items.len -= 1;
+            unsafe { return self.items.ptr[self.items.len]; }
+        }
+
+        pub fn clearRetainingCapacity(self: *Self) { self.items.len = 0; }
+
+        // The elements as a slice the caller owns (and frees); the list is left empty.
+        pub fn toOwnedSlice(self: *Self) -> mem.AllocError![]T {
+            let out = try self.alloc.realloc(T, self.allocatedSlice(), self.items.len);
+            self.items = mem.Allocator.empty(T);
+            self.capacity = 0;
+            return out;
+        }
+
+        // For ArrayList(u8): a fmt.Writer that appends, so fmt can build strings in it.
+        pub fn writer(self: *Self) -> fmt.Writer { return fmt.Writer { ctx: self, writeFn: Self.writeFn }; }
+
+        fn writeFn(ctx: *void, bytes: []const u8) -> !void {
+            unsafe { try @ptrCast(*Self, ctx).appendSlice(bytes); }
+        }
+    };
+}

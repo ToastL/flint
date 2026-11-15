@@ -1,0 +1,6 @@
+fn f(e: anyerror) -> i64 {
+    return switch (e) {
+        error.NotFound => 1,
+    };
+}
+fn main() -> !void {}

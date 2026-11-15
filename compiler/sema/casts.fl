@@ -1,0 +1,154 @@
+// sema.casts - `x as T`: numbers (checked: a value that doesn't fit traps, in every mode and even
+// inside unsafe, design section 6.2), integers to enums (checked), and adding const to slices and
+// pointers.
+
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.ops;
+import sema.expr;
+
+// x as Color: checked, so an enum variable always holds one of its variants
+pub fn intToEnum(v: b.Val, et: *ty.Type, tok: ?*token.Token) -> b.Val {
+    if (et.has_payload) { diag.at(tok, text.f("can't convert an integer to {s}: its variants carry payloads", .{ty.tname(et)})); }
+    ty.layout(et, tok);
+    let vs = et.variants.items;
+    if (v.isconst) {
+        for (vs) |*x| { if (x.value == v.ival) { return b.vInt(et, v.ival); } }
+        diag.at(tok, text.f("{} isn't a value of {s}", .{v.ival, ty.tname(et)}));
+    }
+    var lo = vs[0].value;
+    var hi = lo;
+    for (vs[1..]) |*x| {
+        if (x.value < lo) { lo = x.value; }
+        if (x.value > hi) { hi = x.value; }
+    }
+    let r = b.regOf(v);
+    let ok = b.newBlock();
+    let fail = b.newColdBlock();
+    if (@bitcast(u64, hi -% lo) +% 1 == vs.len as u64) { // dense: one unsigned compare
+        let d = if (lo != 0) b.op2(.Sub, .I, b.R(r), b.IMM(lo)) else r;
+        b.br(b.R(b.cmp(.LS, b.R(d), b.IMM(hi -% lo))), ok, fail);
+    } else {
+        for (vs) |*x| {
+            let nx = b.newBlock();
+            b.br(b.R(b.cmp(.EQ, b.R(r), b.IMM(x.value))), ok, nx);
+            b.setBlk(nx);
+        }
+        b.jmp(fail);
+    }
+    b.setBlk(fail);
+    ops.panicMsg("integer doesn't match any enum value in 'as'");
+    b.setBlk(ok);
+    return b.vReg(et, r);
+}
+
+// 2^n as a double (n up to 64)
+fn pow2(n: i32) -> f64 {
+    if (n >= 64) { return 18446744073709551616.0; }
+    return (@bitcast(u64, 1 as i64) << n as u64) as f64;
+}
+
+// `x as T` for numbers: a value that doesn't fit traps, in every mode and even inside unsafe (section 6.2)
+fn checkedNum(v: b.Val, to: *ty.Type, tok: ?*token.Token) -> b.Val {
+    let from = v.t;
+    if (from == to || !ty.isInt(to) || from.k == .Bool) { return cv.convert(v, to); }
+    let msg = text.f("value doesn't fit in {s} in 'as'", .{ty.tname(to)});
+    if (v.isconst) {
+        if (ty.isFloat(from)) {
+            let d = v.fval;
+            let lo: f64 = if (ty.isSigned(to)) ops.intMin(to) as f64 else 0.0;
+            let hi: f64 = if (ty.isSigned(to)) ops.intMax(to) as f64 else cv.u2f(ops.intMax(to));
+            if (!(d > lo - 1.0 && d < hi + 1.0) || (to.size == 8 && !(d >= lo && d < hi))) {
+                diag.at(tok, text.f("{s} doesn't fit in {s}", .{text.g6(d), ty.tname(to)}));
+            }
+        } else {
+            // the value as a 128-bit integer, against the target's range
+            let x_signed = ty.isLit(from) || ty.isSigned(from);
+            let lo = ops.intMin(to);
+            let hi = ops.intMax(to);
+            var fits = true;
+            if (x_signed) {
+                if (v.ival < lo) {
+                    fits = false;
+                } else if (ty.isSigned(to)) {
+                    fits = v.ival <= hi;
+                } else {
+                    fits = v.ival < 0 || @bitcast(u64, v.ival) <= @bitcast(u64, hi); // (v < 0 is caught by lo = 0)
+                }
+            } else { // unsigned: never below lo (which is <= 0)
+                fits = if (ty.isSigned(to)) @bitcast(u64, v.ival) <= @bitcast(u64, hi) else @bitcast(u64, v.ival) <= @bitcast(u64, hi);
+            }
+            if (!fits) {
+                let shown = if (x_signed) text.f("{}", .{v.ival}) else text.f("{}", .{@bitcast(u64, v.ival)});
+                diag.at(tok, text.f("{s} doesn't fit in {s}", .{shown, ty.tname(to)}));
+            }
+        }
+        return cv.convert(v, to);
+    }
+    if (ty.isFloat(from)) { // in range and not NaN: both compares are false for NaN
+        var r = b.regOf(v);
+        if (from.k == .F32) { r = b.op1(.Fcvt, .F64, b.R(r)); }
+        let bits = to.size * 8;
+        let sg = ty.isSigned(to);
+        let lo: f64 = if (sg) -pow2(bits - 1) else -1.0;
+        let hi = pow2(bits - (if (sg) 1 else 0));
+        let above = if (sg && bits == 64) b.fcmp(.GE, r, b.fconst(.F64, lo)) else b.fcmp(.GT, r, b.fconst(.F64, lo));
+        let below = b.fcmp(.MI, r, b.fconst(.F64, hi));
+        ops.panicIf(b.cmp(.EQ, b.R(b.op2(.And, .I, b.R(above), b.R(below))), b.IMM(0)), msg);
+        return cv.convert(v, to);
+    }
+    if (cv.widens(from, to) || (from.size == to.size && ty.isSigned(from) == ty.isSigned(to))) { return cv.convert(v, to); }
+    let r = b.regOf(v);
+    if (ty.isSigned(from) && !ty.isSigned(to) && to.size >= from.size) {
+        ops.panicIf(b.cmp(.LT, b.R(r), b.IMM(0)), msg); // only negatives don't fit
+    } else if (ty.isSigned(from) && ty.isSigned(to)) {
+        ops.panicIf(b.cmp(.NE, b.R(cv.norm(r, to)), b.R(r)), msg); // narrowing: it fits iff sign-extending changes nothing
+    } else { // as an unsigned number (negatives become huge) it must be <= the max
+        ops.panicIf(b.cmp(.HI, b.R(r), b.IMM(ops.intMax(to))), msg);
+    }
+    return cv.convert(v, to);
+}
+
+pub fn exCast(n: *ast.Node) -> b.Val {
+    let to = names.resolve(n.b.?);
+    let v = expr.expr(n.a.?, if (ty.isNum(to)) to else null);
+    let t = v.t;
+    if (ty.isSlice(t) && ty.isSlice(to) && t.elem == to.elem) {
+        if (t.is_const && !to.is_const) { diag.at(n.tok, text.f("'as' can't remove const: {s} to {s}", .{ty.tname(t), ty.tname(to)})); }
+        return cv.coerce(v, to, n.tok, "'as'");
+    }
+    if (ty.isPlainEnum(t) && ty.isInt(to)) {
+        var w = v;
+        w.t = t.tagt.?;
+        return checkedNum(w, to, n.tok);
+    }
+    if (ty.isInt(t) && to.k == .Enum) { return intToEnum(v, to, n.tok); }
+    if ((ty.isPtr(t) || ty.isOptPtr(t) || ty.isFn(t)) && ty.isInt(to)) {
+        diag.at(n.tok, "'as' converts numbers; use '@ptrToInt(p)' for a pointer's address");
+    }
+    if (ty.isInt(t) && (ty.isPtr(to) || ty.isOptPtr(to))) {
+        diag.at(n.tok, text.f("'as' converts numbers; turning an integer into a pointer is '@intToPtr({s}, n)' inside an 'unsafe' block", .{ty.tname(to)}));
+    }
+    if ((ty.isPtr(t) || ty.isOptPtr(t)) && (ty.isPtr(to) || ty.isOptPtr(to))) {
+        var want = to;
+        if (t.k != .Opt && to.k == .Opt) { want = to.E(); }
+        let to_void = ty.isPtr(want) && ty.isPtr(t) && want.E() == ty.void_;
+        let opt_void = t.k == .Opt && want.k == .Opt && want.E().elem == ty.void_;
+        let same = t.elem == want.elem || (t.k == .Opt && t.E().elem == want.E().elem);
+        if (!to_void && !opt_void && !same) {
+            diag.at(n.tok, text.f("'as' doesn't reinterpret pointers; use '@ptrCast({s}, p)' inside an 'unsafe' block", .{ty.tname(to)}));
+        }
+        return cv.coerce(v, to, n.tok, "'as'");
+    }
+    let ok = (ty.isNum(t) && ty.isNum(to)) || (t == ty.bool_ && ty.isInt(to)) || t == to;
+    if (!ok) { diag.at(n.tok, text.f("can't convert {s} to {s}", .{ty.tname(t), ty.tname(to)})); }
+    return checkedNum(v, to, n.tok);
+}

@@ -1,0 +1,2 @@
+let D: []const u8 = @embedFile("no_such_file.txt");
+fn main() {}

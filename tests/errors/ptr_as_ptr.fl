@@ -1,0 +1,5 @@
+fn main() -> !void {
+    var x: i32 = 1;
+    let p = &x as *u32;
+    _ = p;
+}

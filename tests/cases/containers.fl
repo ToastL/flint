@@ -1,0 +1,79 @@
+// ArrayList(T) and HashMap(K, V): they allocate through the allocator they're given
+
+import std.heap;
+import std.io;
+import std.list;
+import std.map;
+
+enum Color { Red, Green, Blue }
+struct Item { name: str, qty: u32 }
+
+fn main() -> !void {
+    var gpa = heap.DebugAllocator.init();
+    defer gpa.deinit();
+    let alloc = gpa.allocator();
+
+    var xs = list.ArrayList(i32).init(alloc);
+    defer xs.deinit();
+    for (0..10) |i| { try xs.append(i as i32); }
+    try xs.appendSlice(&[_]i32 { 100, 200 });
+    try xs.insert(0, -1);
+    let removed = xs.orderedRemove(3);
+    let swapped = xs.swapRemove(0);
+    try io.print("{} items: {any}\n", .{ xs.items.len, xs.items });
+    try io.print("removed {} swapped {} popped {any} capacity>=len {}\n", .{ removed, swapped, xs.pop(), xs.capacity >= xs.items.len });
+    for (xs.items) |*x| { x.* *= 2; }
+    try io.print("doubled {any}\n", .{xs.items[0..4]});
+    let owned = try xs.toOwnedSlice();
+    defer alloc.free(owned);
+    try io.print("owned {} left {}\n", .{ owned.len, xs.items.len });
+    xs.clearRetainingCapacity();
+
+    var items = list.ArrayList(Item).init(alloc);
+    defer items.deinit();
+    try items.append(.{ name: "bolt", qty: 40 });
+    try items.append(.{ name: "nut", qty: 12 });
+    try io.print("{any}\n", .{items.items});
+
+    // an ArrayList(u8) collects formatted text
+    var text = list.ArrayList(u8).init(alloc);
+    defer text.deinit();
+    let w = text.writer();
+    for (items.items) |it| { try w.print("{s}={};", .{ it.name, it.qty }); }
+    try io.print("{s}\n", .{text.items});
+
+    // string keys
+    var ages = map.HashMap(str, u32).init(alloc);
+    defer ages.deinit();
+    try ages.put("ada", 36);
+    try ages.put("grace", 85);
+    try ages.put("ada", 37);
+    try io.print("{} {any} {any} {}\n", .{ ages.count, ages.get("ada"), ages.get("bob"), ages.contains("grace") });
+    if (ages.getPtr("grace")) |g| { g.* += 1; }
+    try io.print("{} {} {}\n", .{ ages.get("grace").?, ages.remove("grace"), ages.remove("grace") });
+
+    // integer keys, many of them, with removals in between
+    var squares = map.HashMap(u64, u64).init(alloc);
+    defer squares.deinit();
+    for (0..2000) |i| { try squares.put(i, i * i); }
+    for (0..2000) |i| {
+        if (i % 3 != 0) { _ = squares.remove(i); }
+    }
+    for (0..500) |i| { try squares.put(i * 3, 0); }
+    var sum: u64 = 0;
+    var n: usize = 0;
+    var it = squares.iterator();
+    while (it.next()) |kv| {
+        sum += kv.0 + kv.1;
+        n += 1;
+    }
+    try io.print("{} {} {} {any}\n", .{ squares.count, n, sum, squares.get(1500) });
+
+    // enum keys
+    var votes = map.HashMap(Color, i32).init(alloc);
+    defer votes.deinit();
+    for ([_]Color { .Red, .Blue, .Red, .Green, .Red }) |c| {
+        if (votes.getPtr(c)) |v| { v.* += 1; } else { try votes.put(c, 1); }
+    }
+    try io.print("{} {} {}\n", .{ votes.get(.Red).?, votes.get(.Green).?, votes.get(.Blue).? });
+}

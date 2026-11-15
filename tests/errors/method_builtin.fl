@@ -1,0 +1,3 @@
+fn str.shout(s: str) -> str { return s; }
+
+fn main() {}

@@ -1,0 +1,6 @@
+fn rep(comptime n: i32) -> i32 { return n; }
+fn main() {
+    var k: i32 = 3;
+    k += 1;
+    _ = rep(k);
+}

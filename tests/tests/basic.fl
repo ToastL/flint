@@ -1,0 +1,38 @@
+// flint test: each test block runs on its own; a failed check or a panic fails just that test
+import std.fmt;
+import std.mem;
+import std.testing;
+
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+
+fn parse(s: []const u8) -> !i64 { return fmt.parseInt(i64, mem.trim(s), 10); }
+
+test "add adds" {
+    try testing.expectEqual(i64, 5, add(2, 3));
+    try testing.expect(add(-1, 1) == 0);
+}
+
+test "parsing text" {
+    try testing.expectEqual(i64, 42, try parse(" 42 "));
+    try testing.expectError(error.NotANumber, parse("x"));
+    try testing.expectEqualStrings("hi", mem.trim("  hi "));
+}
+
+test "a failing check" {
+    try testing.expectEqual(i64, 4, add(2, 3));
+}
+
+test "an error escapes" {
+    _ = try parse("nope");
+}
+
+test "a panic" {
+    let xs = [_]i64 { 1, 2, 3 };
+    var i: usize = 3;
+    _ = xs[i];
+    i += 1;
+}
+
+fn main() {
+    panic("main isn't run by flint test");
+}

@@ -1,0 +1,1 @@
+there's no global alloc(): memory comes from an Allocator you pass around, like 'let xs = try alloc.alloc(T, n); defer alloc.free(xs);' (see heap.c_allocator, heap.DebugAllocator)

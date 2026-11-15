@@ -1,0 +1,4 @@
+fn main() {
+    let a: @Vector(2, u64) = .{ 1, 2 };
+    let b = a * a;
+}

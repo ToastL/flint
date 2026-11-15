@@ -1,0 +1,562 @@
+// sema.ops - operators: arithmetic with overflow checks (design section 6), wrapping and
+// saturating forms, comparisons, constant folding, pointer arithmetic, SIMD vector operations,
+// && / ||, unary - ! ~ &, and panics.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.expr;
+
+pub fn isCmpOp(op: []const u8) -> bool {
+    return text.eq(op, "==") || text.eq(op, "!=") || text.eq(op, "<") || text.eq(op, "<=") || text.eq(op, ">") || text.eq(op, ">=");
+}
+
+pub fn ccFor(op: []const u8, is_signed: bool, is_fp: bool) -> ir.CC {
+    if (text.eq(op, "==")) { return .EQ; }
+    if (text.eq(op, "!=")) { return .NE; }
+    if (is_fp) {
+        if (text.eq(op, "<")) { return .MI; }
+        if (text.eq(op, "<=")) { return .LS; }
+        if (text.eq(op, ">")) { return .GT; }
+        return .GE;
+    }
+    if (text.eq(op, "<")) { return if (is_signed) .LT else .LO; }
+    if (text.eq(op, "<=")) { return if (is_signed) .LE else .LS; }
+    if (text.eq(op, ">")) { return if (is_signed) .GT else .HI; }
+    return if (is_signed) .GE else .HS;
+}
+
+fn bv(x: bool) -> b.Val { return b.vInt(ty.bool_, if (x) 1 else 0); }
+
+pub fn fold(op: []const u8, a: b.Val, c: b.Val, tok: ?*token.Token) -> b.Val {
+    let fp = ty.isFloat(a.t) || ty.isFloat(c.t);
+    if (fp) {
+        let x = if (ty.isFloat(a.t)) a.fval else a.ival as f64;
+        let y = if (ty.isFloat(c.t)) c.fval else c.ival as f64;
+        if (text.eq(op, "+")) { return b.vFlt(ty.litfloat, x + y); }
+        if (text.eq(op, "-")) { return b.vFlt(ty.litfloat, x - y); }
+        if (text.eq(op, "*")) { return b.vFlt(ty.litfloat, x * y); }
+        if (text.eq(op, "/")) { return b.vFlt(ty.litfloat, x / y); }
+        if (text.eq(op, "%")) { return b.vFlt(ty.litfloat, x - y * cv.f2i(x / y) as f64); }
+        if (text.eq(op, "==")) { return bv(x == y); }
+        if (text.eq(op, "!=")) { return bv(x != y); }
+        if (text.eq(op, "<")) { return bv(x < y); }
+        if (text.eq(op, "<=")) { return bv(x <= y); }
+        if (text.eq(op, ">")) { return bv(x > y); }
+        if (text.eq(op, ">=")) { return bv(x >= y); }
+        diag.at(tok, text.f("operator '{s}' needs integers", .{op}));
+    }
+    let x = a.ival;
+    let y = c.ival;
+    let min = -0x7fffffffffffffff - 1;
+    if ((text.eq(op, "/") || text.eq(op, "%")) && y == 0) { diag.at(tok, "division by zero"); }
+    if (text.eq(op, "+")) { return b.vInt(ty.litint, x +% y); }
+    if (text.eq(op, "-")) { return b.vInt(ty.litint, x -% y); }
+    if (text.eq(op, "*")) { return b.vInt(ty.litint, x *% y); }
+    if (text.eq(op, "/")) { return b.vInt(ty.litint, if (x == min && y == -1) x else x / y); }
+    if (text.eq(op, "%")) { return b.vInt(ty.litint, if (x == min && y == -1) 0 else x % y); }
+    if (text.eq(op, "&")) { return b.vInt(ty.litint, x & y); }
+    if (text.eq(op, "|")) { return b.vInt(ty.litint, x | y); }
+    if (text.eq(op, "^")) { return b.vInt(ty.litint, x ^ y); }
+    let sh = @bitcast(u64, y) & 63;
+    if (text.eq(op, "<<")) { return b.vInt(ty.litint, @bitcast(i64, @bitcast(u64, x) << sh)); }
+    if (text.eq(op, ">>")) { return b.vInt(ty.litint, x >> sh); }
+    if (text.eq(op, "==")) { return bv(x == y); }
+    if (text.eq(op, "!=")) { return bv(x != y); }
+    if (text.eq(op, "<")) { return bv(x < y); }
+    if (text.eq(op, "<=")) { return bv(x <= y); }
+    if (text.eq(op, ">")) { return bv(x > y); }
+    return bv(x >= y);
+}
+
+// panic with `msg` when the bool in vreg `bad` is true (the panic path is a cold block)
+pub fn panicIf(bad: i32, msg: []const u8) {
+    let ok = b.newBlock();
+    let fail = b.newColdBlock();
+    b.br(b.R(bad), fail, ok);
+    b.setBlk(fail);
+    panicMsg(msg);
+    b.setBlk(ok);
+}
+
+pub fn panicMsg(msg: []const u8) {
+    let m = b.strLit(msg);
+    _ = b.callI("_rt_panic", .None, &[_]ir.Opd { b.R(b.load(ty.ptrTo(ty.u8_), m.a)), b.IMM(msg.len as i64) });
+    b.trap();
+}
+
+pub fn intMin(t: *ty.Type) -> i64 {
+    if (!ty.isSigned(t)) { return 0; }
+    if (t.size >= 8) { return -0x7fffffffffffffff - 1; }
+    return 0 - (@bitcast(i64, @bitcast(u64, 1 as i64) << (t.size * 8 - 1) as u64));
+}
+
+// as a raw 64-bit pattern: u64's max is -1
+pub fn intMax(t: *ty.Type) -> i64 {
+    let bits = t.size * 8 - (if (ty.isSigned(t)) 1 else 0);
+    if (bits >= 64) { return -1; }
+    if (bits == 63) { return 0x7fffffffffffffff; }
+    return @bitcast(i64, @bitcast(u64, 1 as i64) << bits as u64) - 1;
+}
+
+// r = a op b (Add, Sub or Mul) on registers holding normalized values of type t. Also returns a
+// vreg that is 1 when the true result doesn't fit in t.
+pub fn ovfOp(o: ir.Op, t: *ty.Type, a0: ir.Opd, c: ir.Opd) -> (i32, i32) {
+    var a = a0;
+    if (a.k == .Imm) { a = b.R(b.iconst(a.v)); }
+    let r = b.op2(o, .I, a, c);
+    if (t.size < 8) { // the exact result fits in 64 bits: it overflowed iff narrowing changes it
+        return .{r, b.cmp(.NE, b.R(cv.norm(r, t)), b.R(r))};
+    }
+    let sg = ty.isSigned(t);
+    if (o == .Mul) {
+        let hi = b.op2(if (sg) .SMulH else .UMulH, .I, a, if (c.k == .Imm) b.R(b.iconst(c.v)) else c);
+        let ovf = if (sg) b.cmp(.NE, b.R(hi), b.R(b.op2(.Asr, .I, b.R(r), b.IMM(63)))) else b.cmp(.NE, b.R(hi), b.IMM(0));
+        return .{r, ovf};
+    }
+    if (!sg) {
+        let ovf = if (o == .Add) b.cmp(.LO, b.R(r), a) else b.cmp(.LO, a, c);
+        return .{r, ovf};
+    }
+    if (c.k == .Imm) { // a ± constant: it overflowed iff the result moved the wrong way
+        let up = (o == .Add) == (c.v >= 0);
+        return .{r, b.cmp(if (up) .LT else .GT, b.R(r), a)};
+    }
+    // signed: add overflows iff both operands' signs differ from the result's; sub iff a's sign
+    // differs from b's and from the result's
+    let x = b.op2(.Xor, .I, a, b.R(r));
+    let y = if (o == .Add) b.op2(.Xor, .I, c, b.R(r)) else b.op2(.Xor, .I, a, c);
+    return .{r, b.cmp(.LT, b.R(b.op2(.And, .I, b.R(x), b.R(y))), b.IMM(0))};
+}
+
+// wrap: +% -% *% (never checked)
+pub fn arith(op: []const u8, t: *ty.Type, a: b.Val, c: b.Val, wrap: bool) -> b.Val {
+    let cls = ty.clsOf(t);
+    if (ty.isFloat(t)) {
+        let ra = b.regOf(a);
+        let rb = b.regOf(c);
+        if (text.eq(op, "%")) { return b.vReg(t, b.callv("_fmod", .F64, &[_]ir.Opd { b.R(ra), b.R(rb) }, &[_]ir.Cls { .F64, .F64 })); }
+        let o: ir.Op = if (text.eq(op, "+")) .FAdd else if (text.eq(op, "-")) .FSub else if (text.eq(op, "*")) .FMul else .FDiv;
+        return b.vReg(t, b.op2(o, cls, b.R(ra), b.R(rb)));
+    }
+    let sg = ty.isSigned(t);
+    var o: ir.Op = .Add;
+    var need_norm = false;
+    var commut = false;
+    if (text.eq(op, "+")) {
+        o = .Add;
+        need_norm = true;
+        commut = true;
+    } else if (text.eq(op, "-")) {
+        o = .Sub;
+        need_norm = true;
+    } else if (text.eq(op, "*")) {
+        o = .Mul;
+        need_norm = true;
+        commut = true;
+    } else if (text.eq(op, "/")) {
+        o = if (sg) .SDiv else .UDiv;
+    } else if (text.eq(op, "%")) {
+        o = if (sg) .SRem else .URem;
+    } else if (text.eq(op, "&")) {
+        o = .And;
+        commut = true;
+    } else if (text.eq(op, "|")) {
+        o = .Or;
+        commut = true;
+    } else if (text.eq(op, "^")) {
+        o = .Xor;
+        commut = true;
+    } else if (text.eq(op, "<<")) {
+        o = .Shl;
+        need_norm = true;
+    } else {
+        o = if (sg) .Asr else .Lsr;
+    }
+    var oa = b.opdOf(a);
+    var ob = b.opdOf(c);
+    if (oa.k == .Imm && commut) {
+        let tmp = oa;
+        oa = ob;
+        ob = tmp;
+    }
+    if (oa.k == .Imm) { oa = b.R(b.iconst(oa.v)); }
+    if ((o == .Add || o == .Sub || o == .Mul) && !wrap && st.safeArith()) {
+        let (r, ovf) = ovfOp(o, t, oa, ob);
+        panicIf(ovf, "integer overflow");
+        return b.vReg(t, r); // it fit, so it's already normalized
+    }
+    if (o == .SDiv || o == .UDiv || o == .SRem || o == .URem) {
+        if (ob.k != .Imm) { panicIf(b.cmp(.EQ, ob, b.IMM(0)), "division by zero"); } // in every mode
+        if (sg) {
+            // MIN / -1 overflows: a trap in safe modes; it wraps (to MIN) in ReleaseFast
+            if (o == .SDiv && st.safeArith() && (ob.k != .Imm || ob.v == -1)) {
+                var bad = b.cmp(.EQ, oa, b.IMM(intMin(t)));
+                if (ob.k != .Imm) { bad = b.op2(.And, .I, b.R(bad), b.R(b.cmp(.EQ, ob, b.IMM(-1)))); }
+                panicIf(bad, "integer overflow");
+            }
+            need_norm = o == .SDiv; // a narrow MIN / -1 must wrap back into range
+        }
+    }
+    if (o == .Shl || o == .Asr || o == .Lsr) {
+        let bits = t.size * 8;
+        if (ob.k == .Imm) {
+            // constant amounts are checked by binop
+        } else if (st.safeArith()) {
+            panicIf(b.cmp(.HS, ob, b.IMM(bits as i64)), "shift amount too large");
+        } else if (bits < 64) {
+            ob = b.R(b.op2(.And, .I, ob, b.IMM((bits - 1) as i64))); // ReleaseFast: the amount is taken mod the width
+        }
+    }
+    let r = b.op2(o, .I, oa, ob);
+    return b.vReg(t, if (need_norm) cv.norm(r, t) else r);
+}
+
+// c ? x : y
+pub fn sel(c: i32, x0: ir.Opd, y0: ir.Opd) -> i32 {
+    var x = x0;
+    var y = y0;
+    if (x.k == .Imm) { x = b.R(b.iconst(x.v)); }
+    if (y.k == .Imm) { y = b.R(b.iconst(y.v)); }
+    let r = b.newVreg(.I);
+    let i = b.emit(.Sel);
+    i.dst = r;
+    i.cls = .I;
+    i.a = b.R(c);
+    i.b = x;
+    i.c = y;
+    return r;
+}
+
+// a +| b, a -| b, a *| b: clamp to the type's range instead of overflowing
+fn saturate(op: u8, t: *ty.Type, a: b.Val, c: b.Val) -> b.Val {
+    let o: ir.Op = if (op == '+') .Add else if (op == '-') .Sub else .Mul;
+    var oa = b.opdOf(a);
+    let ob = b.opdOf(c);
+    if (oa.k == .Imm) { oa = b.R(b.iconst(oa.v)); }
+    let (r, ovf) = ovfOp(o, t, oa, ob);
+    var lim = b.IMM(0);
+    if (!ty.isSigned(t)) {
+        lim = b.IMM(if (o == .Sub) 0 else intMax(t));
+    } else {
+        // the true result's sign: a's for + and -, a^b's for *
+        let neg = b.cmp(.LT, if (o == .Mul) b.R(b.op2(.Xor, .I, oa, ob)) else oa, b.IMM(0));
+        lim = b.R(sel(neg, b.IMM(intMin(t)), b.IMM(intMax(t))));
+    }
+    return b.vReg(t, sel(ovf, lim, b.R(r)));
+}
+
+// SIMD: one instruction for the whole vector (the operands live in memory, like other aggregates)
+pub fn vlanes(vt: *ty.Type) -> i64 {
+    let e = vt.E();
+    return ir.vlanes(e.size as i64, ty.isFloat(e), ty.isSigned(e) && !ty.isFloat(e), vt.size as i64);
+}
+
+pub fn vecOp(vop: ir.Vop, vt: *ty.Type, x: ir.Opd, y: ir.Opd, cls: ir.Cls) -> b.Val {
+    let r = b.temp(vt);
+    let ra = b.addrReg(r);
+    let in = b.emit(.Vec);
+    in.mem = vop as i32;
+    in.a = b.R(ra);
+    in.b = x;
+    in.c = y;
+    in.cls = cls;
+    in.imm = vlanes(vt);
+    return b.vAgg(vt, r, true);
+}
+
+fn vecBinop(op: []const u8, a: b.Val, c: b.Val, tok: ?*token.Token) -> b.Val {
+    let vt = if (ty.isVector(a.t)) a.t else c.t;
+    if (a.t != c.t) {
+        diag.at(tok, text.f("'{s}' needs two {s}, found {s} and {s} (to use one number for every element, write @splat(x))",
+                            .{op, ty.tname(vt), ty.tname(a.t), ty.tname(c.t)}));
+    }
+    let fl = ty.isFloat(vt.E());
+    var vop: ir.Vop = .Add;
+    if (text.eq(op, "+") || text.eq(op, "+%")) {
+        vop = .Add;
+    } else if (text.eq(op, "-") || text.eq(op, "-%")) {
+        vop = .Sub;
+    } else if (text.eq(op, "*") || text.eq(op, "*%")) {
+        vop = .Mul;
+    } else if (text.eq(op, "/")) {
+        vop = .Div;
+    } else if (text.eq(op, "&")) {
+        vop = .And;
+    } else if (text.eq(op, "|")) {
+        vop = .Or;
+    } else if (text.eq(op, "^")) {
+        vop = .Xor;
+    } else {
+        diag.at(tok, text.f("'{s}' doesn't work on vectors (they have + - * / & | ^, element by element)", .{op}));
+    }
+    if (op.len > 1 && op[1] == '%' && fl) { diag.at(tok, text.f("'{s}' needs integers", .{op})); }
+    if (vop == .Div && !fl) { diag.at(tok, "integer vectors have no '/': ARM64 has no SIMD integer division (divide the elements one by one)"); }
+    if (vop as i32 >= ir.Vop.And as i32 && fl) { diag.at(tok, text.f("'{s}' needs integer vectors, not {s}", .{op, ty.tname(vt)})); }
+    if (vop == .Mul && !fl && vt.E().size == 8) { diag.at(tok, text.f("ARM64 has no SIMD multiply for 64-bit integers ({s})", .{ty.tname(vt)})); }
+    let pa = b.addrReg(a.a);
+    let pb = b.addrReg(c.a);
+    return vecOp(vop, vt, b.R(pa), b.R(pb), .I);
+}
+
+fn cmpOnly(op: []const u8) -> bool { return text.eq(op, "==") || text.eq(op, "!="); }
+
+pub fn binop(op0: []const u8, a0: b.Val, c0: b.Val, tok: ?*token.Token) -> b.Val {
+    var op = op0;
+    var a = a0;
+    var c = c0;
+    var wrap = false;
+    if (ty.isVector(a.t) || ty.isVector(c.t)) { return vecBinop(op, a, c, tok); }
+    if (a.t == ty.type_ || c.t == ty.type_) { // types compare by identity, at compile time
+        if (a.t != c.t || !cmpOnly(op)) {
+            diag.at(tok, text.f("'{s}' can't be used on a type{s}", .{op, if (a.t != c.t) " and a value" else "; types only compare with == and !="}));
+        }
+        if (!a.isconst || !c.isconst) { diag.at(tok, "internal error: a type that isn't known at compile time"); }
+        return bv((a.ival == c.ival) == (op[0] == '='));
+    }
+    let arith1 = op.len > 0 && (op[0] == '+' || op[0] == '-' || op[0] == '*');
+    if (arith1 && op.len > 1 && op[1] == '%') { // +% -% *%: wrapping (what the hardware does)
+        if (!ty.isInt(a.t) || !ty.isInt(c.t)) { diag.at(tok, text.f("'{s}' needs integers", .{op})); }
+        wrap = true;
+        op = op[0..1];
+    } else if (arith1 && op.len > 1 && op[1] == '|') { // +| -| *|: saturating, in every mode
+        if (!ty.isInt(a.t) || !ty.isInt(c.t)) { diag.at(tok, text.f("'{s}' needs integers", .{op})); }
+        if (ty.isLit(a.t) && ty.isLit(c.t)) { return fold(op[0..1], a, c, tok); }
+        let t = cv.unify(a.t, c.t, tok, op);
+        if (ty.isSigned(a.t) != ty.isSigned(c.t) && !ty.isLit(a.t) && !ty.isLit(c.t)) {
+            diag.at(tok, text.f("operator '{s}' can't mix {s} and {s}", .{op, ty.tname(a.t), ty.tname(c.t)}));
+        }
+        a = cv.coerce(a, t, tok, "operand");
+        c = cv.coerce(c, t, tok, "operand");
+        return saturate(op[0], t, a, c);
+    }
+    if (ty.isLit(a.t) && ty.isLit(c.t)) { return fold(op, a, c, tok); }
+    if (isCmpOp(op)) {
+        if (ty.isSlice(a.t) || ty.isSlice(c.t)) {
+            if (ty.isBytes(a.t) && ty.isBytes(c.t)) {
+                diag.at(tok, text.f("'{s}' doesn't compare strings (that's a loop over the bytes); use {s}",
+                                    .{op, if (cmpOnly(op)) "mem.eql(u8, a, b)" else "mem.order(u8, a, b)"}));
+            }
+            diag.at(tok, text.f("can't compare slices with '{s}'; compare their elements (mem.eql compares contents)", .{op}));
+        }
+        if ((ty.isOptPtr(a.t) || ty.isPtr(a.t)) && (ty.isOptPtr(c.t) || ty.isPtr(c.t)) && (a.t.k == .Opt || c.t.k == .Opt) && cmpOnly(op)) {
+            // ?*T == ?*T (or *T): null is address 0, so compare the addresses
+            let ea = if (a.t.k == .Opt) a.t.E() else a.t;
+            let ec = if (c.t.k == .Opt) c.t.E() else c.t;
+            if (ea.elem != ec.elem && ea.elem != ty.void_ && ec.elem != ty.void_) {
+                diag.at(tok, text.f("can't compare {s} with {s}", .{ty.tname(a.t), ty.tname(c.t)}));
+            }
+            return b.vReg(ty.bool_, b.cmp(ccFor(op, false, false), b.opdOf(a), b.opdOf(c)));
+        }
+        if (a.t.k == .Opt || c.t.k == .Opt) {
+            let an = a.t == ty.null_;
+            let cn = c.t == ty.null_;
+            if (!(an || cn) || !cmpOnly(op)) {
+                diag.at(tok, "an optional can only be compared with null (== or !=), or with another optional pointer; unwrap it to compare its value");
+            }
+            var h = cv.optHas(if (an) c else a);
+            if (text.eq(op, "==")) { h = b.op2(.Xor, .I, b.R(h), b.IMM(1)); }
+            return b.vReg(ty.bool_, h);
+        }
+        if (ty.isFn(a.t) || ty.isFn(c.t)) {
+            if (a.t == ty.null_ || c.t == ty.null_) {
+                diag.at(tok, text.f("a {s} is never null; only optional functions (?fn(...)) can be", .{ty.tname(if (ty.isFn(a.t)) a.t else c.t)}));
+            }
+            if (a.t != c.t) { diag.at(tok, text.f("can't compare {s} with {s}", .{ty.tname(a.t), ty.tname(c.t)})); }
+            if (!cmpOnly(op)) { diag.at(tok, "functions only support == and !="); }
+            return b.vReg(ty.bool_, b.cmp(ccFor(op, false, false), b.opdOf(a), b.opdOf(c)));
+        }
+        if ((ty.isPtr(a.t) && c.t == ty.null_) || (ty.isPtr(c.t) && a.t == ty.null_)) {
+            diag.at(tok, text.f("a {s} is never null; only optional pointers (?*T) can be", .{ty.tname(if (ty.isPtr(a.t)) a.t else c.t)}));
+        }
+        if ((ty.isPtr(a.t) || a.t == ty.null_) && (ty.isPtr(c.t) || c.t == ty.null_)) {
+            if (a.t.elem != c.t.elem && a.t != ty.null_ && c.t != ty.null_ && a.t.elem != ty.void_ && c.t.elem != ty.void_) {
+                diag.at(tok, text.f("can't compare {s} with {s}", .{ty.tname(a.t), ty.tname(c.t)}));
+            }
+            return b.vReg(ty.bool_, b.cmp(ccFor(op, false, false), b.opdOf(a), b.opdOf(c)));
+        }
+        if (a.t.k == .ErrSet && c.t.k == .ErrSet) { // e == error.NotFound
+            if (!cmpOnly(op)) { diag.at(tok, "errors only support == and !="); }
+            if (a.t == ty.errlit && !cv.setHas(c.t, a.ival)) {
+                diag.at(tok, text.f("{s} has no error {s}", .{ty.tname(c.t), st.M.errnames.items[a.ival as usize]}));
+            }
+            if (c.t == ty.errlit && !cv.setHas(a.t, c.ival)) {
+                diag.at(tok, text.f("{s} has no error {s}", .{ty.tname(a.t), st.M.errnames.items[c.ival as usize]}));
+            }
+            return b.vReg(ty.bool_, b.cmp(ccFor(op, false, false), b.opdOf(a), b.opdOf(c)));
+        }
+        if (a.t.k == .Enum || c.t.k == .Enum) {
+            if (a.t != c.t) { diag.at(tok, text.f("can't compare {s} with {s}", .{ty.tname(a.t), ty.tname(c.t)})); }
+            if (a.t.has_payload) { diag.at(tok, text.f("can't compare {s} values with '{s}'; use switch to look at them", .{ty.tname(a.t), op})); }
+            if (!cmpOnly(op)) { diag.at(tok, "enums only support == and !="); }
+            return b.vReg(ty.bool_, b.cmp(ccFor(op, false, false), b.opdOf(a), b.opdOf(c)));
+        }
+        if (a.t == ty.bool_ && c.t == ty.bool_ && cmpOnly(op)) {
+            return b.vReg(ty.bool_, b.cmp(ccFor(op, false, false), b.opdOf(a), b.opdOf(c)));
+        }
+        if (!ty.isNum(a.t) || !ty.isNum(c.t)) { diag.at(tok, text.f("can't compare {s} with {s}", .{ty.tname(a.t), ty.tname(c.t)})); }
+        if (ty.isInt(a.t) && ty.isInt(c.t) && !ty.isLit(a.t) && !ty.isLit(c.t) && ty.isSigned(a.t) != ty.isSigned(c.t)) {
+            diag.at(tok, text.f("comparing signed and unsigned integers ({s}, {s}); convert one with 'as'", .{ty.tname(a.t), ty.tname(c.t)}));
+        }
+        let t = cv.unify(a.t, c.t, tok, op);
+        a = cv.coerce(a, t, tok, "operand");
+        c = cv.coerce(c, t, tok, "operand");
+        if (ty.isFloat(t)) { return b.vReg(ty.bool_, b.fcmp(ccFor(op, true, true), b.regOf(a), b.regOf(c))); }
+        return b.vReg(ty.bool_, b.cmp(ccFor(op, ty.isSigned(t), false), b.opdOf(a), b.opdOf(c)));
+    }
+    let add_sub = text.eq(op, "+") || text.eq(op, "-");
+    if (add_sub && ty.isPtr(a.t) && ty.isInt(c.t)) {
+        if (a.t.E() == ty.void_) { diag.at(tok, "can't do arithmetic on *void"); }
+        if (!a.t.many) {
+            diag.at(tok, text.f("pointer arithmetic needs a pointer to many items ([*]{s}), not {s}", .{ty.tname(a.t.E()), ty.tname(a.t)}));
+        }
+        if (ty.isSigned(c.t) && !ty.isLit(c.t)) {
+            diag.at(tok, text.f("a pointer offset must be usize, found {s}; convert it with 'as usize'", .{ty.tname(c.t)}));
+        }
+        names.requireUnsafe(tok, "pointer arithmetic");
+        var idx = cv.convert(cv.defaulted(c), ty.i64_);
+        if (text.eq(op, "-")) {
+            if (idx.isconst) { idx.ival = 0 -% idx.ival; } else { idx = b.vReg(ty.i64_, b.op1(.Neg, .I, b.R(idx.reg))); }
+        }
+        let ad = access.elemAddr(b.regOf(a), idx, a.t.E().size);
+        return b.vReg(a.t, b.addrReg(ad));
+    }
+    if (text.eq(op, "-") && ty.isPtr(a.t) && ty.isPtr(c.t) && a.t.elem == c.t.elem) {
+        if (!a.t.many || !c.t.many) { diag.at(tok, "subtracting pointers needs pointers to many items ([*]T)"); }
+        names.requireUnsafe(tok, "pointer arithmetic");
+        var d = b.op2(.Sub, .I, b.R(b.regOf(a)), b.R(b.regOf(c)));
+        let es = if (a.t.E().size != 0) a.t.E().size else 1;
+        if (es > 1) { d = b.op2(.SDiv, .I, b.R(d), b.R(b.iconst(es as i64))); }
+        return b.vReg(ty.isize_, d);
+    }
+    if (!ty.isNum(a.t) || !ty.isNum(c.t)) {
+        let bad = if (ty.isNum(a.t)) c.t else a.t;
+        diag.at(tok, text.f("operator '{s}' needs numbers, found {s}{s}", .{op, ty.tname(bad),
+            if (ty.isBytes(bad) && text.eq(op, "+")) " ('+' doesn't join strings, since that would allocate: use fmt.allocPrint(alloc, \"{s}{s}\", .{ a, b }) or fmt.bufPrint)" else ""}));
+    }
+    if (text.eq(op, "<<") || text.eq(op, ">>")) {
+        if (!ty.isInt(a.t) || !ty.isInt(c.t)) { diag.at(tok, text.f("'{s}' needs integers", .{op})); }
+        if (ty.isSigned(c.t) && !ty.isLit(c.t)) {
+            diag.at(tok, text.f("a shift amount must be unsigned, found {s}; convert it with 'as u32'", .{ty.tname(c.t)}));
+        }
+        let t = ty.defaultT(a.t);
+        a = cv.coerce(a, t, tok, "operand");
+        if (c.isconst && (c.ival < 0 || c.ival >= (t.size * 8) as i64)) {
+            diag.at(tok, text.f("shift amount {} is out of range for {s} (0 to {})", .{c.ival, ty.tname(t), t.size * 8 - 1}));
+        }
+        c = cv.convert(cv.defaulted(c), ty.i64_);
+        return arith(op, t, a, c, false);
+    }
+    let t = cv.unify(a.t, c.t, tok, op);
+    if ((text.eq(op, "&") || text.eq(op, "|") || text.eq(op, "^")) && !ty.isInt(t)) { diag.at(tok, text.f("'{s}' needs integers", .{op})); }
+    a = cv.coerce(a, t, tok, "operand");
+    c = cv.coerce(c, t, tok, "operand");
+    if (ty.isLit(t)) { return fold(op, a, c, tok); }
+    return arith(op, t, a, c, wrap);
+}
+
+fn boolFromCond(n: *ast.Node) -> b.Val {
+    let r = b.newVreg(.I);
+    let tb = b.newBlock();
+    let fb = b.newBlock();
+    let join = b.newBlock();
+    expr.cond(n, tb, fb);
+    b.setBlk(tb);
+    b.mov(r, .I, b.IMM(1));
+    b.jmp(join);
+    b.setBlk(fb);
+    b.mov(r, .I, b.IMM(0));
+    b.jmp(join);
+    b.setBlk(join);
+    return b.vReg(ty.bool_, r);
+}
+
+pub fn exBinary(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let op = n.name;
+    if (text.eq(op, "&&") || text.eq(op, "||")) { return boolFromCond(n); }
+    if (text.eq(op, "+")) {
+        var ops: alloc.Vec(*ast.Node) = .{};
+        var x = n;
+        while (x.k == .Binary && text.eq(x.name, "+") && ops.items.len < 256) {
+            ops.push(x);
+            x = x.a.?;
+        }
+        var acc = expr.expr(x, want);
+        var i = ops.items.len;
+        while (i > 0) {
+            i -= 1;
+            let rhs = expr.expr(ops.items[i].b.?, if (ty.isLit(acc.t)) null else acc.t);
+            acc = binop("+", acc, rhs, ops.items[i].tok);
+        }
+        return acc;
+    }
+    let cmpop = isCmpOp(op);
+    let a = expr.expr(n.a.?, if (cmpop) null else want);
+    let c = expr.expr(n.b.?, if (ty.isLit(a.t)) null else a.t);
+    return binop(op, a, c, n.tok);
+}
+
+pub fn exUnary(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let op = n.name;
+    let operand = n.a.?;
+    if (text.eq(op, "&")) {
+        if (operand.k == .Name) {
+            if (names.findVar(operand.name)) |fv| {
+                if (fv.kind == .Const || fv.kind == .CStr) {
+                    diag.at(operand.tok, text.f("'{s}' is a compile-time constant and has no address; give it a type to make it a variable", .{operand.name}));
+                }
+            }
+        }
+        if (operand.k == .ArrayLit || operand.k == .StructLit) { // &[_]i32 { 1, 2 }: a read-only stack value
+            let v = expr.expr(operand, null);
+            return b.vReg(ty.ptrToQ(v.t, true), b.addrReg(v.a));
+        }
+        if (!access.isLvalueNode(operand)) { diag.at(n.tok, "can't take the address of a temporary value"); }
+        let l = access.lval(operand);
+        if (l.temp) { diag.at(n.tok, "can't take the address of a temporary value"); }
+        if (l.bits != 0) { diag.at(n.tok, "can't take the address of a packed struct field: it isn't at a byte address"); }
+        access.unionRead(l);
+        return b.vReg(ty.ptrToQ(l.t, l.ro), b.addrReg(l.a)); // &let_binding is *const T
+    }
+    let v = expr.expr(operand, want);
+    if (text.eq(op, "-") && ty.isVector(v.t)) { // each element negated (wrapping, like all vector integer math)
+        if (!ty.isFloat(v.t.E()) && !ty.isSigned(v.t.E())) {
+            diag.at(n.tok, text.f("can't negate {s}: its elements are unsigned", .{ty.tname(v.t)}));
+        }
+        let pa = b.addrReg(v.a);
+        return vecOp(.Neg, v.t, b.R(pa), ir.NONE, .I);
+    }
+    if (text.eq(op, "-")) {
+        if (!ty.isNum(v.t)) { diag.at(n.tok, text.f("unary '-' needs a number, found {s}", .{ty.tname(v.t)})); }
+        if (v.isconst && ty.isFloat(v.t)) { return b.vFlt(v.t, -v.fval); }
+        if (ty.isInt(v.t) && !ty.isSigned(v.t)) {
+            diag.at(n.tok, text.f("can't negate an unsigned {s}; write '0 -% x' to wrap on purpose", .{ty.tname(v.t)}));
+        }
+        if (v.isconst && ty.isLit(v.t)) { return b.vInt(v.t, 0 -% v.ival); }
+        if (ty.isFloat(v.t)) { return b.vReg(v.t, b.op1(.FNeg, ty.clsOf(v.t), b.R(b.regOf(v)))); }
+        if (st.safeArith()) { // only MIN overflows
+            let r = b.regOf(v);
+            panicIf(b.cmp(.EQ, b.R(r), b.IMM(intMin(v.t))), "integer overflow");
+            return b.vReg(v.t, b.op1(.Neg, .I, b.R(r)));
+        }
+        return b.vReg(v.t, cv.norm(b.op1(.Neg, .I, b.R(b.regOf(v))), v.t));
+    }
+    if (text.eq(op, "!")) {
+        if (v.t != ty.bool_) { diag.at(n.tok, text.f("'!' needs a bool, found {s}", .{ty.tname(v.t)})); }
+        if (v.isconst) { return bv(v.ival == 0); }
+        return b.vReg(ty.bool_, b.op2(.Xor, .I, b.R(v.reg), b.IMM(1)));
+    }
+    // ~
+    if (!ty.isInt(v.t)) { diag.at(n.tok, text.f("'~' needs an integer, found {s}", .{ty.tname(v.t)})); }
+    if (v.isconst) { return b.vInt(v.t, if (ty.isLit(v.t)) ~v.ival else cv.truncExt(~v.ival, v.t)); }
+    return b.vReg(v.t, cv.norm(b.op1(.Not, .I, b.R(v.reg)), v.t));
+}

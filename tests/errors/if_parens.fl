@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    let x: i64 = 1;
+    if x > 0 { try io.print("{}\n", .{x}); }
+}

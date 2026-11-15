@@ -1,0 +1,5 @@
+fn main() -> !void {
+    var a: [2]i32 = undefined;
+    let b = a;
+    b[0] = 1;
+}

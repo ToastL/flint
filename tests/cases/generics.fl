@@ -1,0 +1,99 @@
+// comptime parameters, anytype, and functions that return types (a slice of milestone 6)
+
+import std.io;
+
+fn maxOf(comptime T: type, a: T, b: T) -> T {
+    return if (a > b) a else b;
+}
+
+fn Pair(comptime A: type, comptime B: type) -> type {
+    return struct {
+        first: A,
+        second: B,
+
+        fn make(a: A, b: B) -> Self { return Self { first: a, second: b }; }
+        fn swap(self: Self) -> Pair(B, A) { return .{ first: self.second, second: self.first }; }
+    };
+}
+
+// a comptime value parameter: each N makes its own type
+fn Stack(comptime T: type, comptime N: usize) -> type {
+    return struct {
+        items: [N]T = undefined,
+        len: usize = 0,
+
+        fn push(self: *Self, x: T) -> bool {
+            if (self.len == N) { return false; }
+            self.items[self.len] = x;
+            self.len += 1;
+            return true;
+        }
+        fn pop(self: *Self) -> ?T {
+            if (self.len == 0) { return null; }
+            self.len -= 1;
+            return self.items[self.len];
+        }
+    };
+}
+
+struct Node {
+    value: i32,
+    next: ?*Node,
+}
+
+// a generic type that points at itself
+fn List(comptime T: type) -> type {
+    return struct {
+        head: ?*Self = null,
+        value: T,
+    };
+}
+
+// anytype: the argument's type becomes the parameter's
+fn describe(x: anytype) -> !void {
+    try io.print("{any} has {} bytes\n", .{ x, @sizeOf(@TypeOf(x)) });
+}
+
+fn repeat(comptime s: []const u8, comptime n: i32) -> !void {
+    for (0..n) |_| { try io.print("{s}", .{s}); }
+    try io.print("\n", .{});
+}
+
+fn sumAll(comptime T: type, xs: []const T) -> T {
+    var t: T = 0;
+    for (xs) |x| { t += x; }
+    return t;
+}
+
+fn main() -> !void {
+    try io.print("{} {} {}\n", .{ maxOf(u32, 3, 9), maxOf(f64, 2.5, -1), maxOf(i8, -3, -7) });
+
+    let p = Pair(i32, bool).make(4, true);
+    let q = p.swap();
+    try io.print("{} {} {} {}\n", .{ p.first, p.second, q.first, q.second });
+    let r: Pair(bool, i32) = q.swap().swap(); // the same arguments give the same type
+    try io.print("{any}\n", .{r});
+
+    var s: Stack(i64, 2) = .{};
+    try io.print("{} {} {}\n", .{ s.push(10), s.push(20), s.push(30) });
+    try io.print("{any} {any} {any}\n", .{ s.pop(), s.pop(), s.pop() });
+
+    var tail = List(u8) { value: 2 };
+    let head = List(u8) { head: &tail, value: 1 };
+    try io.print("{} {}\n", .{ head.value, head.head.?.value });
+
+    try describe(42);
+    try describe(small());
+    try describe(.{ 1, true });
+    try describe(p);
+    try repeat("ab", 3);
+    try repeat("ab", 3); // the same instance again
+    try io.print("{} {d:.1}\n", .{ sumAll(i64, &[_]i64 { 1, 2, 3 }), sumAll(f32, &[_]f32 { 0.5, 0.25 }) });
+    try io.print("{} {} {} {}\n", .{ @minInt(i8), @maxInt(u16), @maxInt(u64), @minInt(i64) });
+
+    var n = Node { value: 1, next: null };
+    let alias: @TypeOf(n) = n;
+    try io.print("{}\n", .{alias.value});
+}
+
+fn small() -> u8 { return 7; }

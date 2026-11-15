@@ -1,0 +1,215 @@
+// sema.literals - values written out in full: struct literals (with field defaults), array
+// literals, @splat, and anonymous `.{ ... }` literals that take their type from context.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.expr;
+import sema.ops;
+import sema.members;
+import sema.globals;
+
+pub fn exStructlit(n: *ast.Node) -> b.Val {
+    if (n.a) |ta| { // List(i32) { ... }
+        let t = members.staticType(ta);
+        if (t == null || t.?.k != .Struct) { diag.at(n.tok, "this isn't a struct type"); }
+        return structInit(t.?, n);
+    }
+    let t = names.findStruct(n.name);
+    names.checkTypePub(t, n.tok);
+    return structInit(t.?, n);
+}
+
+// the value v goes into field fd of a value of struct type st at base
+fn fieldInit(stt: *ty.Type, fd: *ty.Field, base: b.Addr, v: b.Val, tok: ?*token.Token) {
+    if (!stt.is_packed) {
+        b.storeVal(fd.t, b.aAdd(base, fd.off as i64), v);
+        return;
+    }
+    var l = access.newLV();
+    l.t = fd.t;
+    l.a = base;
+    l.bits = fd.bits;
+    l.bitoff = fd.bitoff;
+    l.sbits = fd.sbits;
+    l.backing = stt.tagt;
+    access.bitsStore(l, v, tok);
+}
+
+// the fields of n (Field nodes) fill in a value of struct type stt
+pub fn structInit(stt: *ty.Type, n: *ast.Node) -> b.Val {
+    ty.layout(stt, n.tok);
+    let t = b.temp(stt);
+    if (stt.is_packed) { b.zeroAt(stt, t); }
+    if (stt.is_union && n.count() != 1) {
+        diag.at(n.tok, text.f("a {s} literal sets exactly one field (its fields share memory), but {} are given", .{stt.name, n.count()}));
+    }
+    let nf = stt.fields.items.len;
+    let given = alloc.make(bool, nf + 1);
+    for (n.list.items) |f| {
+        var k: ?usize = null;
+        for (0..nf) |j| { if (text.eq(stt.fields.items[j].name, f.name)) { k = j; } }
+        let ki = k orelse diag.at(f.tok, text.f("struct '{s}' has no field '{s}'", .{stt.name, f.name}));
+        if (given[ki]) { diag.at(f.tok, text.f("field '{s}' given twice", .{f.name})); }
+        given[ki] = true;
+        let fd = &stt.fields.items[ki];
+        let fv = f.a.?;
+        if (fv.k == .Undefined) { // filled in later
+            if (!stt.is_packed) { b.undefinedAt(fd.t, b.aAdd(t, fd.off as i64)); }
+            continue;
+        }
+        let v = cv.coerce(expr.expr(fv, fd.t), fd.t, fv.tok, text.f("field '{s}'", .{f.name}));
+        fieldInit(stt, fd, t, v, fv.tok);
+    }
+    if (!stt.is_union) {
+        for (0..nf) |j| {
+            if (given[j]) { continue; }
+            let fd = &stt.fields.items[j];
+            let def = fd.def orelse diag.at(n.tok, text.f("missing field '{s}' in {s} literal (every field must be set, or have a default)", .{fd.name, stt.name}));
+            if (def.k == .Undefined) {
+                if (!stt.is_packed) { b.undefinedAt(fd.t, b.aAdd(t, fd.off as i64)); }
+                continue;
+            }
+            let saved_te = st.TE;
+            if (stt.genv) |g| { st.TE = g; } // a generic type's defaults see its own bindings
+            let v = cv.coerce(expr.expr(def, fd.t), fd.t, def.tok, text.f("default of field '{s}'", .{fd.name}));
+            st.TE = saved_te;
+            fieldInit(stt, fd, t, v, def.tok);
+        }
+    }
+    return b.vAgg(stt, t, true);
+}
+
+// [N]T { a, b, ... } (also .{ a, b } where an array is expected)
+pub fn arrayInit(at: *ty.Type, els: []*ast.Node, tok: ?*token.Token) -> b.Val {
+    ty.layout(at, tok);
+    let n = els.len;
+    if (n as i64 != at.alen) {
+        diag.at(tok, text.f("{s} needs {} element(s), but {} {s} given", .{ty.tname(at), at.alen, n, if (n == 1) "is" else "are"}));
+    }
+    let et = at.E();
+    let a = b.temp(at);
+    for (0..n) |i| {
+        b.storeVal(et, b.aAdd(a, i as i64 * et.size as i64), cv.coerce(expr.expr(els[i], et), et, els[i].tok, "array element"));
+    }
+    return b.vAgg(at, a, true);
+}
+
+// the type of [N]T { ... } / [_]T { ... }
+pub fn arraylitType(n: *ast.Node) -> *ty.Type {
+    let tn = n.a.?;
+    let et = names.resolve(tn.a.?);
+    if (et == ty.void_ || et == ty.noreturn_) { diag.at(tn.a.?.tok, text.f("can't have an array of {s}", .{ty.tname(et)})); }
+    var len = n.count() as i64;
+    if (tn.c) |lc| {
+        len = globals.evalConstInt(lc, "an array length");
+        if (len < 0) { diag.at(lc.tok, text.f("an array length can't be negative ({})", .{len})); }
+    }
+    return ty.arrayOf(et, len);
+}
+
+pub fn exArraylit(n: *ast.Node) -> b.Val { return arrayInit(arraylitType(n), n.list.items, n.tok); }
+
+// @splat(v): an array with every element set to v (its type comes from context)
+pub fn exSplat(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let arg = n.at(0);
+    if (want) |w| {
+        if (ty.isVector(w)) { // one dup instruction
+            let et = w.E();
+            let v = cv.coerce(expr.expr(arg, et), et, arg.tok, "@splat value");
+            let o = if (ty.isFloat(et)) b.R(b.regOf(v)) else b.opdOf(v);
+            return ops.vecOp(.Splat, w, o, ir.NONE, ty.clsOf(et));
+        }
+    }
+    if (want == null || !ty.isArray(want.?)) {
+        diag.at(n.tok, "can't tell which array @splat makes here; give it a type: 'let a: [N]T = @splat(v);'");
+    }
+    let at = want.?;
+    let et = at.E();
+    ty.layout(at, n.tok);
+    var v = cv.coerce(expr.expr(arg, et), et, arg.tok, "@splat value");
+    let a = b.temp(at);
+    let zero = v.isconst && (if (ty.isFloat(et)) v.fval == 0.0 && 1.0 / v.fval > 0.0 else v.ival == 0);
+    if (zero) {
+        b.zeroAt(at, a);
+    } else if (at.alen <= 8) {
+        var i: i64 = 0;
+        while (i < at.alen) {
+            b.storeVal(et, b.aAdd(a, i * et.size as i64), v);
+            i += 1;
+        }
+    } else if (at.alen > 0) { // a counted loop
+        if (!ty.isAgg(et)) { v = b.vReg(et, b.regOf(v)); }
+        let base = b.addrReg(a);
+        let islot = b.newSlot(ty.usize_);
+        b.store(ty.usize_, b.aSlot(islot, 0), b.IMM(0));
+        let body = b.newBlock();
+        let exit_ = b.newBlock();
+        b.jmp(body);
+        b.setBlk(body);
+        let i = b.load(ty.usize_, b.aSlot(islot, 0));
+        b.storeVal(et, access.elemAddr(base, b.vReg(ty.usize_, i), et.size), v);
+        let i2 = b.op2(.Add, .I, b.R(i), b.IMM(1));
+        b.store(ty.usize_, b.aSlot(islot, 0), b.R(i2));
+        b.br(b.R(b.cmp(.LO, b.R(i2), b.IMM(at.alen))), body, exit_);
+        b.setBlk(exit_);
+    }
+    return b.vAgg(at, a, true);
+}
+
+// .{ ... }: a struct, tuple or array literal whose type comes from context
+pub fn exAnon(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    var t = want;
+    while (t != null && (t.?.k == .Opt || t.?.k == .ErrUnion)) { t = t.?.elem; } // ?T and E!T wrap the value
+    if (t == null && n.flag == 0) { // .{ a, b } with nothing to go by: a tuple of the elements' own types
+        var ts: alloc.Vec(*ty.Type) = .{};
+        var vs: alloc.Vec(b.Val) = .{};
+        for (n.list.items) |el| {
+            var v = cv.defaulted(expr.expr(el, null));
+            if (v.t == ty.null_ || v.t == ty.void_ || v.t == ty.noreturn_) {
+                diag.at(el.tok, text.f("can't put {s} in a tuple without a type", .{ty.tname(v.t)}));
+            }
+            if (!ty.isAgg(v.t)) { v = b.vReg(v.t, b.regOf(v)); }
+            vs.push(v);
+            ts.push(v.t);
+        }
+        let tt = ty.tupleOf(ts.items);
+        ty.layout(tt, n.tok);
+        let a = b.temp(tt);
+        for (0..vs.items.len) |i| { b.storeVal(ts.items[i], b.aAdd(a, tt.fields.items[i].off as i64), vs.items[i]); }
+        return b.vAgg(tt, a, true);
+    }
+    let tt = t orelse diag.at(n.tok, "can't tell the type of '.{ ... }' here; write the type: T { ... }");
+    if (ty.isArray(tt)) {
+        if (n.flag != 0) { diag.at(n.tok, "an array literal lists its elements without names: .{ a, b }"); }
+        return arrayInit(tt, n.list.items, n.tok);
+    }
+    if (tt.k == .Struct && tt.tuple) {
+        if (n.flag != 0) { diag.at(n.tok, "a tuple literal lists its elements without names: .{ a, b }"); }
+        ty.layout(tt, n.tok);
+        let nf = tt.fields.items.len;
+        if (n.count() != nf) {
+            diag.at(n.tok, text.f("{s} has {} elements, but {} {s} given", .{ty.tname(tt), nf, n.count(), if (n.count() == 1) "is" else "are"}));
+        }
+        let a = b.temp(tt);
+        for (0..n.count()) |i| {
+            let fd = &tt.fields.items[i];
+            b.storeVal(fd.t, b.aAdd(a, fd.off as i64), cv.coerce(expr.expr(n.at(i), fd.t), fd.t, n.at(i).tok, text.f("element {}", .{i})));
+        }
+        return b.vAgg(tt, a, true);
+    }
+    if (tt.k == .Struct) {
+        if (n.flag == 0 && n.count() != 0) { diag.at(n.tok, text.f("{s}'s fields need names: .{{ field: value, ... }}", .{ty.tname(tt)})); }
+        return structInit(tt, n);
+    }
+    diag.at(n.tok, text.f("a '.{{ ... }}' literal can't make {s}", .{ty.tname(tt)}));
+}

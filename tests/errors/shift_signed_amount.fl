@@ -1,0 +1,7 @@
+import std.io;
+
+fn main() -> !void {
+    let x: u32 = 5;
+    let n: i32 = 2;
+    try io.print("{}\n", .{x << n});
+}

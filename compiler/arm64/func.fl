@@ -1,0 +1,236 @@
+// arm64.func - IR -> ARM64 assembly (Apple / Mach-O flavor): block layout (entry first, then the
+// order blocks were started in, cold blocks last), the frame (callee-saved registers, slots,
+// spills), prologue and epilogue, and the module's data: string literals, globals (zero ones in
+// bss) and the error-name table the runtime reads.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import ir.ir;
+import arm64.insn as A;
+import arm64.regalloc;
+import arm64.select;
+
+fn E(comptime spec: []const u8, args: anytype) { A.E(spec, args); }
+
+fn blockLess(x: i32, y: i32) -> bool {
+    let a = &A.F.blocks.items[x as usize];
+    let c = &A.F.blocks.items[y as usize];
+    if (a.cold != c.cold) { return !a.cold; }
+    return a.seq < c.seq;
+}
+
+// sorts the blocks after the entry by (cold, start order); a stable insertion sort
+fn sortOrder(xs: []i32) {
+    for (2..xs.len) |i| {
+        let x = xs[i];
+        var j = i;
+        while (j > 1 && blockLess(x, xs[j - 1])) {
+            xs[j] = xs[j - 1];
+            j -= 1;
+        }
+        xs[j] = x;
+    }
+}
+
+fn emitFunc(f: *ir.IRFunc, idx: usize) {
+    A.F = f;
+    A.FN = idx;
+    let nb = f.blocks.items.len;
+    let nv = f.vcls.items.len;
+    A.order = .{};
+    A.layout_idx = alloc.make(i32, nb + 1);
+    for (0..nb) |b| {
+        A.layout_idx[b] = -1;
+        if (!f.blocks.items[b].dead && (b == 0 || f.blocks.items[b].insts.items.len > 0)) { A.order.push(b as i32); }
+    }
+    // entry block first, then by start order, cold blocks last
+    if (A.order.items.len > 2) { sortOrder(A.order.items); }
+    for (0..A.order.items.len) |k| {
+        let b = A.order.items[k];
+        A.layout_idx[b as usize] = k as i32;
+        let blk = &f.blocks.items[b as usize];
+        let n = blk.insts.items.len;
+        if (n == 0 || !ir.isTerm(&blk.insts.items[n - 1])) {
+            diag.at(null, text.f("internal error: block b{} of {s} has no terminator", .{b, f.sym}));
+        }
+    }
+    A.vreg_reg = alloc.make(i32, nv + 1);
+    A.vreg_off = alloc.make(i32, nv + 1);
+    A.usecnt = alloc.make(i32, nv + 1);
+    A.saved_int = .{};
+    A.saved_fp = .{};
+    var u: alloc.Vec(i32) = .{};
+    for (A.order.items) |b| {
+        for (f.blocks.items[b as usize].insts.items) |*in| {
+            ir.instUses(in, &u);
+            for (u.items) |x| { A.usecnt[x as usize] += 1; }
+        }
+    }
+    regalloc.regalloc();
+
+    // frame: [x29-8 ...] callee-saved registers, then slots, then spills
+    var cursor = 8 * (A.saved_int.items.len + A.saved_fp.items.len) as i32;
+    cursor = (cursor + 15) & ~15;
+    let ns = f.slots.items.len;
+    A.slot_off = alloc.make(i32, ns + 1);
+    let used = alloc.make(bool, ns + 1);
+    for (A.order.items) |b| {
+        for (f.blocks.items[b as usize].insts.items) |*in| {
+            if (in.slot >= 0 && (in.op == .Load || in.op == .Store || in.op == .AddrSlot)) { used[in.slot as usize] = true; }
+        }
+    }
+    for (0..ns) |s| {
+        if (!used[s]) { continue; }
+        let sl = f.slots.items[s];
+        let al = if (sl.align < 1) 1 else sl.align;
+        cursor += sl.size;
+        cursor = (cursor + al - 1) / al * al;
+        A.slot_off[s] = cursor;
+    }
+    for (0..nv) |v| {
+        if (A.vreg_reg[v] < 0 && A.vreg_off[v] > 0) {
+            cursor = (cursor + 8 + 7) & ~7;
+            A.vreg_off[v] = cursor;
+        }
+    }
+    A.frame_size = (cursor + 15) & ~15;
+
+    A.O.add("\n\t.p2align 2\n");
+    if (f.is_main || f.exported) { A.O.addf("\t.globl {s}\n", .{f.sym}); }
+    A.O.addf("{s}:\n", .{f.sym});
+    E("stp x29, x30, [sp, #-16]!", .{});
+    E("mov x29, sp", .{});
+    if (A.frame_size != 0) {
+        if (A.frame_size <= 4095) {
+            E("sub sp, sp, #{}", .{A.frame_size});
+        } else {
+            A.movImm(16, A.frame_size as i64);
+            E("sub sp, sp, x16", .{});
+        }
+    }
+    var off: i32 = 0;
+    for (A.saved_int.items) |r| {
+        off += 8;
+        E("stur {s}, [x29, #{}]", .{A.X(r), 0 - off});
+    }
+    for (A.saved_fp.items) |r| {
+        off += 8;
+        E("stur {s}, [x29, #{}]", .{A.D(r), 0 - off});
+    }
+    let norder = A.order.items.len;
+    for (0..norder) |k| {
+        let b = A.order.items[k];
+        let insts = f.blocks.items[b as usize].insts.items;
+        if (k > 0) { A.label(b); }
+        var i: usize = 0;
+        while (i < insts.len) {
+            let nx: ?*const ir.Inst = if (i + 1 < insts.len) &insts[i + 1] else null;
+            let last = k == norder - 1 && i == insts.len - 1;
+            if (select.emitInst(&insts[i], nx, b, last)) { i += 1; }
+            i += 1;
+        }
+    }
+    A.O.addf("Lret{}:\n", .{A.FN});
+    if (f.is_main && f.retcls == .None) { E("mov x0, #0", .{}); }
+    off = 0;
+    for (A.saved_int.items) |r| {
+        off += 8;
+        E("ldur {s}, [x29, #{}]", .{A.X(r), 0 - off});
+    }
+    for (A.saved_fp.items) |r| {
+        off += 8;
+        E("ldur {s}, [x29, #{}]", .{A.D(r), 0 - off});
+    }
+    E("mov sp, x29", .{});
+    E("ldp x29, x30, [sp], #16", .{});
+    E("ret", .{});
+}
+
+fn bytesLine(o: *text.Buf, data: []const u8) {
+    o.add("\t.byte ");
+    for (data) |c| { o.addf("{},", .{c}); }
+    o.add("0\n");
+}
+
+fn dir(size: i32) -> []const u8 { return if (size == 1) ".byte" else if (size == 2) ".short" else if (size == 4) ".long" else ".quad"; }
+
+fn masked(v: i64, size: i32) -> u64 {
+    var u = @bitcast(u64, v);
+    if (size < 8) { u &= (@bitcast(u64, 1 as i64) << (8 * size) as u64) - 1; }
+    return u;
+}
+
+fn p2(align: i32) -> i32 {
+    var al: i32 = 0;
+    var p: i32 = 1;
+    while (p < align) {
+        p *= 2;
+        al += 1;
+    }
+    return al;
+}
+
+// the whole module's assembly
+pub fn emit(m: *ir.Module) -> []const u8 {
+    let o = alloc.new(text.Buf);
+    A.O = o;
+    A.initNames();
+    o.add("\t.build_version macos, 13, 0\n");
+    o.add("\t.section __TEXT,__text,regular,pure_instructions\n");
+    for (0..m.funcs.items.len) |i| { emitFunc(m.funcs.items[i], i); }
+    if (m.strs.items.len > 0) {
+        o.add("\n\t.section __TEXT,__const\n");
+        for (m.strs.items) |*s| {
+            o.addf("{s}:\n", .{s.label});
+            bytesLine(o, s.data);
+        }
+    }
+    if (m.globals.items.len > 0) {
+        o.add("\n\t.section __DATA,__data\n");
+        for (m.globals.items) |*g| {
+            if (g.kind == .Zero) { continue; } // in __bss below: no bytes in the executable
+            if (g.exported) { o.addf("\t.globl {s}\n", .{g.sym}); }
+            o.addf("\t.p2align {}\n{s}:\n", .{p2(g.align), g.sym});
+            switch (g.kind) {
+                .Str => {
+                    let s = &m.strs.items[g.sidx as usize];
+                    o.addf("\t.quad {s}\n\t.quad {}\n", .{s.label, s.data.len});
+                }
+                .Int => { o.addf("\t{s} {}\n", .{dir(g.size), masked(g.ival, g.size)}); }
+                .Data => {
+                    var at: i32 = 0;
+                    for (g.items.items) |*d| {
+                        if (d.off > at) { o.addf("\t.space {}\n", .{d.off - at}); }
+                        if (d.sym.len > 0) {
+                            if (d.val != 0) { o.addf("\t.quad {s}+{}\n", .{d.sym, d.val}); } else { o.addf("\t.quad {s}\n", .{d.sym}); }
+                        } else {
+                            o.addf("\t{s} {}\n", .{dir(d.size), masked(d.val, d.size)});
+                        }
+                        at = d.off + d.size;
+                    }
+                    if (g.size > at) { o.addf("\t.space {}\n", .{g.size - at}); }
+                }
+                .Fill => { o.addf("\t.fill {}, 1, 0xaa\n", .{g.size}); }
+                .Zero => {}
+            }
+        }
+        for (m.globals.items) |*g| {
+            if (g.kind != .Zero) { continue; }
+            if (g.exported) { o.addf("\t.globl {s}\n", .{g.sym}); }
+            o.addf("\t.zerofill __DATA,__bss,{s},{},{}\n", .{g.sym, if (g.size != 0) g.size else 1, p2(g.align)});
+        }
+    }
+    // error code -> name, for the runtime (main returning an error, printing errors)
+    o.add("\n\t.section __TEXT,__const\n");
+    for (0..m.errnames.items.len) |i| {
+        o.addf("l_fl_err_{}:\n", .{i});
+        bytesLine(o, m.errnames.items[i]);
+    }
+    o.add("\n\t.section __DATA,__const\n\t.p2align 3\n\t.globl _fl_error_names\n_fl_error_names:\n");
+    for (0..m.errnames.items.len) |i| { o.addf("\t.quad l_fl_err_{}\n", .{i}); }
+    o.addf("\t.globl _fl_error_count\n_fl_error_count:\n\t.quad {}\n", .{m.errnames.items.len});
+    o.addf("\t.globl _fl_main_errors\n_fl_main_errors:\n\t.quad {}\n", .{if (m.main_errors) 1 else 0});
+    o.add("\n.subsections_via_symbols\n");
+    return o.items;
+}

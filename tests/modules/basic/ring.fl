@@ -1,0 +1,9 @@
+// ring and ring2 import each other: cycles are fine
+import ring2;
+
+pub let depth: i64 = 2;
+
+pub fn ping(n: i64) -> i64 {
+    if (n == 0) { return 0; }
+    return 1 + ring2.pong(n - 1);
+}

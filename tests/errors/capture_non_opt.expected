@@ -1,0 +1,1 @@
+'|v|' unwraps an optional (?T) or error union (!T), but this is bool

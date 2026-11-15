@@ -1,0 +1,86 @@
+// base.diag - compile errors: "file:line:col: error: msg", the source line and a caret.
+//
+// Errors end the compile (the first one wins). Inside a generic instance, the calls that made it
+// are shown as notes so the error leads back to the caller's code.
+
+import std.io;
+import base.alloc;
+import syntax.token;
+
+// the root file, for errors without a token
+pub var path: []const u8 = "<input>";
+pub var src: []const u8 = "";
+
+// calls of generic functions being instantiated, outermost first
+pub var calls: alloc.Vec(*token.Token) = @zeroes(alloc.Vec(*token.Token));
+
+fn pathOf(t: *const token.Token) -> []const u8 { return if (t.path.len > 0) t.path else path; }
+
+fn err(s: []const u8) { _ = io.eprint("{s}", .{s}) catch {}; }
+
+fn showLine(t: *const token.Token) {
+    let p = if (t.src.len > 0) t.src else src;
+    var i: usize = 0;
+    var l: i32 = 1;
+    while (l < t.line && i < p.len) {
+        if (p[i] == '\n') { l += 1; }
+        i += 1;
+    }
+    var e = i;
+    while (e < p.len && p[e] != '\n') { e += 1; }
+    _ = io.eprint("  {d:>4} | {s}\n", .{t.line, p[i..e]}) catch {};
+    err("       | ");
+    var c: i32 = 1;
+    while (c < t.col) {
+        let at = i + (c - 1) as usize;
+        err(if (at < p.len && p[at] == '\t') "\t" else " ");
+        c += 1;
+    }
+    err("^\n");
+}
+
+fn header(t: ?*const token.Token, kind: []const u8, msg: []const u8) {
+    if (t) |tk| {
+        _ = io.eprint("{s}:{}:{}: {s}: {s}\n", .{pathOf(tk), tk.line, tk.col, kind, msg}) catch {};
+        showLine(tk);
+    } else {
+        _ = io.eprint("{s}: {s}: {s}\n", .{path, kind, msg}) catch {};
+    }
+}
+
+fn instanceNotes(t: ?*const token.Token) {
+    var i = calls.items.len;
+    var shown: i32 = 0;
+    while (i > 0 && shown < 4) {
+        i -= 1;
+        let c = calls.items[i];
+        if (t) |tk| {
+            if (c == tk || (c.line == tk.line && c.path.ptr == tk.path.ptr && c.path.len == tk.path.len)) { continue; }
+        }
+        header(c, "note", "in the instance made by this call");
+        shown += 1;
+    }
+}
+
+// An error at t (or, with null, about the root file); ends the compile.
+pub fn at(t: ?*const token.Token, msg: []const u8) -> noreturn {
+    _ = io.flush() catch {};
+    if (t) |tk| {
+        header(tk, "error", msg);
+        instanceNotes(tk);
+    } else {
+        header(null, "error", msg);
+    }
+    exit(1);
+}
+
+// An error followed by notes, each pointing at its own source line (comptime call chains).
+pub fn notes(t: ?*const token.Token, nt: []const ?*token.Token, nm: []const []const u8, msg: []const u8) -> noreturn {
+    _ = io.flush() catch {};
+    header(t, "error", msg);
+    for (0..nt.len) |i| {
+        if (nt[i]) |n| { header(n, "note", nm[i]); }
+    }
+    instanceNotes(t);
+    exit(1);
+}

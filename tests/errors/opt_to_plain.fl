@@ -1,0 +1,4 @@
+fn main() -> !void {
+    let maybe: ?i64 = 5;
+    let x: i64 = maybe;
+}

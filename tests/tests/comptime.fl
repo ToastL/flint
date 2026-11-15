@@ -1,0 +1,16 @@
+// comptime inside test blocks
+
+fn twice(comptime T: type) -> usize { return comptime @sizeOf(T) * 2; }
+
+test "comptime values" {
+    comptime { assert(twice(u8) == 2); }
+    let k = comptime twice(u64);
+    assert(k == 16);
+}
+
+test "types as values" {
+    let T = u16;
+    let x: T = 65535;
+    assert(x == 65535);
+    comptime { assert(T != u8); }
+}

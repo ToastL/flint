@@ -1,0 +1,340 @@
+// std.heap - allocators: c_allocator, page_allocator, Arena, FixedBuffer, DebugAllocator.
+
+import std.fmt;
+import std.io;
+import std.mem;
+
+extern fn memcpy(dst: [*]u8, src: [*]const u8, n: usize) -> [*]u8;
+extern fn memset(dst: [*]u8, c: i32, n: usize) -> [*]u8;
+extern fn malloc(n: usize) -> ?[*]u8;
+extern fn free(p: ?[*]u8);
+extern fn posix_memalign(out: *?[*]u8, alignment: usize, n: usize) -> i32;
+extern fn malloc_size(p: [*]const u8) -> usize;
+extern fn mmap(addr: ?[*]u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> usize;
+extern fn munmap(addr: [*]u8, len: usize) -> i32;
+extern fn getpagesize() -> i32;
+extern fn rt_debug_init();
+extern fn rt_debug_quarantine(p: [*]u8, len: usize);
+
+// ---- c_allocator: C's malloc and free ----
+
+fn cAlloc(ctx: *void, len: usize, alignment: usize) -> ?[*]u8 {
+    if (alignment <= 16) { return malloc(len); }
+    var p: ?[*]u8 = null;
+    if (posix_memalign(&p, alignment, len) != 0) { return null; }
+    return p;
+}
+
+fn cResize(ctx: *void, memory: [*]u8, old_len: usize, new_len: usize) -> bool {
+    return new_len <= malloc_size(memory);
+}
+
+fn cFree(ctx: *void, memory: [*]u8, len: usize, alignment: usize) { free(memory); }
+
+let c_vtable: mem.AllocatorVTable = .{ alloc: cAlloc, resize: cResize, free: cFree };
+pub let c_allocator: mem.Allocator = .{ ctx: undefined, vtable: &c_vtable };
+
+// ---- page_allocator: whole pages straight from the OS (mmap) ----
+
+pub fn pageSize() -> usize { return getpagesize() as usize; }
+
+fn pageRound(n: usize) -> usize {
+    let ps = pageSize();
+    return (n + ps - 1) / ps * ps;
+}
+
+fn mapPages(len: usize) -> ?[*]u8 {
+    let r = mmap(null, pageRound(len), 3, 0x1002, -1, 0); // read|write, private|anonymous
+    if (r == 0xffffffffffffffff) { return null; }
+    unsafe { return @intToPtr([*]u8, r); }
+}
+
+fn unmapPages(p: [*]u8, len: usize) { _ = munmap(p, pageRound(len)); }
+
+fn pageAlloc(ctx: *void, len: usize, alignment: usize) -> ?[*]u8 {
+    if (alignment > pageSize()) { return null; }
+    return mapPages(len);
+}
+
+fn pageResize(ctx: *void, memory: [*]u8, old_len: usize, new_len: usize) -> bool {
+    return pageRound(new_len) == pageRound(old_len);
+}
+
+fn pageFree(ctx: *void, memory: [*]u8, len: usize, alignment: usize) { unmapPages(memory, len); }
+
+let page_vtable: mem.AllocatorVTable = .{ alloc: pageAlloc, resize: pageResize, free: pageFree };
+pub let page_allocator: mem.Allocator = .{ ctx: undefined, vtable: &page_vtable };
+
+// ---- Arena: many allocations, freed all at once ----
+//
+//   var arena = heap.Arena.init(heap.page_allocator);
+//   defer arena.deinit();
+//   let a = arena.allocator();
+pub struct Arena {
+    child: mem.Allocator,
+    chunk: ?[*]u8 = null, // the newest chunk; its first 16 bytes hold (previous chunk, size)
+    pos: usize = 0,
+    end: usize = 0,
+
+    pub fn init(child: mem.Allocator) -> Self { return .{ child: child }; }
+
+    pub fn allocator(self: *Self) -> mem.Allocator { return .{ ctx: self, vtable: &Arena.vtable }; }
+
+    // Frees every allocation at once.
+    pub fn deinit(self: *Self) {
+        var c = self.chunk;
+        while (c) |p| {
+            unsafe {
+                let words = @ptrCast([*]usize, p);
+                let prev = words[0];
+                self.child.vtable.free(self.child.ctx, p, words[1], 16);
+                c = @intToPtr(?[*]u8, prev);
+            }
+        }
+        self.chunk = null;
+        self.pos = 0;
+        self.end = 0;
+    }
+
+    fn allocFn(ctx: *void, len: usize, alignment: usize) -> ?[*]u8 {
+        unsafe {
+            let self = @ptrCast(*Arena, ctx);
+            if (self.chunk) |base| {
+                let at = (@ptrToInt(base) + self.pos + alignment - 1) & ~(alignment - 1);
+                let start = at - @ptrToInt(base);
+                if (start <= self.end && len <= self.end - start) {
+                    self.pos = start + len;
+                    return base + start;
+                }
+            }
+            var size: usize = if (self.end == 0) 4096 else self.end * 2; // chunks double
+            if (size < len + alignment + 16) { size = len + alignment + 16; }
+            let p = self.child.vtable.alloc(self.child.ctx, size, 16) orelse return null;
+            let words = @ptrCast([*]usize, p);
+            words[0] = if (self.chunk) |old| @ptrToInt(old) else 0;
+            words[1] = size;
+            self.chunk = p;
+            self.pos = 16;
+            self.end = size;
+            return Arena.allocFn(ctx, len, alignment);
+        }
+    }
+
+    // the newest allocation can grow or shrink in place; any other can only shrink
+    fn resizeFn(ctx: *void, memory: [*]u8, old_len: usize, new_len: usize) -> bool {
+        unsafe {
+            let self = @ptrCast(*Arena, ctx);
+            let base = self.chunk orelse return false;
+            if (@ptrToInt(memory) < @ptrToInt(base) || @ptrToInt(memory) - @ptrToInt(base) + old_len != self.pos) {
+                return new_len <= old_len;
+            }
+            let start = @ptrToInt(memory) - @ptrToInt(base);
+            if (new_len > self.end - start) { return false; }
+            self.pos = start + new_len;
+            return true;
+        }
+    }
+
+    // only the newest allocation's space is reused; everything else waits for deinit()
+    fn freeFn(ctx: *void, memory: [*]u8, len: usize, alignment: usize) {
+        unsafe {
+            let self = @ptrCast(*Arena, ctx);
+            if (self.chunk) |base| {
+                if (@ptrToInt(memory) >= @ptrToInt(base) && @ptrToInt(memory) - @ptrToInt(base) + len == self.pos) {
+                    self.pos -= len;
+                }
+            }
+        }
+    }
+
+    let vtable: mem.AllocatorVTable = .{ alloc: Arena.allocFn, resize: Arena.resizeFn, free: Arena.freeFn };
+}
+
+// ---- FixedBuffer: allocates from a byte array you own (on the stack, say) ----
+//
+//   var buf: [1024]u8 = undefined;
+//   var fb = heap.FixedBuffer.init(&buf);
+//   let a = fb.allocator();
+pub struct FixedBuffer {
+    buf: []u8,
+    end: usize = 0,
+
+    pub fn init(buf: []u8) -> Self { return .{ buf: buf }; }
+
+    pub fn allocator(self: *Self) -> mem.Allocator { return .{ ctx: self, vtable: &FixedBuffer.vtable }; }
+
+    // Forgets every allocation, making all of the buffer available again.
+    pub fn reset(self: *Self) { self.end = 0; }
+
+    fn allocFn(ctx: *void, len: usize, alignment: usize) -> ?[*]u8 {
+        unsafe {
+            let self = @ptrCast(*FixedBuffer, ctx);
+            let base = @ptrToInt(self.buf.ptr);
+            let start = ((base + self.end + alignment - 1) & ~(alignment - 1)) - base;
+            if (start > self.buf.len || len > self.buf.len - start) { return null; }
+            self.end = start + len;
+            return self.buf.ptr + start;
+        }
+    }
+
+    fn resizeFn(ctx: *void, memory: [*]u8, old_len: usize, new_len: usize) -> bool {
+        unsafe {
+            let self = @ptrCast(*FixedBuffer, ctx);
+            let start = @ptrToInt(memory) - @ptrToInt(self.buf.ptr);
+            if (start + old_len != self.end) { return new_len <= old_len; }
+            if (new_len > self.buf.len - start) { return false; }
+            self.end = start + new_len;
+            return true;
+        }
+    }
+
+    fn freeFn(ctx: *void, memory: [*]u8, len: usize, alignment: usize) {
+        unsafe {
+            let self = @ptrCast(*FixedBuffer, ctx);
+            let start = @ptrToInt(memory) - @ptrToInt(self.buf.ptr);
+            if (start + len == self.end) { self.end = start; }
+        }
+    }
+
+    let vtable: mem.AllocatorVTable = .{ alloc: FixedBuffer.allocFn, resize: FixedBuffer.resizeFn, free: FixedBuffer.freeFn };
+}
+
+// ---- DebugAllocator: finds leaks, double frees and uses after free ----
+//
+// Every allocation gets its own pages, filled with 0xAA. Freed pages are poisoned and made
+// inaccessible (quarantined), so a use after free stops the program with a message instead
+// of corrupting memory. Freeing twice, or with the wrong length, panics. deinit() reports
+// every allocation that was never freed, numbered in the order they were made. It's slow
+// and uses a lot of memory: it's for finding bugs.
+//
+//   var gpa = heap.DebugAllocator.init();
+//   defer gpa.deinit();
+//   let alloc = gpa.allocator();
+struct DebugRecord {
+    addr: usize,
+    len: usize,
+    pages: usize,
+    freed: bool,
+}
+
+pub struct DebugAllocator {
+    records: ?[*]DebugRecord = null,
+    count: usize = 0,
+    cap: usize = 0,
+
+    pub fn init() -> Self {
+        rt_debug_init();
+        return .{};
+    }
+
+    pub fn allocator(self: *Self) -> mem.Allocator { return .{ ctx: self, vtable: &DebugAllocator.vtable }; }
+
+    // The number of allocations that haven't been freed.
+    pub fn leakCount(self: *Self) -> usize {
+        var n: usize = 0;
+        for (0..self.count) |i| {
+            unsafe {
+                if (!self.records.?[i].freed) { n += 1; }
+            }
+        }
+        return n;
+    }
+
+    // Reports every allocation that was never freed (on stderr), then lets go of its own memory.
+    pub fn deinit(self: *Self) {
+        var bytes: usize = 0;
+        let leaks = self.leakCount();
+        for (0..self.count) |i| {
+            unsafe {
+                let r = self.records.?[i];
+                if (!r.freed) {
+                    bytes += r.len;
+                    io.eprint("error(DebugAllocator): leaked {} bytes (allocation #{})\n", .{ r.len, i + 1 }) catch {};
+                }
+            }
+        }
+        if (leaks > 0) {
+            io.eprint("error(DebugAllocator): {} allocation(s) ({} bytes) were never freed\n", .{ leaks, bytes }) catch {};
+        }
+        if (self.records) |p| {
+            unsafe { unmapPages(@ptrCast([*]u8, p), self.cap * @sizeOf(DebugRecord)); }
+        }
+        self.records = null;
+        self.count = 0;
+        self.cap = 0;
+    }
+
+    fn find(self: *Self, memory: [*]u8, what: []const u8) -> *DebugRecord {
+        let addr = @ptrToInt(memory);
+        var i = self.count;
+        while (i > 0) {
+            i -= 1;
+            unsafe {
+                let r = &self.records.?[i];
+                if (r.addr == addr && !r.freed) { return r; }
+            }
+        }
+        i = self.count;
+        while (i > 0) {
+            i -= 1;
+            unsafe {
+                if (self.records.?[i].addr == addr) { panic(if (what[0] == 'f') "DebugAllocator: double free" else "DebugAllocator: resize after free"); }
+            }
+        }
+        if (what[0] == 'f') { panic("DebugAllocator: free of memory it didn't allocate (or of a pointer into the middle of an allocation)"); }
+        panic("DebugAllocator: resize of memory it didn't allocate");
+    }
+
+    fn allocFn(ctx: *void, len: usize, alignment: usize) -> ?[*]u8 {
+        unsafe {
+            let self = @ptrCast(*DebugAllocator, ctx);
+            if (self.count == self.cap) { // grow the record table (page memory, not tracked)
+                let ncap = if (self.cap == 0) 256 else self.cap * 2;
+                let fresh = mapPages(ncap * @sizeOf(DebugRecord)) orelse return null;
+                if (self.records) |old| {
+                    _ = memcpy(fresh, @ptrCast([*]u8, old), self.count * @sizeOf(DebugRecord));
+                    unmapPages(@ptrCast([*]u8, old), self.cap * @sizeOf(DebugRecord));
+                }
+                self.records = @ptrCast([*]DebugRecord, fresh);
+                self.cap = ncap;
+            }
+            if (alignment > pageSize()) { return null; }
+            let pages = pageRound(len);
+            let p = mapPages(pages) orelse return null;
+            _ = memset(p, 0xAA, pages);
+            self.records.?[self.count] = .{ addr: @ptrToInt(p), len: len, pages: pages, freed: false };
+            self.count += 1;
+            return p;
+        }
+    }
+
+    fn resizeFn(ctx: *void, memory: [*]u8, old_len: usize, new_len: usize) -> bool {
+        unsafe {
+            let self = @ptrCast(*DebugAllocator, ctx);
+            let r = self.find(memory, "resize");
+            if (new_len > r.pages) { return false; }
+            r.len = new_len;
+            return true;
+        }
+    }
+
+    fn freeFn(ctx: *void, memory: [*]u8, len: usize, alignment: usize) {
+        unsafe {
+            let self = @ptrCast(*DebugAllocator, ctx);
+            let r = self.find(memory, "free");
+            if (len != r.len) {
+                var buf: [128]u8 = undefined;
+                if (fmt.bufPrint(&buf, "DebugAllocator: freed {} bytes of a {}-byte allocation", .{ len, r.len })) |msg| {
+                    panic(msg);
+                } else |_| {
+                    panic("DebugAllocator: free with the wrong length");
+                }
+            }
+            r.freed = true;
+            _ = memset(memory, 0xDD, r.pages); // poisoned, then made inaccessible
+            rt_debug_quarantine(memory, r.pages);
+        }
+    }
+
+    let vtable: mem.AllocatorVTable = .{ alloc: DebugAllocator.allocFn, resize: DebugAllocator.resizeFn, free: DebugAllocator.freeFn };
+}

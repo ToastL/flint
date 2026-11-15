@@ -1,0 +1,589 @@
+// sema.generics - comptime parameters, anytype, and `-> type` functions: binding comptime
+// arguments, finding or making an instance (one per distinct argument list), structs made by type
+// functions (fields, nested types, lets, methods), `where` constraints, @TypeOf.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import modules.unit;
+import ir.ir;
+import interp.memory as imem;
+import interp.run as interp;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.calls;
+import sema.ctexec;
+import sema.ctdata;
+import sema.members;
+import sema.program;
+import sema.globals;
+import sema.enums;
+
+var geninst_counter: i32 = 0;
+
+pub fn bindType(e: *st.TEnv, name: []const u8, t: *ty.Type) {
+    let bd = alloc.new(st.Binding);
+    bd.name = name;
+    bd.type_ = t;
+    e.b.push(bd);
+}
+
+// a comptime value parameter: inside the instance its name is a constant
+fn bindValue(e: *st.TEnv, name: []const u8, v: b.Val, vt: *ty.Type, kp: *st.KeyPart, origin: ?*token.Token) {
+    let bd = alloc.new(st.Binding);
+    bd.name = name;
+    bd.vt = vt;
+    let var_ = alloc.new(st.Var);
+    var_.name = name;
+    var_.t = vt;
+    var_.is_const = true;
+    var_.slot = -1;
+    var_.reg = -1;
+    kp.vt = vt;
+    if (v.strlit != 0) {
+        let data = b.strData(v.strlit);
+        var_.kind = .CStr;
+        var_.sdata = data;
+        kp.sdata = data;
+        var_.origin = origin;
+    } else {
+        var_.kind = .Const;
+        var_.cival = v.ival;
+        kp.ival = v.ival;
+        var_.cfval = v.fval;
+        kp.fval = v.fval;
+    }
+    bd.var_ = var_;
+    e.b.push(bd);
+}
+
+fn keyEq(a: []const st.KeyPart, c: []const st.KeyPart) -> bool {
+    for (0..a.len) |i| {
+        if (a[i].t != c[i].t || a[i].vt != c[i].vt) { return false; }
+        let vt = a[i].vt orelse continue;
+        if (ty.isBytes(vt)) {
+            if (!text.eq(a[i].sdata orelse "", c[i].sdata orelse "")) { return false; }
+        } else if (if (ty.isFloat(vt)) a[i].fval != c[i].fval else a[i].ival != c[i].ival) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the type an argument names: u8, *Node, []const u8, List(i32), @TypeOf(x)
+fn typeArg(a: *ast.Node) -> *ty.Type {
+    switch (a.k) {
+        .Name => {
+            if (names.findVar(a.name) != null && names.findStruct(a.name) == null) {
+                diag.at(a.tok, text.f("'{s}' is a value, but this parameter needs a type", .{a.name}));
+            }
+            let tmp = alloc.new(ast.Node);
+            tmp.* = a.*;
+            tmp.k = .TName;
+            return names.resolve(tmp);
+        }
+        .TypeExpr => { return names.resolve(a.a.?); }
+        .Call => {
+            if (members.calleeFn(a.a.?)) |f| {
+                if (f.type_fn) { return instantiateType(f, a.list.items, a.tok); }
+            }
+        }
+        .FieldAcc => {
+            if (members.staticType(a)) |t| { return t; }
+        }
+        .TName, .TPtr, .TSlice, .TOpt, .TArray, .TFn, .TTuple, .TErrU, .TGeneric, .TTypeOf => { return names.resolve(a); }
+        else => {}
+    }
+    diag.at(a.tok, "expected a type here (this parameter is 'comptime ...: type')");
+}
+
+// where a comptime argument was written: a forwarded comptime string keeps its first origin
+pub fn originOf(a: *ast.Node) -> ?*token.Token {
+    if (a.k == .Name) {
+        if (names.findVar(a.name)) |v| {
+            if (v.kind == .CStr && v.origin != null) { return v.origin; }
+        }
+    }
+    return a.tok;
+}
+
+// an argument for a comptime value parameter: it must be known at compile time
+fn comptimeValue(a0: *ast.Node, vt: *ty.Type, pname: []const u8) -> b.Val {
+    var a = a0;
+    if (a.k == .TName) { // List(N) in a type position: N is a constant's name
+        let tmp = alloc.new(ast.Node);
+        tmp.* = a.*;
+        tmp.k = .Name;
+        a = tmp;
+    }
+    let v = cv.coerce(expr.expr(a, vt), vt, a.tok, text.f("comptime parameter '{s}'", .{pname}));
+    let unknown = if (ty.isBytes(vt)) v.strlit == 0 else (!v.isconst || ty.isAgg(vt));
+    if (unknown) { diag.at(a.tok, text.f("'{s}' is a comptime parameter, so its argument must be known at compile time", .{pname})); }
+    return v;
+}
+
+fn valueText(v: b.Val, vt: *ty.Type) -> []const u8 {
+    if (v.strlit != 0) { return text.f("\"{s}\"", .{b.strData(v.strlit)}); }
+    if (ty.isFloat(vt)) { return text.g6(v.fval); }
+    if (vt == ty.bool_) { return if (v.ival != 0) "true" else "false"; }
+    return text.f("{}", .{v.ival});
+}
+
+// ----- struct types made by type functions -----
+
+struct PendStruct {
+    t: *ty.Type,
+    s: *ast.Node,
+}
+
+var pend: alloc.Vec(PendStruct) = @zeroes(alloc.Vec(PendStruct)); // structs whose methods are declared once their type function has finished
+var TF_NAME: []const u8 = "";   // the instance being made: List(i32)
+var TF_COUNT: i32 = 0;          // structs made for it so far
+
+fn newInstStruct(name: []const u8, u: ?*unit.Unit, base: []const u8) -> *ty.Type {
+    let t = alloc.new(ty.Type);
+    t.k = .Struct;
+    t.name = name;
+    geninst_counter += 1;
+    t.mname = text.f("{s}{s}__T{}", .{if (u) |uu| uu.prefix else "", base, geninst_counter});
+    t.unit = u;
+    t.is_pub = true;
+    if (u) |uu| { if (uu.dname.len > 0) { t.dname = text.f("{s}{s}", .{uu.dname, t.name}); } }
+    let env = alloc.new(st.TEnv); // Self, and the types declared inside it
+    env.parent = st.TE;
+    t.genv = env;
+    bindType(env, "Self", t);
+    return t;
+}
+
+// the types declared inside an instance's struct (any depth): Self.Node becomes List(i32).Node
+fn collectNested(s: *ast.Node, out: *alloc.Vec(*ast.Node)) {
+    for (s.list.items) |m| {
+        if (m.k != .Struct && m.k != .Enum) { continue; }
+        out.push(m);
+        if (m.k == .Struct) { collectNested(m, out); }
+    }
+}
+
+fn nestedTypes(t: *ty.Type, s: *ast.Node, nodes: *alloc.Vec(*ast.Node), types: *alloc.Vec(*ty.Type)) {
+    collectNested(s, nodes);
+    for (nodes.items) |m| {
+        let shortn = if (text.startsWith(m.name, "Self.")) m.name[5..] else m.name;
+        let nt = alloc.new(ty.Type);
+        nt.k = if (m.k == .Enum) .Enum else .Struct;
+        nt.name = text.f("{s}.{s}", .{t.name, shortn});
+        let mn = alloc.dupe(u8, text.f("{s}_{s}", .{t.mname, shortn}));
+        for (0..mn.len) |i| { if (mn[i] == '.') { mn[i] = '_'; } }
+        nt.mname = mn;
+        nt.unit = t.unit;
+        nt.is_pub = true;
+        if (t.unit) |u| { if (u.dname.len > 0) { nt.dname = text.f("{s}{s}", .{u.dname, nt.name}); } }
+        nt.genv = t.genv;
+        if (m.k == .Struct) {
+            nt.is_packed = m.flag == 1;
+            nt.is_union = m.flag == 2;
+        }
+        bindType(t.genv.?, m.name, nt);
+        if (!text.eq(shortn, m.name)) { bindType(t.genv.?, shortn, nt); }
+        st.structs.push(nt); // so List(i32).Node finds it
+        types.push(nt);
+    }
+}
+
+// an instance's fields, layout, nested types and lets (its methods come later: declareInstMethods)
+fn fillInstStruct(t: *ty.Type, s: *ast.Node, tok: ?*token.Token) {
+    let saved = st.TE;
+    let su = st.CU;
+    st.TE = t.genv;
+    if (s.unit) |u| { st.CU = u; }
+    var nn: alloc.Vec(*ast.Node) = .{};
+    var nt: alloc.Vec(*ty.Type) = .{};
+    nestedTypes(t, s, &nn, &nt);
+    let k = nn.items.len;
+    for (0..k) |i| { if (nn.items[i].k == .Enum) { enums.declareEnum(nn.items[i]); } }
+    for (0..k) |i| { if (nn.items[i].k == .Struct) { program.structFields(nt.items[i], nn.items[i]); } }
+    program.structFields(t, s);
+    diag.calls.push(tok.?);
+    ty.layout(t, tok);
+    for (0..k) |i| { ty.layout(nt.items[i], tok); }
+    _ = diag.calls.pop();
+    for (s.list.items) |m| { if (m.k == .Let) { globals.declareLazy(m, t); } }
+    for (0..k) |i| {
+        for (nn.items[i].list.items) |m| { if (m.k == .Let) { globals.declareLazy(m, nt.items[i]); } }
+    }
+    st.TE = saved;
+    st.CU = su;
+}
+
+fn declareInstMethods(t: *ty.Type, s: *ast.Node) {
+    let saved = st.TE;
+    st.TE = t.genv;
+    var ns: alloc.Vec(*ast.Node) = .{};
+    ns.push(s);
+    collectNested(s, &ns);
+    for (ns.items) |n| {
+        for (n.list.items) |m| {
+            if (m.k != .Fn) { continue; }
+            program.declareFn(m, false);
+            st.fns.last().lazy = true; // lowered only when called
+        }
+    }
+    st.TE = saved;
+}
+
+// `struct { ... }` inside a type function: a new type, made while the function is compiled
+pub fn ctStructExpr(n: *ast.Node) -> *ty.Type {
+    var nm: []const u8 = "struct";
+    if (TF_NAME.len > 0) {
+        nm = if (TF_COUNT != 0) text.f("{s}#{}", .{TF_NAME, TF_COUNT + 1}) else TF_NAME;
+        TF_COUNT += 1;
+    }
+    let cfn = st.c().fn_.?;
+    let t = newInstStruct(nm, cfn.decl.?.unit, cfn.name);
+    // its declarations see the function's constants and type names (let n = ...; let T = ...;)
+    var chain: alloc.Vec(*st.Scope) = .{};
+    var sc = st.c().cur;
+    while (sc) |s| {
+        if (chain.items.len >= 256) { break; }
+        chain.push(s);
+        sc = s.parent;
+    }
+    var d = chain.items.len;
+    while (d > 0) {
+        d -= 1;
+        for (chain.items[d].vars.items) |v| {
+            if (v.kind == .Type) {
+                bindType(t.genv.?, v.name, v.t.?);
+            } else if (v.kind == .Const || v.kind == .CStr) {
+                let bd = alloc.new(st.Binding);
+                bd.name = v.name;
+                bd.vt = v.t;
+                let copy = alloc.new(st.Var);
+                copy.* = v.*;
+                bd.var_ = copy;
+                t.genv.?.b.push(bd);
+            }
+        }
+    }
+    bindType(t.genv.?, "Self", t); // (again: it wins over a captured name)
+    fillInstStruct(t, n, n.tok);
+    pend.push(PendStruct { t: t, s: n });
+    return t;
+}
+
+// the source text of a `where` clause, from its tokens
+fn whereText(d: *ast.Node) -> []const u8 {
+    var s: []const u8 = "";
+    var prev: ?*token.Token = null;
+    let first = d.wbeg.?;
+    let count = (@ptrToInt(d.wend.?) - @ptrToInt(first)) / @sizeOf(token.Token);
+    var toks: [*]token.Token = undefined;
+    unsafe { toks = @ptrCast([*]token.Token, first); }
+    for (0..count) |i| {
+        var k: *token.Token = undefined;
+        unsafe { k = &toks[i]; }
+        let txt = if (k.k == .Int) text.f("{}", .{k.ival})
+                  else if (k.k == .Float) text.g6(k.fval)
+                  else if (k.k == .Str) text.f("\"{s}\"", .{k.str}) else k.s;
+        let ps = if (prev) |p| p.s else "";
+        var tight = prev == null || text.eq(txt, "(") || text.eq(txt, ")") || text.eq(txt, ",") || text.eq(txt, ".") ||
+                    text.eq(ps, "(") || text.eq(ps, ".") || ((text.eq(ps, "!") || text.eq(ps, "@")) && prev.?.k == .Op);
+        if (text.eq(txt, "(") && prev != null && prev.?.k == .Kw) { tight = false; }
+        s = text.f("{s}{s}{s}", .{s, if (tight) "" else " ", txt});
+        prev = k;
+    }
+    return s;
+}
+
+// a `where` clause may ask about a run-time parameter's type (@TypeOf(x)), not its value
+fn whereParamsOk(m: ?*ast.Node, pn: []const []const u8, in_typeof0: bool) {
+    let e = m orelse return;
+    var in_typeof = in_typeof0;
+    if (e.k == .TTypeOf || (e.k == .Builtin && text.eq(e.name, "@TypeOf"))) { in_typeof = true; }
+    if (e.k == .Name && !in_typeof) {
+        for (pn) |p| {
+            if (text.eq(p, e.name)) {
+                diag.at(e.tok, text.f("'{s}' is only known at run time; a 'where' condition can ask about its type: @TypeOf({s})", .{e.name, e.name}));
+            }
+        }
+    }
+    whereParamsOk(e.a, pn, in_typeof);
+    whereParamsOk(e.b, pn, in_typeof);
+    whereParamsOk(e.c, pn, in_typeof);
+    for (e.list.items) |c| { whereParamsOk(c, pn, in_typeof); }
+}
+
+// fn f(comptime T: type, ...) where cond: checked for each new instance, at the call
+fn checkWhereP(f: *st.FnInfo, env: *st.TEnv, what: []const u8, tok: ?*token.Token, pn: []const []const u8, pt: []const *ty.Type) {
+    let d = f.decl.?;
+    let wc = d.wherec orelse return;
+    whereParamsOk(wc, pn, false);
+    for (0..pn.len) |i| {
+        ctexec.CT_PRE_NAMES.push(pn[i]);
+        ctexec.CT_PRE_TYPES.push(pt[i]);
+    }
+    let saved = st.TE;
+    let su = st.CU;
+    let sc = st.C;
+    let stok = st.CUR_TOK;
+    st.TE = env;
+    st.CU = d.unit;
+    st.C = null; // it sees the comptime parameters and the module, not the caller's variables
+    var o = @zeroes(ctdata.CtOut);
+    let t = ctexec.ctCompute(wc, false, null, "the 'where' condition", &o);
+    st.TE = saved;
+    st.CU = su;
+    st.C = sc;
+    st.CUR_TOK = stok;
+    if (t != ty.bool_) { diag.at(wc.tok, text.f("a 'where' condition must be a bool, not {s}", .{ty.tname(t)})); }
+    if (o.ival == 0) {
+        let nt = [_]?*token.Token { d.wbeg };
+        let nm = [_][]const u8 { "the constraint is here" };
+        diag.notes(tok, nt[..], nm[..], text.f("{s} doesn't satisfy 'where {s}'", .{what, whereText(d)}));
+    }
+}
+
+fn checkWhere(f: *st.FnInfo, env: *st.TEnv, what: []const u8, tok: ?*token.Token) {
+    checkWhereP(f, env, what, tok, @zeroes([]const []const u8), @zeroes([]const *ty.Type));
+}
+
+fn isTypeParam(p: *ast.Node) -> bool { return p.a.?.k == .TName && text.eq(p.a.?.name, "type"); }
+
+// type function call List(i32): runs at compile time and gives a type (one per distinct argument list)
+pub fn instantiateType(f: *st.FnInfo, args: []*ast.Node, tok: ?*token.Token) -> *ty.Type {
+    let d = f.decl.?;
+    let np = f.np();
+    if (args.len != np) { diag.at(tok, text.f("'{s}' takes {} argument(s), got {}", .{f.name, np, args.len})); }
+    let env = alloc.new(st.TEnv);
+    env.parent = f.tenv;
+    let key = alloc.make(st.KeyPart, np + 1);
+    var name: []const u8 = text.f("{s}(", .{f.name});
+    let saved = st.TE;
+    for (0..np) |i| {
+        let p = d.at(i);
+        if (p.flag == 0) {
+            diag.at(p.tok, text.f("'{s}' returns a type, so it runs at compile time: its parameters must be comptime", .{f.name}));
+        }
+        if (isTypeParam(p)) {
+            let t = typeArg(args[i]);
+            bindType(env, p.name, t);
+            key[i].t = t;
+            name = text.f("{s}{s}{s}", .{name, if (i > 0) ", " else "", ty.tname(t)});
+        } else {
+            st.TE = env;
+            let vt = names.resolve(p.a.?);
+            st.TE = saved;
+            let v = comptimeValue(args[i], vt, p.name);
+            bindValue(env, p.name, v, vt, &key[i], originOf(args[i]));
+            name = text.f("{s}{s}{s}", .{name, if (i > 0) ", " else "", valueText(v, vt)});
+        }
+    }
+    for (f.insts.items) |gi| {
+        if (keyEq(gi.key[0..np], key[0..np])) {
+            let it = gi.type_ orelse diag.at(tok, text.f("'{s})' needs itself while it's being made (inside its own struct, use Self)", .{name}));
+            return it;
+        }
+    }
+    checkWhere(f, env, text.f("{s})", .{name}), tok);
+    let body = d.c.?;
+    diag.calls.push(tok.?);
+    if (body.count() == 1 && body.at(0).k == .Return && body.at(0).a != null && body.at(0).a.?.k == .Struct) {
+        // just `return struct { ... };`: made directly, and registered first, so it can name itself
+        let s = body.at(0).a.?;
+        st.TE = env;
+        let t = newInstStruct(text.f("{s})", .{name}), d.unit, f.name);
+        let gi = alloc.new(st.GenInst);
+        gi.key = key;
+        gi.type_ = t;
+        f.insts.push(gi);
+        fillInstStruct(t, s, tok);
+        declareInstMethods(t, s);
+        st.TE = saved;
+        _ = diag.calls.pop();
+        return t;
+    }
+    // a body with logic in it: compile it (comptime parameters are constants there) and run it
+    let gi = alloc.new(st.GenInst); // type_ null: being made
+    gi.key = key;
+    f.insts.push(gi);
+    let g = alloc.new(st.FnInfo);
+    g.* = f.*;
+    g.generic = false;
+    g.type_fn = false;
+    g.ct_fn = true;
+    g.insts = .{};
+    g.tenv = env;
+    g.pt = .{};
+    g.pn = .{};
+    g.ptok = .{};
+    g.ret = ty.type_;
+    g.state = 0;
+    g.lazy = false;
+    geninst_counter += 1;
+    g.sym = text.f("{s}__ct{}", .{f.sym, geninst_counter});
+    let sn = TF_NAME;
+    let scount = TF_COUNT;
+    let pstart = pend.items.len;
+    TF_NAME = text.f("{s})", .{name});
+    TF_COUNT = 0;
+    ctexec.CT_DEPTH += 1;
+    program.lowerFn(g);
+    ctexec.CT_DEPTH -= 1;
+    let irf = st.M.funcs.last();
+    var bits: u64 = 0;
+    let err = alloc.new(imem.CtError);
+    if (!interp.run(irf, &bits, err)) { comptimeFail(err, tok); }
+    interp.release();
+    let res = ty.typeFromId(@bitcast(i64, bits)) orelse diag.at(tok, text.f("internal error: '{s})' didn't produce a type", .{name}));
+    gi.type_ = res;
+    for (pend.items[pstart..]) |*ps| { declareInstMethods(ps.t, ps.s); }
+    pend.truncate(pstart);
+    TF_NAME = sn;
+    TF_COUNT = scount;
+    _ = diag.calls.pop();
+    return res;
+}
+
+fn comptimeFail(err: *imem.CtError, tok: ?*token.Token) -> noreturn { ctexec.reportFail(err, tok); }
+
+// List(i32) written in a type position
+pub fn genericType(n: *ast.Node) -> *ty.Type {
+    let su = st.CU;
+    if (n.unit) |u| { st.CU = u; }
+    var f = names.findFn(n.name);
+    let dot = text.indexOf(n.name, '.');
+    if (f == null && dot != null) { // list.ArrayList(i32)
+        if (names.aliasUnit(n.name[0..dot.?])) |u| {
+            f = names.fnIn(u, n.name[dot.? + 1..]);
+            if (f) |ff| { names.checkPub(u, ff.is_pub, n.name[dot.? + 1..], n.tok); }
+        }
+    }
+    st.CU = su;
+    if (f == null || !f.?.type_fn) {
+        diag.at(n.tok, text.f("'{s}' isn't a function that returns a type, so '{s}(...)' isn't a type", .{n.name, n.name}));
+    }
+    let t = instantiateType(f.?, n.list.items, n.tok);
+    if (n.name2.len > 0) { // Tree(i32).Node
+        let in = if (t.unit != null) names.typeIn(t.unit, text.f("{s}.{s}", .{t.name, n.name2})) else null;
+        return in orelse diag.at(n.tok, text.f("{s} has no type '{s}'", .{ty.tname(t), n.name2}));
+    }
+    return t;
+}
+
+// @TypeOf(e): e's type. e is lowered into an unreachable block, so it never runs
+pub fn typeOfExpr(e: *ast.Node) -> *ty.Type {
+    let cx = st.C orelse diag.at(e.tok, "@TypeOf can only be used inside a function");
+    let saved = cx.blk;
+    b.setBlk(b.newBlock());
+    let v = cv.defaulted(expr.expr(e, null));
+    if (!b.terminated()) { b.trap(); }
+    cx.blk = saved;
+    if (v.t == ty.null_ || v.t == ty.noreturn_) { diag.at(e.tok, text.f("@TypeOf can't name the type of {s}", .{ty.tname(v.t)})); }
+    return v.t;
+}
+
+// a call of a generic function: bind its comptime parameters, find or make the instance, call it
+pub fn callGeneric(f: *st.FnInfo, args: []*ast.Node, self_: ?*b.Val, tok: ?*token.Token) -> b.Val {
+    let d = f.decl.?;
+    let first: usize = if (self_ != null) 1 else 0;
+    let given = args.len + first;
+    let np = f.np();
+    if (f.type_fn) {
+        if (self_ != null) { diag.at(tok, text.f("'{s}' makes a type, so it can't be called as a method", .{f.name})); }
+        return b.vInt(ty.type_, ty.typeId(instantiateType(f, args, tok)));
+    }
+    if (given != np) { diag.at(tok, text.f("'{s}' takes {} argument(s), got {}", .{f.name, np as i64 - first as i64, args.len})); }
+    if (given > 40) { diag.at(tok, "too many arguments"); }
+    let env = alloc.new(st.TEnv);
+    env.parent = f.tenv;
+    let key = alloc.make(st.KeyPart, np + 1);
+    var vals: alloc.Vec(b.Val) = .{};
+    var toks: alloc.Vec(?*token.Token) = .{};
+    var pt: alloc.Vec(*ty.Type) = .{};
+    var pn: alloc.Vec([]const u8) = .{};
+    var ptok: alloc.Vec(*token.Token) = .{};
+    let saved = st.TE;
+    var desc: []const u8 = text.f("{s}(", .{f.name}); // for a failed `where`: max(str, ...)
+    for (0..np) |i| {
+        let p = d.at(i);
+        let a: ?*ast.Node = if (i < first) null else args[i - first];
+        let at = if (a) |x| x.tok else tok;
+        let sep = if (i > 0) ", " else "";
+        if (p.flag != 0) {
+            let an = a orelse diag.at(p.tok, "the receiver can't be a comptime parameter");
+            if (isTypeParam(p)) {
+                let t = typeArg(an);
+                bindType(env, p.name, t);
+                key[i].t = t;
+                desc = text.f("{s}{s}{s}", .{desc, sep, ty.tname(t)});
+            } else {
+                st.TE = env;
+                let vt = names.resolve(p.a.?);
+                st.TE = saved;
+                let cval = comptimeValue(an, vt, p.name);
+                bindValue(env, p.name, cval, vt, &key[i], originOf(an));
+                desc = text.f("{s}{s}{s}", .{desc, sep, valueText(cval, vt)});
+            }
+            continue;
+        }
+        let is_any = p.a.?.k == .TName && text.eq(p.a.?.name, "anytype");
+        desc = text.f("{s}{s}{s}", .{desc, sep, if (is_any) "anytype" else "..."});
+        var v: b.Val = undefined;
+        var t: *ty.Type = undefined;
+        if (is_any) { // the argument's type becomes the parameter's
+            v = if (a) |x| cv.defaulted(expr.expr(x, null)) else self_.?.*;
+            if (v.t == ty.null_ || v.t == ty.void_ || v.t == ty.noreturn_) {
+                diag.at(at, text.f("can't pass {s} as an anytype argument (it needs a type)", .{ty.tname(v.t)}));
+            }
+            t = v.t;
+            key[i].t = t;
+            desc = text.f("{s}{s}", .{desc[0..desc.len - 7], ty.tname(t)}); // anytype -> the argument's type
+        } else {
+            st.TE = env;
+            t = names.resolve(p.a.?);
+            st.TE = saved;
+            v = if (a) |x| expr.expr(x, t) else self_.?.*;
+        }
+        ty.layout(t, at);
+        vals.push(v);
+        toks.push(at);
+        pt.push(t);
+        pn.push(p.name);
+        ptok.push(p.tok);
+    }
+    var g: ?*st.FnInfo = null;
+    for (f.insts.items) |gi| { if (keyEq(gi.key[0..np], key[0..np])) { g = gi.fn_; } }
+    if (g == null) {
+        checkWhereP(f, env, text.f("{s})", .{desc}), tok, pn.items, pt.items);
+        st.TE = env;
+        let ret = if (d.b) |rb| names.resolve(rb) else ty.void_;
+        st.TE = saved;
+        let ng = alloc.new(st.FnInfo);
+        ng.* = f.*;
+        ng.generic = false;
+        ng.insts = .{};
+        ng.tenv = env;
+        ng.pt = pt;
+        ng.pn = pn;
+        ng.ptok = ptok;
+        ng.ret = ret;
+        ng.state = 0;
+        geninst_counter += 1;
+        ng.sym = text.f("{s}__{}", .{f.sym, geninst_counter});
+        let gi = alloc.new(st.GenInst);
+        gi.key = key;
+        gi.fn_ = ng;
+        f.insts.push(gi);
+        g = ng;
+    }
+    diag.calls.push(tok.?);
+    let res = calls.callCore(g.?, vals.items, toks.items, tok); // lowers the instance the first time
+    _ = diag.calls.pop();
+    return res;
+}

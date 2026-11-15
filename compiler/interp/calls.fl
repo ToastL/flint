@@ -1,0 +1,188 @@
+// interp.calls - calls in comptime code: the ones the interpreter does itself (the runtime's pure
+// parts and a few libc functions), refusing I/O and C, and running Flint functions.
+
+import base.alloc;
+import base.text;
+import syntax.token;
+import ir.ir;
+import interp.memory as mem;
+import interp.run;
+
+// the compiler's own runtime (std.rt) formats floats the same way programs do
+extern fn rt_fmt_f64(v: f64, buf: [*]u8) -> usize;
+extern fn rt_fmt_f32(v: f32, buf: [*]u8) -> usize;
+extern fn rt_fmt_f64_prec(v: f64, prec: i64, exp: bool, buf: [*]u8, cap: usize) -> usize;
+extern fn rt_parse_f64(p: [*]const u8, n: usize, ok: *bool) -> f64;
+extern fn fmod(x: f64, y: f64) -> f64;
+
+fn D(x: i64) -> f64 { return @bitcast(f64, x); }
+fn bitsD(d: f64) -> i64 { return @bitcast(i64, d); }
+
+// does the interpreter do this call itself? (ret gets the result)
+fn builtinCall(sym0: []const u8, a: []const i64, ret: *i64) -> mem.CtFail!bool {
+    let s = if (sym0.len > 0 && sym0[0] == '_') sym0[1..] else sym0;
+    if (text.eq(s, "rt_panic")) {
+        let len = a[1];
+        let buf = alloc.make(u8, if (len > 0) len as usize else 0);
+        try mem.memRead(@bitcast(u64, a[0]), buf);
+        return mem.fail(null, text.f("panic at compile time: {s}", .{buf}));
+    }
+    if (text.eq(s, "rt_oob")) { return mem.fail(null, text.f("panic at compile time: index {} out of bounds (len {})", .{a[0], a[1]})); }
+    if (text.eq(s, "rt_range")) {
+        if (a[0] < 0 || a[1] < a[0] || a[1] > a[2]) {
+            return mem.fail(null, text.f("panic at compile time: slice [{}..{}] out of bounds (len {})", .{a[0], a[1], a[2]}));
+        }
+        return true;
+    }
+    if (text.eq(s, "rt_assert_fail")) { return mem.fail(null, "assertion failed at compile time"); }
+    if (text.eq(s, "rt_exit")) { return mem.fail(null, text.f("comptime code can't exit the compiler (exit({}))", .{a[0]})); }
+    if (text.eq(s, "rt_error_name")) {
+        let code = a[0];
+        let names = mem.MOD.errnames.items;
+        let nm = if (code >= 0 && code < names.len as i64) names[code as usize] else "(unknown error)";
+        let key = text.f("l_fl_err_{}", .{code});
+        var r = mem.symLookup(key);
+        if (r == 0) {
+            r = mem.newRegion(.Const, nm.len as i64 + 1);
+            let reg = mem.regs.items[r as usize];
+            for (0..nm.len) |i| { reg.data[i] = nm[i]; }
+            reg.readonly = true;
+            reg.name = "an error name";
+            mem.symInsert(key, r);
+        }
+        ret.* = @bitcast(i64, mem.mkptr(r, 0));
+        return true;
+    }
+    if (text.eq(s, "memcpy") || text.eq(s, "memmove")) {
+        let len = a[2];
+        if (len > 0) {
+            let tmp = alloc.make(u8, len as usize);
+            try mem.memRead(@bitcast(u64, a[1]), tmp);
+            try mem.memWrite(@bitcast(u64, a[0]), tmp);
+        }
+        ret.* = a[0];
+        return true;
+    }
+    if (text.eq(s, "memset") || text.eq(s, "bzero")) {
+        let bz = s[0] == 'b';
+        let len = if (bz) a[1] else a[2];
+        if (len > 0) {
+            let p = try mem.memSpan(@bitcast(u64, a[0]), len, true);
+            let byte: u8 = if (bz) 0 else @truncate(u8, a[1]);
+            for (0..p.len) |i| { p[i] = byte; }
+        }
+        ret.* = a[0];
+        return true;
+    }
+    if (text.eq(s, "memcmp")) {
+        let len = a[2];
+        var c: i64 = 0;
+        if (len > 0) {
+            let x = try mem.memSpan(@bitcast(u64, a[0]), len, false);
+            let y = try mem.memSpan(@bitcast(u64, a[1]), len, false);
+            for (0..x.len) |i| {
+                if (x[i] != y[i]) {
+                    c = if (x[i] < y[i]) -1 else 1;
+                    break;
+                }
+            }
+        }
+        ret.* = c;
+        return true;
+    }
+    if (text.eq(s, "strlen")) {
+        var len: i64 = 0;
+        while (true) {
+            let ch = try mem.readU(@bitcast(u64, a[0]) +% @bitcast(u64, len), 1);
+            if (ch == 0) { break; }
+            len += 1;
+        }
+        ret.* = len;
+        return true;
+    }
+    if (text.eq(s, "rt_fmt_f64") || text.eq(s, "rt_fmt_f32")) {
+        var buf: [64]u8 = undefined;
+        let len = if (s[8] == '6') rt_fmt_f64(D(a[0]), &buf) else rt_fmt_f32(D(a[0]) as f32, &buf);
+        try mem.memWrite(@bitcast(u64, a[1]), buf[0..len]);
+        ret.* = len as i64;
+        return true;
+    }
+    if (text.eq(s, "rt_fmt_f64_prec")) {
+        let cap = @bitcast(u64, a[4]) as usize;
+        let buf = alloc.make(u8, cap + 64);
+        let len = rt_fmt_f64_prec(D(a[0]), a[1], (a[2] & 0xff) != 0, buf.ptr, cap);
+        try mem.memWrite(@bitcast(u64, a[3]), buf[0..(if (len + 1 <= cap) len + 1 else len)]);
+        ret.* = len as i64;
+        return true;
+    }
+    if (text.eq(s, "rt_parse_f64")) {
+        let len = a[1];
+        let buf = alloc.make(u8, if (len > 0) len as usize + 1 else 1);
+        try mem.memRead(@bitcast(u64, a[0]), buf[0..(if (len > 0) len as usize else 0)]);
+        var ok = false;
+        ret.* = bitsD(rt_parse_f64(buf.ptr, len as usize, &ok));
+        try mem.writeU(@bitcast(u64, a[2]), if (ok) 1 else 0, 1);
+        return true;
+    }
+    if (text.eq(s, "sin")) { ret.* = bitsD(sin(D(a[0]))); return true; }
+    if (text.eq(s, "cos")) { ret.* = bitsD(cos(D(a[0]))); return true; }
+    if (text.eq(s, "tan")) { ret.* = bitsD(tan(D(a[0]))); return true; }
+    if (text.eq(s, "exp")) { ret.* = bitsD(exp(D(a[0]))); return true; }
+    if (text.eq(s, "log")) { ret.* = bitsD(log(D(a[0]))); return true; }
+    if (text.eq(s, "floor")) { ret.* = bitsD(floor(D(a[0]))); return true; }
+    if (text.eq(s, "ceil")) { ret.* = bitsD(ceil(D(a[0]))); return true; }
+    if (text.eq(s, "round")) { ret.* = bitsD(round(D(a[0]))); return true; }
+    if (text.eq(s, "pow")) { ret.* = bitsD(pow(D(a[0]), D(a[1]))); return true; }
+    if (text.eq(s, "atan2")) { ret.* = bitsD(atan2(D(a[0]), D(a[1]))); return true; }
+    if (text.eq(s, "fmod")) { ret.* = bitsD(fmod(D(a[0]), D(a[1]))); return true; }
+    return false;
+}
+
+let IO_FNS = [_][]const u8 {
+    "rt_write", "rt_flush", "rt_now", "rt_args", "write", "read", "open", "close", "printf",
+    "puts", "fopen", "fwrite", "fread", "mmap", "munmap", "malloc", "free", "posix_memalign",
+    "getpagesize", "rt_debug_init", "rt_debug_quarantine", "malloc_size",
+};
+
+pub fn doCall(in: *const ir.Inst, v: []i64) -> mem.CtFail!i64 {
+    let direct = in.sym.len > 0;
+    let nargs = if (direct) in.args.len else in.args.len - 1;
+    let av = alloc.make(i64, nargs + 1);
+    for (0..nargs) |j| { av[j] = if (in.args[j].k == .Imm) in.args[j].v else v[in.args[j].v as usize]; }
+    var ret: i64 = 0;
+    var target: *mem.Region = undefined;
+    if (direct) {
+        if (try builtinCall(in.sym, av, &ret)) { return ret; }
+        let ri = mem.regionForSym(in.sym, false, in.tok);
+        target = mem.regs.items[ri as usize];
+    } else {
+        let c = in.args[nargs];
+        let p = @bitcast(u64, if (c.k == .Imm) c.v else v[c.v as usize]);
+        let ri = p >> 32;
+        if (p == 0 || ri >= mem.regs.items.len as u64 || (p & 0xffffffff) != 0 ||
+            (mem.regs.items[ri as usize].kind != .Func && mem.regs.items[ri as usize].kind != .Extern)) {
+            return mem.fail(null, "comptime code called something that isn't a function");
+        }
+        target = mem.regs.items[ri as usize];
+        if (try builtinCall(target.sym, av, &ret)) { return ret; }
+    }
+    // the runtime's I/O functions are Flint code now (std.rt), but still off limits
+    if (text.oneOf(target.name, IO_FNS[..])) {
+        return mem.fail(null, text.f("comptime code can't call '{s}': there's no I/O, memory from the system or C at compile time", .{target.name}));
+    }
+    if (target.kind != .Func || target.fn_ == null) {
+        if (target.why.len > 0) { return mem.fail(null, text.f("comptime code can't call '{s}': {s}", .{target.name, target.why})); }
+        return mem.fail(null, text.f("comptime code can't call '{s}' (a C function): there's no I/O or C at compile time", .{target.name}));
+    }
+    if (mem.depth >= 1000) { return mem.fail(null, "comptime calls nested more than 1000 deep (infinite recursion?)"); }
+    pushFrame(target.fn_.?, in.tok);
+    let r = try run.exec(target.fn_.?, av[0..nargs], in.argcls, in.nfixed as usize);
+    mem.depth -= 1;
+    return r;
+}
+
+pub fn pushFrame(f: *ir.IRFunc, call: ?*token.Token) {
+    let fr = mem.Frame { f: f, call: call };
+    if (mem.depth < mem.stack.items.len) { mem.stack.items[mem.depth] = fr; } else { mem.stack.push(fr); }
+    mem.depth += 1;
+}

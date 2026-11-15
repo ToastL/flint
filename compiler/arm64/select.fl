@@ -1,0 +1,490 @@
+// arm64.select - instruction selection: the ARM64 instructions for one IR instruction (a compare
+// directly followed by the branch that uses it becomes one conditional branch).
+
+import base.alloc;
+import base.text;
+import ir.ir;
+import arm64.insn as A;
+
+fn E(comptime spec: []const u8, args: anytype) { A.E(spec, args); }
+
+fn X(r: i32) -> []const u8 { return A.X(r); }
+
+// SIMD arrangement of a vector op: 16b 8h 4s 2d (128-bit) or 8b 4h 2s (64-bit)
+fn varr(imm: i64) -> []const u8 {
+    let es = ir.vlEsize(imm);
+    let total = ir.vlTotal(imm);
+    let c: u8 = if (es == 1) 'b' else if (es == 2) 'h' else if (es == 4) 's' else 'd';
+    return text.f("{}{c}", .{total / es, c});
+}
+
+// vectors live in memory between operations: load into v29/v30, one instruction, store
+fn emitVec(in: *const ir.Inst) {
+    let total = ir.vlTotal(in.imm);
+    let es = ir.vlEsize(in.imm);
+    let fl = ir.vlFloat(in.imm);
+    let arr = varr(in.imm);
+    let bytes = if (total == 16) "16b" else "8b"; // the logical ops work on bytes
+    let q: u8 = if (total == 16) 'q' else 'd';
+    let op = in.mem;
+    if (op == ir.Vop.Splat as i32) {
+        if (fl) {
+            let r = A.gf(in.b, 30);
+            let lane: u8 = if (es == 4) 's' else 'd';
+            E("dup v29.{s}, v{}.{c}[0]", .{arr, r, lane});
+        } else {
+            let r = A.gi(in.b, 16);
+            E("dup v29.{s}, {s}", .{arr, if (es == 8) X(r) else A.W(r)});
+        }
+    } else {
+        E("ldr {c}29, [{s}]", .{q, X(A.gi(in.b, 16))});
+        if (op != ir.Vop.Neg as i32) { E("ldr {c}30, [{s}]", .{q, X(A.gi(in.c, 16))}); }
+        if (op == ir.Vop.Add as i32) { E("{s} v29.{s}, v29.{s}, v30.{s}", .{if (fl) "fadd" else "add", arr, arr, arr}); }
+        if (op == ir.Vop.Sub as i32) { E("{s} v29.{s}, v29.{s}, v30.{s}", .{if (fl) "fsub" else "sub", arr, arr, arr}); }
+        if (op == ir.Vop.Mul as i32) { E("{s} v29.{s}, v29.{s}, v30.{s}", .{if (fl) "fmul" else "mul", arr, arr, arr}); }
+        if (op == ir.Vop.Div as i32) { E("fdiv v29.{s}, v29.{s}, v30.{s}", .{arr, arr, arr}); }
+        if (op == ir.Vop.And as i32) { E("and v29.{s}, v29.{s}, v30.{s}", .{bytes, bytes, bytes}); }
+        if (op == ir.Vop.Or as i32) { E("orr v29.{s}, v29.{s}, v30.{s}", .{bytes, bytes, bytes}); }
+        if (op == ir.Vop.Xor as i32) { E("eor v29.{s}, v29.{s}, v30.{s}", .{bytes, bytes, bytes}); }
+        if (op == ir.Vop.Neg as i32) { E("{s} v29.{s}, v29.{s}", .{if (fl) "fneg" else "neg", arr, arr}); }
+    }
+    E("str {c}29, [{s}]", .{q, X(A.gi(in.a, 17))});
+}
+
+// the sum of the lanes, into an integer or float register (pairwise for floats, like the interpreter)
+fn emitVreduce(in: *const ir.Inst) {
+    let total = ir.vlTotal(in.imm);
+    let es = ir.vlEsize(in.imm);
+    let lanes = total / es;
+    let fl = ir.vlFloat(in.imm);
+    let sg = ir.vlSigned(in.imm);
+    let q: u8 = if (total == 16) 'q' else 'd';
+    E("ldr {c}29, [{s}]", .{q, X(A.gi(in.a, 16))});
+    if (fl) {
+        let d = A.df(in.dst);
+        if (es == 4 && lanes == 4) {
+            E("faddp v29.4s, v29.4s, v29.4s", .{});
+            E("faddp s29, v29.2s", .{});
+        } else if (es == 4) {
+            E("faddp s29, v29.2s", .{});
+        } else {
+            E("faddp d29, v29.2d", .{});
+        }
+        E("fmov {s}, {s}", .{A.FR(d, in.cls), if (es == 4) "s29" else "d29"});
+        A.fin(in.dst, d);
+        return;
+    }
+    let d = A.di(in.dst);
+    if (es == 8) {
+        E("addp d29, v29.2d", .{});
+        E("fmov {s}, d29", .{X(d)});
+    } else {
+        if (es == 4 && lanes == 2) {
+            E("addp v29.2s, v29.2s, v29.2s", .{});
+        } else {
+            let r: u8 = if (es == 1) 'b' else if (es == 2) 'h' else 's';
+            E("addv {c}29, v29.{s}", .{r, varr(in.imm)});
+        }
+        let lane: u8 = if (es == 1) 'b' else if (es == 2) 'h' else 's';
+        if (sg) { E("smov {s}, v29.{c}[0]", .{X(d), lane}); } else { E("umov {s}, v29.{c}[0]", .{A.W(d), lane}); }
+    }
+    A.fin(in.dst, d);
+}
+
+fn binName(op: ir.Op) -> []const u8 {
+    switch (op) {
+        .SDiv => { return "sdiv"; }
+        .UDiv => { return "udiv"; }
+        .And => { return "and"; }
+        .Or => { return "orr"; }
+        .Xor => { return "eor"; }
+        .SMulH => { return "smulh"; }
+        .UMulH => { return "umulh"; }
+        .FAdd => { return "fadd"; }
+        .FSub => { return "fsub"; }
+        .FMul => { return "fmul"; }
+        else => { return "fdiv"; }
+    }
+}
+
+// emits one instruction; true if it also consumed the following one
+pub fn emitInst(in: *const ir.Inst, nx: ?*const ir.Inst, b: i32, last_in_func: bool) -> bool {
+    var d: i32 = 0;
+    switch (in.op) {
+        .Nop => { return false; }
+        .GetArg => {
+            if (in.imm >= 1000) { // past the 8 argument registers: on the caller's stack, just above our frame record
+                let off = 16 + 8 * (in.imm - 1000);
+                if (in.cls == .I) {
+                    d = A.di(in.dst);
+                    E("ldr {s}, [x29, #{}]", .{X(d), off});
+                } else {
+                    d = A.df(in.dst);
+                    E("ldr {s}, [x29, #{}]", .{A.FR(d, in.cls), off});
+                }
+                A.fin(in.dst, d);
+                return false;
+            }
+            if (in.cls == .I) {
+                d = A.di(in.dst);
+                if (d as i64 != in.imm) { E("mov {s}, {s}", .{X(d), X(in.imm as i32)}); }
+            } else {
+                d = A.df(in.dst);
+                if (d as i64 != in.imm) { E("fmov {s}, {s}", .{A.FR(d, in.cls), A.FR(in.imm as i32, in.cls)}); }
+            }
+            A.fin(in.dst, d);
+        }
+        .IConst => {
+            d = A.di(in.dst);
+            A.movImm(d, in.imm);
+            A.fin(in.dst, d);
+        }
+        .FConst => {
+            d = A.df(in.dst);
+            if (in.cls == .F32) {
+                let bits = @bitcast(u32, in.fimm as f32);
+                if (bits == 0) {
+                    E("fmov {s}, wzr", .{A.S(d)});
+                } else {
+                    A.movImm(16, bits as i64);
+                    E("fmov {s}, w16", .{A.S(d)});
+                }
+            } else {
+                let bits = @bitcast(u64, in.fimm);
+                if (bits == 0) {
+                    E("fmov {s}, xzr", .{A.D(d)});
+                } else {
+                    A.movImm(16, @bitcast(i64, bits));
+                    E("fmov {s}, x16", .{A.D(d)});
+                }
+            }
+            A.fin(in.dst, d);
+        }
+        .Mov => {
+            if (in.cls == .I) {
+                d = A.di(in.dst);
+                A.intoInt(d, in.a);
+            } else {
+                d = A.df(in.dst);
+                A.intoFp(d, in.a, in.cls);
+            }
+            A.fin(in.dst, d);
+        }
+        .Add, .Sub => {
+            let ra = A.gi(in.a, 16);
+            d = A.di(in.dst);
+            if (in.b.k == .Imm) {
+                A.addsubImm(in.op == .Add, d, ra, in.b.v);
+            } else {
+                E("{s} {s}, {s}, {s}", .{if (in.op == .Add) "add" else "sub", X(d), X(ra), X(A.gi(in.b, 8))});
+            }
+            A.fin(in.dst, d);
+        }
+        .Mul => {
+            let ra = A.gi(in.a, 16);
+            d = A.di(in.dst);
+            if (in.b.k == .Imm && in.b.v > 0 && (in.b.v & (in.b.v - 1)) == 0) {
+                var sh: i64 = 0;
+                while ((@bitcast(i64, @bitcast(u64, 1 as i64) << sh as u64)) != in.b.v) { sh += 1; }
+                if (sh == 0) { E("mov {s}, {s}", .{X(d), X(ra)}); } else { E("lsl {s}, {s}, #{}", .{X(d), X(ra), sh}); }
+            } else {
+                E("mul {s}, {s}, {s}", .{X(d), X(ra), X(A.gi(in.b, 8))});
+            }
+            A.fin(in.dst, d);
+        }
+        .SDiv, .UDiv, .And, .Or, .Xor, .SMulH, .UMulH => {
+            let ra = A.gi(in.a, 16);
+            let rb = A.gi(in.b, 8);
+            d = A.di(in.dst);
+            E("{s} {s}, {s}, {s}", .{binName(in.op), X(d), X(ra), X(rb)});
+            A.fin(in.dst, d);
+        }
+        .SRem, .URem => {
+            let ra = A.gi(in.a, 16);
+            let rb = A.gi(in.b, 8);
+            d = A.di(in.dst);
+            E("{s} x17, {s}, {s}", .{if (in.op == .SRem) "sdiv" else "udiv", X(ra), X(rb)});
+            E("msub {s}, x17, {s}, {s}", .{X(d), X(rb), X(ra)});
+            A.fin(in.dst, d);
+        }
+        .Shl, .Asr, .Lsr => {
+            let nm = if (in.op == .Shl) "lsl" else if (in.op == .Asr) "asr" else "lsr";
+            let ra = A.gi(in.a, 16);
+            d = A.di(in.dst);
+            if (in.b.k == .Imm) { E("{s} {s}, {s}, #{}", .{nm, X(d), X(ra), in.b.v & 63}); } else { E("{s} {s}, {s}, {s}", .{nm, X(d), X(ra), X(A.gi(in.b, 8))}); }
+            A.fin(in.dst, d);
+        }
+        .Neg, .Not => {
+            let ra = A.gi(in.a, 16);
+            d = A.di(in.dst);
+            E("{s} {s}, {s}", .{if (in.op == .Neg) "neg" else "mvn", X(d), X(ra)});
+            A.fin(in.dst, d);
+        }
+        .FAdd, .FSub, .FMul, .FDiv => {
+            let ra = A.gf(in.a, 29);
+            let rb = A.gf(in.b, 30);
+            d = A.df(in.dst);
+            E("{s} {s}, {s}, {s}", .{binName(in.op), A.FR(d, in.cls), A.FR(ra, in.cls), A.FR(rb, in.cls)});
+            A.fin(in.dst, d);
+        }
+        .FNeg, .FSqrt, .FAbs => {
+            let nm = if (in.op == .FNeg) "fneg" else if (in.op == .FSqrt) "fsqrt" else "fabs";
+            let ra = A.gf(in.a, 29);
+            d = A.df(in.dst);
+            E("{s} {s}, {s}", .{nm, A.FR(d, in.cls), A.FR(ra, in.cls)});
+            A.fin(in.dst, d);
+        }
+        .Cmp, .FCmp => {
+            if (in.op == .Cmp) {
+                A.cmpOperands(in.a, in.b);
+            } else {
+                let c = A.F.vcls.items[in.a.v as usize];
+                let ra = A.gf(in.a, 29);
+                let rb = A.gf(in.b, 30);
+                E("fcmp {s}, {s}", .{A.FR(ra, c), A.FR(rb, c)});
+            }
+            if (nx) |n| {
+                if (n.op == .Br && n.a.k == .Reg && n.a.v == in.dst as i64 && A.usecnt[in.dst as usize] == 1) {
+                    A.branch(in.mem as ir.CC, n.t1, n.t2, b);
+                    return true;
+                }
+            }
+            d = A.di(in.dst);
+            E("cset {s}, {s}", .{X(d), A.CCN[in.mem as usize]});
+            A.fin(in.dst, d);
+        }
+        .Sel => {
+            let rc = A.gi(in.a, 16);
+            E("cmp {s}, #0", .{X(rc)});
+            if (in.cls == .I) {
+                let rb = A.gi(in.b, 16);
+                let rcc = A.gi(in.c, 8);
+                d = A.di(in.dst);
+                E("csel {s}, {s}, {s}, ne", .{X(d), X(rb), X(rcc)});
+            } else {
+                let rb = A.gf(in.b, 29);
+                let rcc = A.gf(in.c, 30);
+                d = A.df(in.dst);
+                E("fcsel {s}, {s}, {s}, ne", .{A.FR(d, in.cls), A.FR(rb, in.cls), A.FR(rcc, in.cls)});
+            }
+            A.fin(in.dst, d);
+        }
+        .Ext => {
+            let ra = A.gi(in.a, 16);
+            d = A.di(in.dst);
+            let size = in.mem & 0x7f;
+            let sg = (in.mem & 0x80) != 0;
+            if (size == 1) {
+                if (sg) { E("sxtb {s}, {s}", .{X(d), A.W(ra)}); } else { E("and {s}, {s}, #0xff", .{X(d), X(ra)}); }
+            } else if (size == 2) {
+                if (sg) { E("sxth {s}, {s}", .{X(d), A.W(ra)}); } else { E("and {s}, {s}, #0xffff", .{X(d), X(ra)}); }
+            } else if (size == 4) {
+                if (sg) { E("sxtw {s}, {s}", .{X(d), A.W(ra)}); } else { E("mov {s}, {s}", .{A.W(d), A.W(ra)}); }
+            } else if (d != ra) {
+                E("mov {s}, {s}", .{X(d), X(ra)});
+            }
+            A.fin(in.dst, d);
+        }
+        .Scvtf, .Ucvtf => {
+            let ra = A.gi(in.a, 16);
+            d = A.df(in.dst);
+            E("{s} {s}, {s}", .{if (in.op == .Scvtf) "scvtf" else "ucvtf", A.FR(d, in.cls), X(ra)});
+            A.fin(in.dst, d);
+        }
+        .Fcvtzs, .Fcvtzu => {
+            let c = A.F.vcls.items[in.a.v as usize];
+            let ra = A.gf(in.a, 29);
+            d = A.di(in.dst);
+            E("{s} {s}, {s}", .{if (in.op == .Fcvtzs) "fcvtzs" else "fcvtzu", X(d), A.FR(ra, c)});
+            A.fin(in.dst, d);
+        }
+        .Fcvt => {
+            let c = A.F.vcls.items[in.a.v as usize];
+            let ra = A.gf(in.a, 29);
+            d = A.df(in.dst);
+            if (c == in.cls) {
+                if (d != ra) { E("fmov {s}, {s}", .{A.FR(d, c), A.FR(ra, c)}); }
+            } else {
+                E("fcvt {s}, {s}", .{A.FR(d, in.cls), A.FR(ra, c)});
+            }
+            A.fin(in.dst, d);
+        }
+        .Load => {
+            var base: i32 = 0;
+            var off = in.imm;
+            if (in.slot >= 0) {
+                base = 29;
+                off = 0 - A.slot_off[in.slot as usize] as i64 + in.imm;
+            } else {
+                base = A.gi(in.a, 17);
+            }
+            d = if (in.cls == .I) A.di(in.dst) else A.df(in.dst);
+            A.memOp(true, in.mem, in.cls, d, base, off);
+            A.fin(in.dst, d);
+        }
+        .Store => {
+            var rv: i32 = 0;
+            if (in.cls == .I) {
+                rv = if (in.b.k == .Imm && in.b.v == 0) 31 else A.gi(in.b, 16);
+            } else {
+                rv = A.gf(in.b, 29);
+            }
+            var base: i32 = 0;
+            var off = in.imm;
+            if (in.slot >= 0) {
+                base = 29;
+                off = 0 - A.slot_off[in.slot as usize] as i64 + in.imm;
+            } else {
+                base = A.gi(in.a, 17);
+            }
+            A.memOp(false, in.mem, in.cls, rv, base, off);
+        }
+        .AddrSlot => {
+            d = A.di(in.dst);
+            let off = A.slot_off[in.slot as usize];
+            if (off <= 4095) {
+                E("sub {s}, x29, #{}", .{X(d), off});
+            } else {
+                A.movImm(17, off as i64);
+                E("sub {s}, x29, x17", .{X(d)});
+            }
+            A.fin(in.dst, d);
+        }
+        .AddrSym => {
+            d = A.di(in.dst);
+            if (in.mem != 0) { // defined in another image (a dylib): go through the GOT
+                E("adrp {s}, {s}@GOTPAGE", .{X(d), in.sym});
+                E("ldr {s}, [{s}, {s}@GOTPAGEOFF]", .{X(d), X(d), in.sym});
+            } else {
+                E("adrp {s}, {s}@PAGE", .{X(d), in.sym});
+                E("add {s}, {s}, {s}@PAGEOFF", .{X(d), X(d), in.sym});
+            }
+            A.fin(in.dst, d);
+        }
+        .Call => { emitCall(in); }
+        .Memcpy, .Memzero => {
+            let rd = A.gi(in.a, 16);
+            let cp = in.op == .Memcpy;
+            let rs = if (cp) A.gi(in.b, 17) else 31;
+            let n = in.imm;
+            var i: i64 = 0;
+            while (i + 8 <= n) {
+                if (cp) {
+                    E("ldr x8, [{s}, #{}]", .{X(rs), i});
+                    E("str x8, [{s}, #{}]", .{X(rd), i});
+                } else {
+                    E("str xzr, [{s}, #{}]", .{X(rd), i});
+                }
+                i += 8;
+            }
+            while (i + 4 <= n) {
+                if (cp) {
+                    E("ldr w8, [{s}, #{}]", .{X(rs), i});
+                    E("str w8, [{s}, #{}]", .{X(rd), i});
+                } else {
+                    E("str wzr, [{s}, #{}]", .{X(rd), i});
+                }
+                i += 4;
+            }
+            while (i < n) {
+                if (cp) {
+                    E("ldrb w8, [{s}, #{}]", .{X(rs), i});
+                    E("strb w8, [{s}, #{}]", .{X(rd), i});
+                } else {
+                    E("strb wzr, [{s}, #{}]", .{X(rd), i});
+                }
+                i += 1;
+            }
+        }
+        .Jmp => {
+            if (in.t1 != A.nextBlock(b)) { E("b Lb{}_{}", .{A.FN, in.t1}); }
+        }
+        .Br => {
+            let rc = A.gi(in.a, 16);
+            let nb = A.nextBlock(b);
+            if (in.t1 == nb) {
+                E("cbz {s}, Lb{}_{}", .{X(rc), A.FN, in.t2});
+            } else if (in.t2 == nb) {
+                E("cbnz {s}, Lb{}_{}", .{X(rc), A.FN, in.t1});
+            } else {
+                E("cbnz {s}, Lb{}_{}", .{X(rc), A.FN, in.t1});
+                E("b Lb{}_{}", .{A.FN, in.t2});
+            }
+        }
+        .Ret => {
+            if (in.a.k != .None) {
+                if (in.cls == .I) { A.intoInt(0, in.a); } else { A.intoFp(0, in.a, in.cls); }
+            }
+            if (!last_in_func) { E("b Lret{}", .{A.FN}); }
+        }
+        .Trap => { E("brk #1", .{}); }
+        .Vec => { emitVec(in); }
+        .VReduce => { emitVreduce(in); }
+    }
+    return false;
+}
+
+fn emitCall(in: *const ir.Inst) {
+    // an indirect call (no symbol) carries the callee as its last operand
+    let direct = in.sym.len > 0;
+    let nargs = if (direct) in.args.len else in.args.len - 1;
+    // on the stack, 8 bytes each and in order: C varargs (Apple's ABI), or (between Flint
+    // functions) fixed arguments that don't fit in x0-x7 / d0-d7
+    let on_stack = alloc.make(bool, nargs + 1);
+    var nstack: i64 = 0;
+    var ic: i32 = 0;
+    var fc: i32 = 0;
+    for (0..nargs) |j| {
+        let fp = in.argcls[j] != .I;
+        var used: i32 = 0;
+        if (j as i32 >= in.nfixed) {
+            on_stack[j] = true;
+        } else {
+            if (fp) { used = fc; fc += 1; } else { used = ic; ic += 1; }
+            on_stack[j] = used >= 8;
+        }
+        if (on_stack[j]) { nstack += 1; }
+    }
+    let space = (nstack * 8 + 15) & ~15;
+    if (space != 0) { E("sub sp, sp, #{}", .{space}); }
+    var k: i64 = 0;
+    for (0..nargs) |j| {
+        if (!on_stack[j]) { continue; }
+        if (in.argcls[j] == .I) {
+            E("str {s}, [sp, #{}]", .{X(A.gi(in.args[j], 16)), 8 * k});
+        } else {
+            E("str {s}, [sp, #{}]", .{A.D(A.gf(in.args[j], 31)), 8 * k});
+        }
+        k += 1;
+    }
+    ic = 0;
+    fc = 0;
+    for (0..nargs) |j| {
+        if (on_stack[j]) { continue; }
+        if (in.argcls[j] == .I) {
+            A.intoInt(ic, in.args[j]);
+            ic += 1;
+        } else {
+            A.intoFp(fc, in.args[j], in.argcls[j]);
+            fc += 1;
+        }
+    }
+    if (direct) {
+        E("bl {s}", .{in.sym});
+    } else { // loaded last: argument setup only writes x0-x7, d0-d7 and scratch registers
+        let rc = A.gi(in.args[nargs], 17);
+        E("blr {s}", .{X(rc)});
+    }
+    if (space != 0) { E("add sp, sp, #{}", .{space}); }
+    if (in.dst >= 0) {
+        var d: i32 = 0;
+        if (in.cls == .I) {
+            d = A.di(in.dst);
+            if (d != 0) { E("mov {s}, x0", .{X(d)}); }
+        } else {
+            d = A.df(in.dst);
+            if (d != 0) { E("fmov {s}, {s}", .{A.FR(d, in.cls), A.FR(0, in.cls)}); }
+        }
+        A.fin(in.dst, d);
+    }
+}

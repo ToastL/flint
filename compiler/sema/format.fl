@@ -1,0 +1,413 @@
+// sema.format - @format: compile-time checked formatting (design section 4.14). The format string
+// is read while compiling and expands into calls to std.fmt's helpers, one per piece. Also @hash
+// and @eql, which HashMap uses.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import modules.unit;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.expr;
+import sema.calls;
+import sema.errors;
+import sema.enums;
+import sema.ops;
+import sema.generics;
+
+// what the compiler itself calls in std (whatever the program imports, and ignoring pub)
+fn stdUnitNamed(mod: []const u8) -> *unit.Unit {
+    let path = text.f("std.{s}", .{mod});
+    for (st.UNITS) |u| { if (text.eq(u.path, path)) { return u; } }
+    diag.at(null, text.f("internal error: std.{s} isn't loaded", .{mod}));
+}
+
+pub fn stdType(mod: []const u8, name: []const u8) -> *ty.Type {
+    return names.typeIn(stdUnitNamed(mod), name) orelse diag.at(null, text.f("internal error: std.{s}.{s} is missing", .{mod, name}));
+}
+
+pub fn stdFn(mod: []const u8, name: []const u8) -> *st.FnInfo {
+    return names.fnIn(stdUnitNamed(mod), name) orelse diag.at(null, text.f("internal error: std.{s}.{s} is missing", .{mod, name}));
+}
+
+fn sameToks(n: usize, tok: ?*token.Token) -> []?*token.Token {
+    let toks = alloc.make(?*token.Token, n);
+    for (0..n) |i| { toks[i] = tok; }
+    return toks;
+}
+
+// fmt.<name>(args...) from std.fmt, as `try`
+fn fmtCall(name: []const u8, args: []const b.Val, tok: ?*token.Token) {
+    let m = stdFn("fmt", name);
+    _ = errors.tryVal(calls.callCore(m, args, sameToks(args.len, tok), tok), tok);
+}
+
+fn fmtWrite(w: b.Val, s: b.Val, tok: ?*token.Token) {
+    let m = names.findMethod(stdType("fmt", "Writer"), "writeAll").?;
+    _ = errors.tryVal(calls.callCore(m, &[_]b.Val { w, s }, sameToks(2, tok), tok), tok);
+}
+
+fn fmtLit(w: b.Val, s: []const u8, tok: ?*token.Token) {
+    if (s.len > 0) { fmtWrite(w, b.strLit(s), tok); }
+}
+
+struct FmtSpec {
+    spec: []const u8, // "", "d", "x", "X", "b", "o", "s", "c", "e", "*", "any"
+    width: i64,
+    prec: i64,
+    has_prec: bool,
+    fill: u8,
+    align: u8,
+}
+
+fn plainSpec() -> FmtSpec { return FmtSpec { spec: "", width: 0, prec: 0, has_prec: false, fill: ' ', align: 0 }; }
+
+fn fmtOpts(sp: *const FmtSpec, base: i64, upper: bool, tok: ?*token.Token) -> b.Val {
+    let ot = stdType("fmt", "FmtOpts");
+    ty.layout(ot, tok);
+    let a = b.temp(ot);
+    b.zeroAt(ot, a);
+    let names_ = [_][]const u8 { "width", "prec", "has_prec", "fill", "align", "base", "upper" };
+    let vals = [_]i64 { sp.width, sp.prec, if (sp.has_prec) 1 else 0, sp.fill as i64, sp.align as i64, base, if (upper) 1 else 0 };
+    for (0..names_.len) |i| {
+        for (ot.fields.items) |*f| {
+            if (text.eq(f.name, names_[i])) { b.store(f.t, b.aAdd(a, f.off as i64), b.IMM(vals[i])); }
+        }
+    }
+    return b.vAgg(ot, a, true);
+}
+
+// { a, b, c }: the elements of an array or slice, through a loop
+fn fmtElems(w: b.Val, et: *ty.Type, p: i32, len: ir.Opd, tok: ?*token.Token, depth: i32) {
+    if (len.k == .Imm && len.v == 0) {
+        fmtLit(w, "{}", tok);
+        return;
+    }
+    fmtLit(w, "{", tok);
+    let islot = b.newSlot(ty.usize_);
+    b.store(ty.usize_, b.aSlot(islot, 0), b.IMM(0));
+    let body = b.newBlock();
+    let exit_ = b.newBlock();
+    let l = if (len.k == .Imm) b.R(b.iconst(len.v)) else len;
+    b.br(b.R(b.cmp(.NE, l, b.IMM(0))), body, exit_);
+    b.setBlk(body);
+    let i = b.load(ty.usize_, b.aSlot(islot, 0));
+    let first = b.newBlock();
+    let rest = b.newBlock();
+    let elem = b.newBlock();
+    b.br(b.R(b.cmp(.EQ, b.R(i), b.IMM(0))), first, rest);
+    b.setBlk(rest);
+    fmtLit(w, ", ", tok);
+    b.jmp(elem);
+    b.setBlk(first);
+    fmtLit(w, " ", tok);
+    b.jmp(elem);
+    b.setBlk(elem);
+    let inner = plainSpec();
+    fmtValue(w, b.loadVal(et, access.elemAddr(p, b.vReg(ty.usize_, i), et.size)), &inner, tok, depth + 1);
+    let i2 = b.op2(.Add, .I, b.R(b.load(ty.usize_, b.aSlot(islot, 0))), b.IMM(1));
+    b.store(ty.usize_, b.aSlot(islot, 0), b.R(i2));
+    b.br(b.R(b.cmp(.LO, b.R(i2), l)), body, exit_);
+    b.setBlk(exit_);
+    let some = b.newBlock();
+    let none = b.newBlock();
+    let done = b.newBlock();
+    b.br(b.R(b.cmp(.NE, l, b.IMM(0))), some, none);
+    b.setBlk(some);
+    fmtLit(w, " }", tok);
+    b.jmp(done);
+    b.setBlk(none);
+    fmtLit(w, "}", tok);
+    b.jmp(done);
+    b.setBlk(done);
+}
+
+var fmt_argno: usize = 0; // the argument being formatted (1-based), for error messages
+
+fn fmtArg() -> []const u8 { return if (fmt_argno != 0) text.f(" (argument {})", .{fmt_argno}) else ""; }
+
+fn fmtBad(tok: ?*token.Token, sp: *const FmtSpec, t: *ty.Type) -> noreturn {
+    diag.at(tok, text.f("format string: '{{{s}}}' can't format {s}{s}", .{sp.spec, ty.tname(t), fmtArg()}));
+}
+
+fn call3(name: []const u8, w: b.Val, v: b.Val, opts: b.Val, tok: ?*token.Token) { fmtCall(name, &[_]b.Val { w, v, opts }, tok); }
+
+fn fmtValue(w: b.Val, v0: b.Val, sp: *const FmtSpec, tok: ?*token.Token, depth: i32) {
+    var v = v0;
+    var t = v.t;
+    let s = sp.spec;
+    let dflt = s.len == 0 || text.eq(s, "any");
+    if (t.k == .Opt) {
+        let yes = b.newBlock();
+        let no = b.newBlock();
+        let join = b.newBlock();
+        b.br(b.R(cv.optHas(v)), yes, no);
+        b.setBlk(yes);
+        fmtValue(w, cv.optValue(v), sp, tok, depth);
+        b.jmp(join);
+        b.setBlk(no);
+        call3("formatStr", w, b.strLit("null"), fmtOpts(sp, 10, false, tok), tok);
+        b.jmp(join);
+        b.setBlk(join);
+        return;
+    }
+    if (t == ty.errlit) {
+        v = cv.defaulted(v);
+        t = v.t;
+    }
+    if (ty.isInt(t)) {
+        v = cv.defaulted(v);
+        t = v.t;
+        if (text.eq(s, "c")) {
+            if (t.k != .U8) { diag.at(tok, text.f("format string: '{{c}}' prints a byte (u8), not {s}{s}", .{ty.tname(t), fmtArg()})); }
+            call3("formatByte", w, v, fmtOpts(sp, 10, false, tok), tok);
+            return;
+        }
+        let base: i64 = if (text.eq(s, "x") || text.eq(s, "X")) 16 else if (text.eq(s, "b")) 2 else if (text.eq(s, "o")) 8 else 10;
+        if (!dflt && !text.eq(s, "d") && base == 10) { fmtBad(tok, sp, t); }
+        let sg = ty.isSigned(t);
+        call3(if (sg) "formatInt" else "formatUint", w, cv.convert(v, if (sg) ty.i64_ else ty.u64_), fmtOpts(sp, base, text.eq(s, "X"), tok), tok);
+        return;
+    }
+    if (ty.isFloat(t)) {
+        if (!dflt && !text.eq(s, "d") && !text.eq(s, "e")) { fmtBad(tok, sp, t); }
+        let f32 = t.k == .F32;
+        call3(if (f32) "formatFloat32" else "formatFloat", w, if (f32) v else cv.convert(cv.defaulted(v), ty.f64_), fmtOpts(sp, 10, text.eq(s, "e"), tok), tok);
+        return;
+    }
+    if (t == ty.bool_) {
+        if (!dflt) { fmtBad(tok, sp, t); }
+        call3("formatBool", w, v, fmtOpts(sp, 10, false, tok), tok);
+        return;
+    }
+    if (ty.isBytes(t) && (text.eq(s, "s") || (s.len == 0 && depth > 0))) {
+        if (depth > 0 && s.len == 0) { fmtLit(w, "\"", tok); }
+        call3("formatStr", w, cv.coerce(v, ty.str_, tok, "a string"), fmtOpts(sp, 10, false, tok), tok);
+        if (depth > 0 && s.len == 0) { fmtLit(w, "\"", tok); }
+        return;
+    }
+    if (ty.isBytes(t) && (text.eq(s, "x") || text.eq(s, "X"))) {
+        call3("formatHex", w, cv.coerce(v, ty.str_, tok, "bytes"), fmtOpts(sp, 16, text.eq(s, "X"), tok), tok);
+        return;
+    }
+    if (ty.isBytes(t) && s.len == 0) {
+        diag.at(tok, text.f("format string: use '{{s}}' to print {s} as text, or '{{any}}' for its bytes as numbers{s}", .{ty.tname(t), fmtArg()}));
+    }
+    if (t == ty.cstr_ && text.eq(s, "s")) {
+        call3("formatCStr", w, v, fmtOpts(sp, 10, false, tok), tok);
+        return;
+    }
+    if (t.k == .Enum) {
+        if (!dflt && !text.eq(s, "s")) { fmtBad(tok, sp, t); }
+        call3("formatStr", w, enums.tagName(v), fmtOpts(sp, 10, false, tok), tok);
+        return;
+    }
+    if (t.k == .ErrSet) {
+        if (!dflt && !text.eq(s, "s")) { fmtBad(tok, sp, t); }
+        fmtLit(w, "error.", tok);
+        call3("formatStr", w, errors.errNameStr(b.opdOf(v)), fmtOpts(sp, 10, false, tok), tok);
+        return;
+    }
+    if (ty.isPtr(t) || ty.isFn(t) || ty.isOptPtr(t)) {
+        if (!dflt && !text.eq(s, "*")) { fmtBad(tok, sp, t); }
+        call3("formatPtr", w, b.vReg(ty.u64_, b.regOf(v)), fmtOpts(sp, 16, false, tok), tok);
+        return;
+    }
+    if (t.k == .ErrUnion) {
+        if (s.len == 0 || s[0] != '!') {
+            diag.at(tok, text.f("format string: {s} might be an error; handle it first with 'try' or 'catch', or print either with '{{!}}'{s}", .{ty.tname(t), fmtArg()}));
+        }
+        var inner = sp.*;
+        inner.spec = s[1..];
+        let code = cv.euErr(v);
+        let ok = b.newBlock();
+        let bad = b.newBlock();
+        let join = b.newBlock();
+        b.br(b.R(b.cmp(.EQ, code, b.IMM(0))), ok, bad);
+        b.setBlk(ok);
+        if (t.E() == ty.void_) { fmtLit(w, "void", tok); } else { fmtValue(w, cv.euValue(v), &inner, tok, depth); }
+        b.jmp(join);
+        b.setBlk(bad);
+        let e = if (code.k == .Imm) b.vInt(t.eset.?, code.v) else b.vReg(t.eset.?, code.v as i32);
+        inner.spec = "";
+        fmtValue(w, e, &inner, tok, depth);
+        b.jmp(join);
+        b.setBlk(join);
+        return;
+    }
+    if (s.len > 0 && s[0] == '!') { diag.at(tok, text.f("format string: '{{{s}}}' is for error unions, but this is {s}{s}", .{s, ty.tname(t), fmtArg()})); }
+    if (!dflt) { fmtBad(tok, sp, t); }
+    if (depth > 16) { diag.at(tok, text.f("format string: {s} is nested too deeply to print", .{ty.tname(t)})); }
+    if (ty.isArray(t)) {
+        ty.layout(t, tok);
+        fmtElems(w, t.E(), b.addrReg(v.a), b.IMM(t.alen), tok, depth);
+        return;
+    }
+    if (ty.isSlice(t)) {
+        fmtElems(w, t.E(), b.load(ty.ptrTo(t.E()), v.a), b.R(b.load(ty.usize_, b.aAdd(v.a, 8))), tok, depth);
+        return;
+    }
+    if (t.k == .Struct && !t.is_packed && !t.is_union) {
+        ty.layout(t, tok);
+        let nf = t.fields.items.len;
+        if (t.tuple) {
+            fmtLit(w, if (nf > 0) ".{ " else ".{", tok);
+        } else {
+            fmtLit(w, t.name, tok);
+            fmtLit(w, if (nf > 0) "{ " else "{", tok);
+        }
+        for (0..nf) |i| {
+            let fd = &t.fields.items[i];
+            if (i > 0) { fmtLit(w, ", ", tok); }
+            if (!t.tuple) {
+                fmtLit(w, fd.name, tok);
+                fmtLit(w, ": ", tok);
+            }
+            let inner = plainSpec();
+            fmtValue(w, b.loadVal(fd.t, b.aAdd(v.a, fd.off as i64)), &inner, tok, depth + 1);
+        }
+        fmtLit(w, if (nf > 0) " }" else "}", tok);
+        return;
+    }
+    diag.at(tok, text.f("format string: can't format {s} yet (format its fields){s}", .{ty.tname(t), fmtArg()}));
+}
+
+let SPECS = [_][]const u8 { "", "d", "x", "X", "b", "o", "s", "c", "e", "*", "any" };
+
+fn isAlignCh(c: u8) -> bool { return c == '<' || c == '>' || c == '^'; }
+fn isDigit(c: u8) -> bool { return c >= '0' && c <= '9'; }
+
+// @format(writer, "x = {}\n", .{x})
+pub fn exFormat(n: *ast.Node) -> b.Val {
+    if (n.count() != 3) { diag.at(n.tok, "@format takes a Writer, a format string and a tuple of arguments"); }
+    var w = expr.expr(n.at(0), null);
+    if (w.t != stdType("fmt", "Writer")) { diag.at(n.at(0).tok, text.f("@format writes to a Writer, not {s}", .{ty.tname(w.t)})); }
+    let fnode = n.at(1);
+    let fv = expr.expr(fnode, ty.str_);
+    if (fv.strlit == 0) { diag.at(fnode.tok, "the format string must be known at compile time (a string literal)"); }
+    let ftok = generics.originOf(fnode);
+    let f = b.strData(fv.strlit);
+    var args = expr.expr(n.at(2), null);
+    if (args.t.k != .Struct || !args.t.tuple) {
+        diag.at(n.at(2).tok, text.f("the arguments go in a tuple: .{{ x, y }} (or .{{}} for none), not {s}", .{ty.tname(args.t)}));
+    }
+    ty.layout(args.t, n.tok);
+    if (!args.fresh) { // the writes below may change what the arguments point into: copy them first
+        let c = b.temp(args.t);
+        b.copyAgg(args.t, c, args.a);
+        args = b.vAgg(args.t, c, true);
+    }
+    let wa = b.temp(w.t); // the writer is used once per piece
+    b.copyAgg(w.t, wa, w.a);
+    w = b.vAgg(w.t, wa, false);
+    var next: usize = 0;
+    let nfields = args.t.fields.items.len;
+    var lit: text.Buf = .{};
+    var i: usize = 0;
+    while (i < f.len) {
+        let c = f[i];
+        if (c == '}') {
+            if (i + 1 < f.len && f[i + 1] == '}') {
+                lit.byte('}');
+                i += 2;
+                continue;
+            }
+            diag.at(ftok, "format string: unmatched '}' (write '}}' for a literal brace)");
+        }
+        if (c != '{') {
+            lit.byte(c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 < f.len && f[i + 1] == '{') {
+            lit.byte('{');
+            i += 2;
+            continue;
+        }
+        var j = i + 1;
+        while (j < f.len && f[j] != '}') { j += 1; }
+        if (j >= f.len) { diag.at(ftok, "format string: unclosed '{' (write '{{' for a literal brace)"); }
+        let ph = f[i + 1..j];
+        i = j + 1;
+        var sp = plainSpec();
+        let colon = text.indexOf(ph, ':');
+        sp.spec = if (colon) |cl| ph[0..cl] else ph;
+        let bare = if (sp.spec.len > 0 && sp.spec[0] == '!') sp.spec[1..] else sp.spec;
+        if (!text.oneOf(bare, SPECS[..])) {
+            diag.at(ftok, text.f("format string: unknown '{{{s}}}' (use {{}}, {{d}}, {{x}}, {{X}}, {{b}}, {{o}}, {{s}}, {{c}}, {{e}}, {{*}} or {{any}}, after '!' for an error union, and optionally followed by :[fill][<>^][width][.precision])", .{ph}));
+        }
+        if (colon) |cl| {
+            let o = ph[cl + 1..];
+            var k: usize = 0;
+            if (o.len >= 2 && isAlignCh(o[1])) {
+                sp.fill = o[0];
+                sp.align = o[1];
+                k = 2;
+            } else if (o.len >= 1 && isAlignCh(o[0])) {
+                sp.align = o[0];
+                k = 1;
+            }
+            while (k < o.len && isDigit(o[k])) {
+                sp.width = sp.width * 10 + (o[k] - '0') as i64;
+                k += 1;
+            }
+            if (k < o.len && o[k] == '.') {
+                k += 1;
+                sp.has_prec = true;
+                if (!(k < o.len && isDigit(o[k]))) { diag.at(ftok, text.f("format string: '.' must be followed by a precision in '{{{s}}}'", .{ph})); }
+                while (k < o.len && isDigit(o[k])) {
+                    sp.prec = sp.prec * 10 + (o[k] - '0') as i64;
+                    k += 1;
+                }
+            }
+            if (k < o.len) { diag.at(ftok, text.f("format string: can't read the options in '{{{s}}}' (they're :[fill][<>^][width][.precision])", .{ph})); }
+        }
+        if (next >= nfields) { diag.at(ftok, text.f("format string has more placeholders than arguments ({} given)", .{nfields})); }
+        fmtLit(w, lit.items, ftok);
+        lit = .{};
+        let fd = &args.t.fields.items[next];
+        next += 1;
+        fmt_argno = next;
+        fmtValue(w, b.loadVal(fd.t, b.aAdd(args.a, fd.off as i64)), &sp, ftok, 0);
+        fmt_argno = 0;
+    }
+    fmtLit(w, lit.items, ftok);
+    if (next < nfields) { diag.at(ftok, text.f("format string uses {} argument(s), but {} are given", .{next, nfields})); }
+    return b.vVoid();
+}
+
+// @hash(x): a 64-bit hash of an integer, bool, enum, pointer or string (HashMap's keys)
+pub fn exHash(n: *ast.Node) -> b.Val {
+    if (n.count() != 1) { diag.at(n.tok, "@hash takes one value"); }
+    let v = cv.defaulted(expr.expr(n.at(0), null));
+    let toks = sameToks(1, n.tok);
+    if (ty.isBytes(v.t)) {
+        return calls.callCore(stdFn("hash", "bytes"), &[_]b.Val { cv.coerce(v, ty.str_, n.tok, "@hash") }, toks, n.tok);
+    }
+    if (!(ty.isInt(v.t) || v.t == ty.bool_ || ty.isPlainEnum(v.t) || ty.isPtr(v.t) || ty.isOptPtr(v.t))) {
+        diag.at(n.at(0).tok, text.f("@hash works on integers, bools, plain enums, pointers and strings, not {s}", .{ty.tname(v.t)}));
+    }
+    return calls.callCore(stdFn("hash", "int"), &[_]b.Val { b.vReg(ty.u64_, b.regOf(v)) }, toks, n.tok);
+}
+
+// @eql(a, b): == for integers, bools, enums and pointers; the bytes for strings
+pub fn exEql(n: *ast.Node) -> b.Val {
+    if (n.count() != 2) { diag.at(n.tok, "@eql takes two values"); }
+    let a = expr.expr(n.at(0), null);
+    let c = expr.expr(n.at(1), if (ty.isLit(a.t)) null else a.t);
+    if (ty.isBytes(a.t) && ty.isBytes(c.t)) {
+        let args = [_]b.Val { cv.coerce(a, ty.str_, n.tok, "@eql"), cv.coerce(c, ty.str_, n.tok, "@eql") };
+        return calls.callCore(stdFn("hash", "eqlBytes"), args[..], sameToks(2, n.tok), n.tok);
+    }
+    if (ty.isAgg(a.t) || ty.isAgg(c.t)) {
+        diag.at(n.tok, text.f("@eql compares integers, bools, plain enums, pointers and strings, not {s}", .{ty.tname(a.t)}));
+    }
+    return ops.binop("==", a, c, n.tok);
+}

@@ -1,0 +1,160 @@
+// sema.errors - error unions in code: `try`, `catch`, returning an error (errdefers and defers run
+// first), and error names as strings.
+
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.stmt;
+import sema.optional;
+
+pub fn retInst(o: ir.Opd) {
+    let f = st.c().fn_.?;
+    let r = b.emit(.Ret);
+    let rt = f.ret.?;
+    if (!ty.isAgg(rt) && rt != ty.void_) {
+        r.a = o;
+        r.cls = ty.clsOf(rt);
+    }
+}
+
+// leave the function with error `code`: errdefers and defers run first
+pub fn errReturn(code: ir.Opd) {
+    let rt = st.c().fn_.?.ret.?;
+    var e = if (code.k == .Imm) b.vInt(rt.eset.?, code.v) else b.vReg(rt.eset.?, code.v as i32);
+    stmt.emitDefersErr(null, &e);
+    if (ty.isAgg(rt)) { b.store(ty.u16_, b.aReg(st.c().retptr, ty.errOff(rt) as i64), code); }
+    retInst(code);
+}
+
+pub fn exTry(n: *ast.Node) -> b.Val {
+    let cx = st.c();
+    if (cx.ct_scratch) { diag.at(n.tok, "'try' would leave the comptime expression; handle the error with 'catch'"); }
+    if (cx.defer_depth != 0) {
+        diag.at(n.tok, "'try' can't be used in a defer: the function is already leaving (handle the error with 'catch')");
+    }
+    let v = expr.expr(n.a.?, null);
+    if (v.t.k != .ErrUnion) { diag.at(n.tok, text.f("'try' needs something that can fail (!T), but this is {s}", .{ty.tname(v.t)})); }
+    let f = cx.fn_.?;
+    if (f.ret == null || f.ret.?.k != .ErrUnion) {
+        diag.at(n.tok, text.f("'try' passes the error up, so '{s}' must return an error union (like -> !{s})",
+                              .{f.name, if (f.ret) |r| ty.tname(r) else "T"}));
+    }
+    let fr = f.ret.?;
+    if (!cv.setSubset(v.t.eset.?, fr.eset.?)) {
+        diag.at(n.tok, text.f("this can fail with {s} errors, but '{s}' returns {s}", .{ty.tname(v.t.eset.?), f.name, ty.tname(fr)}));
+    }
+    let code = cv.euErr(v);
+    let fail = b.newBlock();
+    let ok = b.newBlock();
+    b.br(b.R(b.cmp(.NE, code, b.IMM(0))), fail, ok);
+    b.setBlk(fail);
+    errReturn(code);
+    b.setBlk(ok);
+    return cv.euValue(v);
+}
+
+// like `try v`: a failed v returns its error from the current function
+pub fn tryVal(v: b.Val, tok: ?*token.Token) -> b.Val {
+    let cx = st.c();
+    let f = cx.fn_.?;
+    if (cx.ct_scratch) { diag.at(tok, "this passes errors up, which would leave the comptime expression; use it inside a function"); }
+    if (cx.defer_depth != 0) { diag.at(tok, "@format passes write errors up, so it can't be used directly in a defer"); }
+    if (f.ret == null || f.ret.?.k != .ErrUnion) {
+        diag.at(tok, text.f("this passes write errors up, so '{s}' must return an error union (like -> !void)", .{f.name}));
+    }
+    let fr = f.ret.?;
+    if (!cv.setSubset(v.t.eset.?, fr.eset.?)) {
+        diag.at(tok, text.f("this can fail with {s} errors, but '{s}' returns {s}", .{ty.tname(v.t.eset.?), f.name, ty.tname(fr)}));
+    }
+    let code = cv.euErr(v);
+    let fail = b.newBlock();
+    let ok = b.newBlock();
+    b.br(b.R(b.cmp(.NE, code, b.IMM(0))), fail, ok);
+    b.setBlk(fail);
+    errReturn(code);
+    b.setBlk(ok);
+    return cv.euValue(v);
+}
+
+// x catch value / x catch |e| expr / x catch |e| { ... }
+pub fn exCatch(n: *ast.Node) -> b.Val {
+    let v = expr.expr(n.a.?, null);
+    if (v.t.k != .ErrUnion) { diag.at(n.tok, text.f("'catch' needs something that can fail (!T), but this is {s}", .{ty.tname(v.t)})); }
+    let et = v.t.E();
+    let code = cv.euErr(v);
+    let ok = b.newBlock();
+    let fail = b.newBlock();
+    let join = b.newBlock();
+    b.br(b.R(b.cmp(.NE, code, b.IMM(0))), fail, ok);
+    b.setBlk(fail);
+    names.pushScope(false, -1, -1);
+    if (n.name.len > 0) { optional.bindErr(n.name, n.tok, v); }
+    var d = b.vVoid();
+    var dead = false;
+    let rhs = n.b.?;
+    if (rhs.k == .Block) {
+        stmt.blockBody(rhs);
+        dead = b.terminated();
+        if (!dead && et != ty.void_) {
+            diag.at(rhs.tok, text.f("this catch block must produce a value of type {s} or leave with return, break or continue", .{ty.tname(et)}));
+        }
+    } else {
+        d = expr.expr(rhs, et);
+        dead = d.t == ty.noreturn_;
+        if (!dead && et == ty.void_ && d.t != ty.void_) {
+            diag.at(rhs.tok, "the call gives no value, so the catch has nothing to replace (write 'catch {}' to ignore the error)");
+        }
+        if (!dead && et != ty.void_) { d = cv.coerce(d, et, rhs.tok, "the 'catch' value"); }
+    }
+    names.popScope();
+    let dend = st.c().blk;
+    if (et == ty.void_) {
+        if (!dead) { b.jmp(join); }
+        b.setBlk(ok);
+        b.jmp(join);
+        b.setBlk(join);
+        return b.vVoid();
+    }
+    if (ty.isAgg(et)) {
+        let ra = b.temp(et);
+        b.setBlk(ok);
+        b.copyAgg(et, ra, cv.euValue(v).a);
+        b.jmp(join);
+        if (!dead) {
+            b.setBlk(dend);
+            b.copyAgg(et, ra, d.a);
+            b.jmp(join);
+        }
+        b.setBlk(join);
+        return b.vAgg(et, ra, true);
+    }
+    let r = b.newVreg(ty.clsOf(et));
+    b.setBlk(ok);
+    b.mov(r, ty.clsOf(et), b.opdOf(cv.euValue(v)));
+    b.jmp(join);
+    if (!dead) {
+        b.setBlk(dend);
+        b.mov(r, ty.clsOf(et), b.opdOf(d));
+        b.jmp(join);
+    }
+    b.setBlk(join);
+    return b.vReg(et, r);
+}
+
+// an error's name, as a str
+pub fn errNameStr(code: ir.Opd) -> b.Val {
+    let p = b.callI("_rt_error_name", .I, &[_]ir.Opd { code });
+    let l = b.callI("_strlen", .I, &[_]ir.Opd { b.R(p) });
+    let t = b.temp(ty.str_);
+    b.store(ty.ptrTo(ty.u8_), t, b.R(p));
+    b.store(ty.i64_, b.aAdd(t, 8), b.R(l));
+    return b.vAgg(ty.str_, t, true);
+}

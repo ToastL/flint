@@ -1,0 +1,11 @@
+import std.io;
+
+fn positive(x: i64) -> ?i64 {
+    if (x > 0) { return x; }
+    return null;
+}
+
+fn main() -> !void {
+    try io.print("before\n", .{});
+    try io.print("{}\n", .{positive(-1).?});
+}

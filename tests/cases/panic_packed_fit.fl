@@ -1,0 +1,18 @@
+import std.io;
+
+packed struct Reg {
+    mode: u2,
+    delta: i5,
+}
+
+fn get(x: i8) -> i8 { return x; }
+fn getu(x: u8) -> u8 { return x; }
+
+fn main() -> !void {
+    var r = @bitcast(Reg, 0);
+    r.delta = get(-16);
+    r.mode = getu(3);
+    try io.print("{} {}\n", .{ r.delta, r.mode });
+    r.delta = get(16);
+    try io.print("unreachable\n", .{});
+}

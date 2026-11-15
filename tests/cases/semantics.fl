@@ -1,0 +1,107 @@
+// Low-level semantics a hand-written backend can get wrong.
+
+import std.heap;
+import std.io;
+import std.list;
+
+struct Pair { a: i32, b: u8 }
+struct Big { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64 }
+struct Vec3 {
+    x: f64,
+    y: f64,
+    z: f64,
+
+    fn dot(self: Vec3, o: Vec3) -> f64 { return self.x * o.x + self.y * o.y + self.z * o.z; }
+    fn add(self: Vec3, o: Vec3) -> Vec3 { return Vec3 { x: self.x + o.x, y: self.y + o.y, z: self.z + o.z }; }
+}
+
+var counter: i64 = 0;
+let LIMIT = 3;
+let greeting = "hi";
+let ratio: f32 = 0.5;
+
+fn make_big(k: i64) -> Big { return Big { a: k, b: k + 1, c: k + 2, d: k + 3, e: k + 4, f: k + 5 }; }
+fn sum_big(b: Big) -> i64 { return b.a + b.b + b.c + b.d + b.e + b.f; }
+fn bump() { counter += 1; }
+fn many(a: i64, b: f64, c: i64, d: f64, e: i64, f: i32, g: u8, h: f32) -> f64 {
+    return a as f64 + b + c as f64 + d + e as f64 + f as f64 + g as f64 + h as f64;
+}
+fn order(log: *list.ArrayList(i64), k: i64) -> !void {
+    defer log.append(k * 10) catch {};
+    if (k == 1) { return; }
+    try log.append(k);
+}
+
+fn main() -> !void {
+    // narrow integers wrap when you ask for it
+    var x: u8 = 250;
+    x +%= 10;
+    var y: i8 = 127;
+    y +%= 1;
+    let z: i16 = -1;
+    let w = @bitcast(u16, z);
+    try io.print("wrap {} {} {} {} {}\n", .{ x, y, w, @truncate(u8, 300), @bitcast(u32, -1 as i32) });
+
+    // signed vs unsigned division and shifts
+    let s: i32 = -7;
+    let u: u32 = 4294967289;
+    try io.print("div {} {} {} {} {}\n", .{ s / 2, s % 2, u / 2, s >> 1, u >> 1 });
+
+    // floats
+    let f: f32 = 1.5;
+    let g = f * ratio;
+    try io.print("f32 {} {} {} {} {}\n", .{ g, (g as f64) * 2.0, 7.0 % 2.5, -0.0 == 0.0, 1.0 / 3.0 });
+    try io.print("conv {} {} {} {}\n", .{ 3.99 as i64, -3.99 as i64, 255 as f64, (2_000_000_000 as i32) as f64 });
+
+    // globals and constants
+    for (0..LIMIT) |i| { bump(); }
+    try io.print("global {} {s} {}\n", .{ counter, greeting, greeting.len });
+
+    // structs by value: copies are independent
+    let p = Pair { a: -5, b: 200 };
+    var q = p;
+    q.a = 9;
+    try io.print("pair {} {} {}\n", .{ p.a, p.b, q.a });
+    let big = make_big(10);
+    var big2 = big;
+    big2.f = 0;
+    try io.print("big {} {}\n", .{ sum_big(big), sum_big(big2) });
+    let v = Vec3 { x: 1, y: 2, z: 3 };
+    try io.print("vec {} {}\n", .{ v.dot(v), v.add(v).z });
+
+    // mixed int/float args in registers
+    try io.print("args {}\n", .{many(1, 2.5, 3, 4.5, 5, 6, 7, 8.25)});
+
+    // defer order with early return
+    var gpa = heap.DebugAllocator.init();
+    defer gpa.deinit();
+    var log = list.ArrayList(i64).init(gpa.allocator());
+    defer log.deinit();
+    try order(&log, 1);
+    try order(&log, 2);
+    for (log.items) |k| { try io.print("log {}\n", .{k}); }
+
+    // slices, pointer slicing, pop
+    var four: [4]i64 = undefined;
+    let xs: []i64 = &four;
+    for (0..xs.len) |i| { xs[i] = (i * i) as i64; }
+    let tail = xs[2..];
+    tail[0] = 100;
+    unsafe { try io.print("slice {} {} {}\n", .{ xs[2], tail.len, xs.ptr[1..3][1] }); }
+    var st = list.ArrayList(Vec3).init(heap.c_allocator);
+    defer st.deinit();
+    for (0..20) |i| { try st.append(Vec3 { x: i as f64, y: 0, z: 0 }); }
+    let last = st.pop().?;
+    try io.print("vecs {} {} {}\n", .{ st.items.len, last.x, st.items[18].x });
+
+    // short-circuit and if-expressions
+    let zero: i64 = 0;
+    let ok = false && (10 / zero == 1);
+    try io.print("logic {} {} {} {s} {} {} {}\n", .{ ok, true || false, !ok, if (zero > 0) "yes" else "no", min(3, -2), max(2.5, 1), abs(-7) });
+
+    // u64 range, bit ops
+    let big_u: u64 = 18446744073709551615;
+    try io.print("bits {} {} {} {} {} {} {}\n", .{ big_u, big_u >> 60, 0xF0 | 0x0F, 6 & 3, 6 ^ 3, ~0, 1 << 40 });
+    assert(counter == 3);
+    try io.print("done\n", .{});
+}

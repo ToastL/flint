@@ -1,0 +1,53 @@
+// import c "header.h" as name: C declarations, translated by the compiler when they're used.
+import c "stdio.h" as c;
+import c "string.h" as cstring;
+import c "math.h" as math;
+import c "stdlib.h" as stdlib;
+import c "time.h" as time;
+import c "cimport_local.h" as local;
+import std.io;
+import std.mem;
+
+// qsort's comparator: C's `int (*)(const void *, const void *)` is ?fn(?*const void, ?*const void) -> i32
+fn cmp(a: ?*const void, b: ?*const void) -> i32 {
+    unsafe {
+        let x = @ptrCast(*const i32, a.?).*;
+        let y = @ptrCast(*const i32, b.?).*;
+        return if (x < y) -1 else if (x > y) 1 else 0;
+    }
+}
+
+fn add(a: i32, b: i32) -> i32 { return a + b; }
+
+fn main() -> !void {
+    // functions, with C's own types: size_t is usize, const char * is ?cstr
+    try io.print("strlen {} sqrt {} floor {}\n", .{ cstring.strlen("hello"), math.sqrt(2.25), math.floor(-1.5) });
+    let found = cstring.strchr("a=b", '=');
+    try io.print("strchr found {}\n", .{found != null});
+    var xs = [_]i32 { 5, 3, 9, 1 };
+    stdlib.qsort(&xs, 4, @sizeOf(i32), cmp);
+    try io.print("sorted {any}\n", .{xs});
+    try io.print("abs {} atoi {}\n", .{ stdlib.abs(-7), stdlib.atoi("123") });
+
+    // macros that are constants, and enum constants
+    try io.print("EOF {} pi {d:.4} limit {} scale {} mask {} name {s}\n",
+        .{ c.EOF, math.M_PI, local.LOCAL_LIMIT, local.LOCAL_SCALE, local.LOCAL_MASK, local.LOCAL_NAME });
+    try io.print("colors {} {} {}\n", .{ local.RED, local.GREEN, local.BLUE });
+
+    // structs keep C's layout; a typedef and the tag name the same type
+    var p: local.point_t = undefined;
+    p.x = 3;
+    p.y = 4;
+    p.next = null;
+    let q: local.struct_point = p;
+    try io.print("point {} {} size {} {}\n", .{ q.x, q.y, @sizeOf(local.point_t), @sizeOf(time.struct_tm) });
+    let ops = local.struct_ops { apply: add, label: "plus" };
+    try io.print("ops {} {s}\n", .{ ops.apply.?(2, 3), mem.span(ops.label.?) });
+    let n = local.union_num { f: 1.5 };
+    unsafe { try io.print("union {} size {}\n", .{ n.f, @sizeOf(local.union_num) }); }
+
+    // C globals, and variadic functions
+    try io.flush();
+    _ = c.printf("printf %d %s %.2f\n", 42, "ok", 0.5);
+    _ = c.fflush(c.stdout);
+}

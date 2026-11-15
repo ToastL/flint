@@ -1,0 +1,13 @@
+import std.io;
+fn first(xs: []const i32) -> ?i32 { return if (xs.len > 0) xs[0] else null; }
+fn f(xs: []const i32) -> i32 {
+    let v = first(xs) orelse {
+        try_print();
+        return -1;
+    };
+    return v * 2;
+}
+fn try_print() { _ = io.print("empty\n", .{}) catch {}; }
+fn main() -> !void {
+    try io.print("{} {}\n", .{f(&[_]i32 { 21 }), f(&[_]i32 {})});
+}

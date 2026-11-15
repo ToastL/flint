@@ -1,0 +1,72 @@
+// opt.cfg - control flow: jumps through blocks that only jump are threaded to their target, a
+// branch with both targets the same becomes a jump, and unreachable blocks are dropped.
+
+import base.alloc;
+import ir.ir;
+
+fn thread(f: *ir.IRFunc, b0: i32) -> i32 {
+    var b = b0;
+    var guard: i32 = 0;
+    while (guard < 32) {
+        let blk = &f.blocks.items[b as usize];
+        if (blk.insts.items.len == 1 && blk.insts.items[0].op == .Jmp && blk.insts.items[0].t1 != b) {
+            b = blk.insts.items[0].t1;
+        } else {
+            break;
+        }
+        guard += 1;
+    }
+    return b;
+}
+
+pub fn simplify(f: *ir.IRFunc) -> bool {
+    var ch = false;
+    for (f.blocks.items) |*blk| {
+        let n = blk.insts.items.len;
+        if (blk.dead || n == 0) { continue; }
+        let t = &blk.insts.items[n - 1];
+        if (t.op == .Jmp || t.op == .Br) {
+            let n1 = thread(f, t.t1);
+            if (n1 != t.t1) {
+                t.t1 = n1;
+                ch = true;
+            }
+        }
+        if (t.op == .Br) {
+            let n2 = thread(f, t.t2);
+            if (n2 != t.t2) {
+                t.t2 = n2;
+                ch = true;
+            }
+            if (t.t1 == t.t2) {
+                t.op = .Jmp;
+                t.a.k = .None;
+                ch = true;
+            }
+        }
+    }
+    let nb = f.blocks.items.len;
+    let seen = alloc.make(bool, nb + 1);
+    var stack: alloc.Vec(i32) = .{};
+    stack.push(0);
+    seen[0] = true;
+    while (stack.items.len > 0) {
+        let b = stack.pop();
+        let (s, k) = ir.succs(&f.blocks.items[b as usize]);
+        for (0..k) |i| {
+            if (!seen[s[i] as usize]) {
+                seen[s[i] as usize] = true;
+                stack.push(s[i]);
+            }
+        }
+    }
+    for (0..nb) |b| {
+        let blk = &f.blocks.items[b];
+        if (!seen[b] && !blk.dead) {
+            blk.dead = true;
+            blk.insts.truncate(0);
+            ch = true;
+        }
+    }
+    return ch;
+}

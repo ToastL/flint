@@ -1,0 +1,23 @@
+// if (comptime ...): only the taken branch is type-checked
+
+import std.io;
+import std.target;
+
+fn linuxFutex(addr: *u32) -> i32 { return 0; }
+
+fn wait(addr: *u32, v: u32) -> i32 {
+    if (comptime target.os == .linux) {
+        return linuxFutex(addr, v, 1);       // wrong for this signature, but never type-checked here
+    } else if (comptime target.os == .macos) {
+        return 1;
+    } else {
+        let bad: i32 = "not checked either";
+        return bad;
+    }
+}
+
+fn main() -> !void {
+    var w: u32 = 0;
+    let arch = if (comptime target.arch == .aarch64) "arm64" else 42;
+    try io.print("{} {s} {}\n", .{ wait(&w, 1), arch, comptime target.pointer_size * 8 });
+}

@@ -1,0 +1,8 @@
+import std.heap;
+
+fn main() -> !void {
+    var gpa = heap.DebugAllocator.init();
+    let alloc = gpa.allocator();
+    let xs = try alloc.alloc(u8, 16);
+    alloc.free(xs[0..8]);
+}

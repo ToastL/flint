@@ -1,0 +1,1 @@
+can't index *i32: it points at a single item (a pointer to many items is [*]i32)

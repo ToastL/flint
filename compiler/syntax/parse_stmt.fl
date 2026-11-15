@@ -1,0 +1,346 @@
+// syntax.parse_stmt - statements and blocks: let/var, if, while, for, switch, defer,
+// return/break/continue, assignments.
+
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import syntax.parser;
+import syntax.parse_expr;
+import syntax.parse_type;
+
+pub fn letStmt(p: *parser.Parser) -> *ast.Node {
+    let kw = p.next(); // let | var
+    let immutable: i32 = if (text.eq(kw.s, "let")) 1 else 0;
+    if (p.at("(")) { // let (q, r) = divmod(a, b);
+        let lp = p.next();
+        let n = p.mk(.Let, lp);
+        while (!p.at(")")) {
+            let v = p.ident("a variable name");
+            let vn = p.mk(.Name, v);
+            vn.name = v.s;
+            n.add(vn);
+            if (p.accept(",") == null) { break; }
+        }
+        _ = p.expect(")", "')' to close the names");
+        if (n.count() < 2) { diag.at(lp, "destructuring needs at least two names: let (a, b) = ...;"); }
+        n.name = n.at(0).name;
+        n.flag = immutable;
+        if (p.accept(":") != null) { n.a = parse_type.type_(p); }
+        if (p.accept("=") == null) { diag.at(p.cur(), "expected '=' and a tuple value"); }
+        n.b = parse_expr.expr(p);
+        return n;
+    }
+    let name = p.ident("variable name");
+    let n = p.mk(.Let, name);
+    n.name = name.s;
+    n.flag = immutable;
+    if (p.accept(":") != null) { n.a = parse_type.type_(p); }
+    if (p.accept("=") == null) {
+        diag.at(p.cur(), text.f("'{s}' needs a value: every variable must be initialized{s}",
+                                .{name.s, if (n.flag != 0) "" else " (write '= undefined' to fill it in later)"}));
+    }
+    n.b = parse_expr.expr(p);
+    return n;
+}
+
+pub fn parenCond(p: *parser.Parser, kw: []const u8) -> *ast.Node {
+    if (!p.at("(")) { diag.at(p.cur(), text.f("expected '(' after '{s}': conditions are written {s} (cond) {{ ... }}", .{kw, kw})); }
+    _ = p.next();
+    let e = parse_expr.expr(p);
+    _ = p.expect(")", "')' to close the condition");
+    return e;
+}
+
+// An optional |name| after a condition: unwraps an optional. |*name| points at the value inside it
+// instead (only where by_ptr is given).
+pub fn captureP(p: *parser.Parser, by_ptr: ?*i32) -> []const u8 {
+    if (p.accept("|") == null) { return ""; }
+    if (p.at("*")) {
+        let bp = by_ptr orelse diag.at(p.cur(), "an error can't be captured by pointer; write |err|");
+        _ = p.next();
+        bp.* = 1;
+    }
+    let name = p.ident("a capture name").s;
+    _ = p.expect("|", "'|' to close the capture");
+    return name;
+}
+
+pub fn capture(p: *parser.Parser) -> []const u8 { return captureP(p, null); }
+
+fn bodyBlock(p: *parser.Parser, kw: []const u8) -> *ast.Node {
+    if (!p.at("{")) { diag.at(p.cur(), text.f("expected '{{': the body of '{s}' must be a block in braces", .{kw})); }
+    return block(p);
+}
+
+fn ifRest(p: *parser.Parser, t: *token.Token) -> *ast.Node {
+    let n = p.mk(.If, t);
+    n.a = parenCond(p, "if");
+    n.name = captureP(p, &n.flag2);
+    n.b = bodyBlock(p, "if");
+    if (p.accept("else") != null) {
+        n.name2 = capture(p);
+        if (n.name2.len > 0 && p.at("if")) { diag.at(p.cur(), text.f("'else |{s}|' must be followed by a block", .{n.name2})); }
+        if (p.at("if")) {
+            let it = p.next();
+            let b = p.mk(.Block, it);
+            b.add(ifRest(p, it));
+            n.c = b;
+        } else {
+            n.c = bodyBlock(p, "else");
+        }
+    }
+    return n;
+}
+
+// for (items) |item, i| { }   for (items) |*item| { }   for (a..b) |i| { }
+fn forRest(p: *parser.Parser, t: *token.Token, label: []const u8) -> *ast.Node {
+    if (!p.at("(")) { diag.at(p.cur(), "expected '(' after 'for': write for (items) |item| { ... } or for (0..n) |i| { ... }"); }
+    _ = p.next();
+    let start = parse_expr.expr(p);
+    if (p.at("..") || p.at("..=")) {
+        let incl = text.eq(p.next().s, "..=");
+        let end = parse_expr.expr(p);
+        _ = p.expect(")", "')' after the range");
+        _ = p.expect("|", "a capture like |i| after the range");
+        if (p.at("*")) { diag.at(p.cur(), "a range loop variable can't be captured by pointer"); }
+        let v = p.ident("loop variable");
+        if (p.at(",")) { diag.at(p.cur(), "a range loop takes a single variable"); }
+        _ = p.expect("|", "'|' to close the capture");
+        let n = p.mk(.ForRange, t);
+        n.name = v.s;
+        n.a = start;
+        n.b = end;
+        n.flag = if (incl) 1 else 0;
+        n.label = label;
+        n.c = bodyBlock(p, "for");
+        return n;
+    }
+    _ = p.expect(")", "')' after the sequence");
+    _ = p.expect("|", "a capture like |item| or |item, i| after the sequence");
+    let by_ptr = p.accept("*") != null;
+    let v = p.ident("loop variable");
+    let i: ?*token.Token = if (p.accept(",") != null) p.ident("index variable") else null;
+    _ = p.expect("|", "'|' to close the capture");
+    let n = p.mk(.ForEach, t);
+    n.name = v.s;
+    if (i) |it| { n.name2 = it.s; }
+    n.flag = if (by_ptr) 1 else 0;
+    n.a = start;
+    n.label = label;
+    n.c = bodyBlock(p, "for");
+    return n;
+}
+
+// .Tag  .Tag(a, b)  value  lo..=hi  else
+fn pattern(p: *parser.Parser) -> *ast.Node {
+    let t = p.cur();
+    let n = p.mk(.Pattern, t);
+    if (p.accept("else") != null) {
+        n.flag = 3;
+        return n;
+    }
+    if (p.at(".") && p.peek(1).k == .Id) {
+        _ = p.next();
+        n.flag = 2;
+        n.name = p.ident("variant name").s;
+        if (p.accept("(") != null) {
+            while (!p.at(")")) {
+                let c = p.ident("a capture name");
+                let cn = p.mk(.Name, c);
+                cn.name = c.s;
+                n.add(cn);
+                if (p.accept(",") == null) { break; }
+            }
+            _ = p.expect(")", "')' to close the captures");
+        }
+        return n;
+    }
+    n.a = parse_expr.expr(p);
+    if (p.accept("..=") != null) {
+        n.flag = 1;
+        n.b = parse_expr.expr(p);
+    } else if (p.at("..")) {
+        diag.at(p.cur(), "case ranges are inclusive: write 'lo..=hi'");
+    }
+    return n;
+}
+
+// a switch arm body without braces: an assignment, a call, or return/break/continue
+fn armStmt(p: *parser.Parser) -> *ast.Node {
+    let t = p.cur();
+    if (p.accept("return") != null) {
+        let s = p.mk(.Return, t);
+        if (!p.at(",") && !p.at("}")) { s.a = parse_expr.expr(p); }
+        return s;
+    }
+    if (p.at("break") || p.at("continue")) {
+        let brk = p.at("break");
+        _ = p.next();
+        let s = p.mk(if (brk) .Break else .Continue, t);
+        if (p.accept(":") != null) { s.label = p.ident("a loop label").s; }
+        return s;
+    }
+    return simpleStmt(p);
+}
+
+pub fn switchRest(p: *parser.Parser, t: *token.Token, is_expr: bool) -> *ast.Node {
+    let n = p.mk(.Switch, t);
+    n.flag = if (is_expr) 1 else 0;
+    if (!p.at("(")) { diag.at(p.cur(), "expected '(' after 'switch': write switch (value) { ... }"); }
+    _ = p.next();
+    n.a = parse_expr.expr(p);
+    _ = p.expect(")", "')' after the switch value");
+    _ = p.expect("{", "'{' to start the switch cases");
+    while (!p.at("}")) {
+        if (p.cur().k == .Eof) { diag.at(t, "unclosed switch"); }
+        let arm = p.mk(.Arm, p.cur());
+        arm.add(pattern(p));
+        while (p.accept(",") != null) { arm.add(pattern(p)); }
+        _ = p.expect("=>", "'=>' after the case pattern");
+        if (is_expr) {
+            arm.a = parse_expr.expr(p);
+        } else if (p.at("{")) {
+            arm.a = block(p);
+            _ = p.accept(",");
+            n.add(arm);
+            continue;
+        } else {
+            arm.a = armStmt(p);
+        }
+        if (p.accept(",") == null && !p.at("}")) { diag.at(p.cur(), text.f("expected ',' after the case, found {s}", .{parser.desc(p.cur())})); }
+        n.add(arm);
+    }
+    _ = p.expect("}", "");
+    if (n.count() == 0) { diag.at(t, "a switch needs at least one case"); }
+    return n;
+}
+
+pub fn block(p: *parser.Parser) -> *ast.Node {
+    let t = p.expect("{", "");
+    let b = p.mk(.Block, t);
+    while (!p.at("}")) {
+        if (p.cur().k == .Eof) { diag.at(t, "unclosed '{'"); }
+        b.add(stmt(p));
+    }
+    _ = p.expect("}", "");
+    return b;
+}
+
+let ASSIGN_OPS = [_][]const u8 {
+    "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+    "+%=", "-%=", "*%=", "+|=", "-|=", "*|=",
+};
+
+fn noIncr(t: *token.Token) -> noreturn {
+    diag.at(t, text.f("Flint has no '{s}'; write 'x {s}= 1;'", .{t.s, if (t.s[0] == '+') "+" else "-"}));
+}
+
+pub fn simpleStmt(p: *parser.Parser) -> *ast.Node {
+    let t = p.cur();
+    if (t.k == .Id && text.eq(t.s, "_") && p.atN(1, "=")) {
+        _ = p.next();
+        _ = p.next();
+        let d = p.mk(.Discard, t);
+        d.a = parse_expr.expr(p);
+        return d;
+    }
+    if (p.at("++") || p.at("--")) { noIncr(t); }
+    let e = parse_expr.expr(p);
+    for (ASSIGN_OPS) |op| {
+        if (p.at(op)) {
+            let ot = p.next();
+            let n = p.mk(.Assign, ot);
+            n.name = ot.s;
+            n.a = e;
+            n.b = parse_expr.expr(p);
+            return n;
+        }
+    }
+    if (p.at("++") || p.at("--")) { noIncr(p.cur()); }
+    let n = p.mk(.ExprStmt, t);
+    n.a = e;
+    return n;
+}
+
+fn deferBody(p: *parser.Parser, s: *ast.Node) -> *ast.Node {
+    if (p.at("{")) {
+        s.a = block(p);
+        return s;
+    }
+    s.a = simpleStmt(p);
+    p.semi("the deferred statement");
+    return s;
+}
+
+pub fn stmt(p: *parser.Parser) -> *ast.Node {
+    var t = p.cur();
+    var label: []const u8 = "";
+    if (t.k == .Id && p.atN(1, ":") && (p.atN(2, "for") || p.atN(2, "while"))) {
+        label = t.s;
+        _ = p.next();
+        _ = p.next();
+        t = p.cur();
+    }
+    if (p.accept("while") != null) {
+        let n = p.mk(.While, t);
+        n.a = parenCond(p, "while");
+        n.name = captureP(p, &n.flag2);
+        n.label = label;
+        n.b = bodyBlock(p, "while");
+        return n;
+    }
+    if (p.accept("for") != null) { return forRest(p, t, label); }
+    if (p.accept("switch") != null) { return switchRest(p, t, false); }
+    if (p.accept("fallthrough") != null) {
+        let s = p.mk(.Fallthrough, t);
+        p.semi("fallthrough");
+        return s;
+    }
+    if (p.at("let") || p.at("var")) {
+        let s = letStmt(p);
+        p.semi("the declaration");
+        return s;
+    }
+    if (p.at("{")) { return block(p); }
+    if (p.at("unsafe")) { // unsafe { ... }: the only place unchecked operations are allowed
+        _ = p.next();
+        if (!p.at("{")) { diag.at(p.cur(), text.f("expected '{{' after 'unsafe', found {s}", .{parser.desc(p.cur())})); }
+        let b = block(p);
+        b.is_unsafe = true;
+        return b;
+    }
+    if (p.at("comptime") && p.atN(1, "{")) { // comptime { ... }: runs while compiling
+        _ = p.next();
+        let n = p.mk(.Comptime, t);
+        n.flag = 1;
+        n.a = block(p);
+        return n;
+    }
+    if (p.accept("if") != null) { return ifRest(p, t); }
+    if (p.accept("return") != null) {
+        let s = p.mk(.Return, t);
+        if (!p.at(";")) { s.a = parse_expr.expr(p); }
+        p.semi("return");
+        return s;
+    }
+    if (p.at("break") || p.at("continue")) {
+        let brk = p.at("break");
+        _ = p.next();
+        let s = p.mk(if (brk) .Break else .Continue, t);
+        if (p.accept(":") != null) { s.label = p.ident("a loop label").s; }
+        p.semi(if (brk) "break" else "continue");
+        return s;
+    }
+    if (p.at("errdefer")) { // runs only when the function returns an error
+        _ = p.next();
+        let s = p.mk(.Defer, t);
+        s.flag = 1;
+        s.name = capture(p);
+        return deferBody(p, s);
+    }
+    if (p.accept("defer") != null) { return deferBody(p, p.mk(.Defer, t)); }
+    let s = simpleStmt(p);
+    p.semi(if (s.k == .Assign) "the assignment" else "the statement");
+    return s;
+}

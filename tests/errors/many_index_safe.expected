@@ -1,0 +1,1 @@
+indexing [*]i32 (it has no length to check against) is only allowed inside an 'unsafe' block

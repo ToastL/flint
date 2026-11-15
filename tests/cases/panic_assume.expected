@@ -1,0 +1,4 @@
+
+--- stderr
+panic: @assume'd condition is false
+--- exit 101

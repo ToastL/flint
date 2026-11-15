@@ -1,0 +1,7 @@
+import std.io;
+
+fn main() -> !void {
+    var arr: [2]i32 = undefined;
+    let xs: []i32 = &arr;
+    try io.print("{}\n", .{xs.ptr.*});
+}

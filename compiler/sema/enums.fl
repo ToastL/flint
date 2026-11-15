@@ -1,0 +1,191 @@
+// sema.enums - enums as values: variants (with tuple or struct payloads), tags, @tagName, binding
+// a switch case's payload captures, and declaring enum types.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.stmt;
+import sema.globals;
+
+pub fn findVariant(et: *ty.Type, name: []const u8) -> ?*ty.Variant {
+    for (et.variants.items) |*v| { if (text.eq(v.name, name)) { return v; } }
+    return null;
+}
+
+let SHAPE = [_][]const u8 { "", "(...)", " { ... }" };
+
+// kind: 0 = bare (Red), 1 = tuple payload (Circle(2.0)), 2 = struct payload (Rect { w: 1 })
+pub fn enumValue(et: *ty.Type, vname: []const u8, kind: i32, list: []*ast.Node, tok: ?*token.Token) -> b.Val {
+    let vr = findVariant(et, vname) orelse diag.at(tok, text.f("enum {s} has no variant '{s}'", .{et.name, vname}));
+    ty.layout(et, tok);
+    if (kind != vr.kind) {
+        if (vr.kind == 0) { diag.at(tok, text.f("{s}.{s} has no payload; write just {s}.{s}", .{et.name, vname, et.name, vname})); }
+        diag.at(tok, text.f("{s}.{s} needs its payload: {s}.{s}{s}", .{et.name, vname, et.name, vname, SHAPE[vr.kind as usize]}));
+    }
+    if (!et.has_payload) { return b.vInt(et, vr.value); }
+    let a = b.temp(et);
+    b.store(et.tagt.?, a, b.IMM(vr.value));
+    if (vr.kind == 0) { return b.vAgg(et, a, true); }
+    let pt = vr.payload.?;
+    let pa = b.aAdd(a, et.payload_off as i64);
+    let nf = pt.fields.items.len;
+    if (vr.kind == 1) {
+        if (list.len != nf) { diag.at(tok, text.f("{s}.{s} takes {} value(s), got {}", .{et.name, vname, nf, list.len})); }
+        for (0..list.len) |i| {
+            let fd = &pt.fields.items[i];
+            b.storeVal(fd.t, b.aAdd(pa, fd.off as i64), cv.coerce(expr.expr(list[i], fd.t), fd.t, list[i].tok, "payload"));
+        }
+    } else if (vr.kind == 2) {
+        let given = alloc.make(bool, nf + 1);
+        for (list) |f| {
+            var k: ?usize = null;
+            for (0..nf) |j| { if (text.eq(pt.fields.items[j].name, f.name)) { k = j; } }
+            let ki = k orelse diag.at(f.tok, text.f("{s}.{s} has no field '{s}'", .{et.name, vname, f.name}));
+            if (given[ki]) { diag.at(f.tok, text.f("field '{s}' given twice", .{f.name})); }
+            given[ki] = true;
+            let fd = &pt.fields.items[ki];
+            b.storeVal(fd.t, b.aAdd(pa, fd.off as i64), cv.coerce(expr.expr(f.a.?, fd.t), fd.t, f.a.?.tok, text.f("field '{s}'", .{f.name})));
+        }
+        for (0..nf) |j| {
+            if (!given[j]) { diag.at(tok, text.f("missing field '{s}' in {s}.{s}", .{pt.fields.items[j].name, et.name, vname})); }
+        }
+    }
+    return b.vAgg(et, a, true);
+}
+
+pub fn enumTag(v: b.Val) -> ir.Opd {
+    if (v.t.has_payload) { return b.R(b.load(v.t.tagt.?, v.a)); }
+    return b.opdOf(v);
+}
+
+// the variant's name as a str
+pub fn tagName(v: b.Val) -> b.Val {
+    let et = v.t;
+    var tag = enumTag(v);
+    if (tag.k == .Imm) {
+        for (et.variants.items) |*vr| { if (vr.value == tag.v) { return b.strLit(vr.name); } }
+        tag = b.R(b.iconst(tag.v));
+    }
+    let res = b.temp(ty.str_);
+    let join = b.newBlock();
+    for (et.variants.items) |*vr| {
+        let yes = b.newBlock();
+        let no = b.newBlock();
+        b.br(b.R(b.cmp(.EQ, tag, b.IMM(vr.value))), yes, no);
+        b.setBlk(yes);
+        b.copyAgg(ty.str_, res, b.strLit(vr.name).a);
+        b.jmp(join);
+        b.setBlk(no);
+    }
+    b.copyAgg(ty.str_, res, b.strLit("?").a);
+    b.jmp(join);
+    b.setBlk(join);
+    return b.vAgg(ty.str_, res, true);
+}
+
+// .Circle(r) binds r to the payload; .Rect(r) binds r to the payload struct
+pub fn bindCaptures(pat: *ast.Node, vr: *ty.Variant, et: *ty.Type, subj: b.Val) {
+    if (vr.kind == 0) { diag.at(pat.tok, text.f("{s}.{s} has no payload to capture", .{et.name, vr.name})); }
+    let pt = vr.payload.?;
+    let pa = b.aAdd(subj.a, et.payload_off as i64);
+    if (vr.kind == 2) {
+        if (pat.count() != 1) {
+            diag.at(pat.tok, text.f("{s}.{s} has a struct payload: capture it with one name, like .{s}(r)", .{et.name, vr.name, vr.name}));
+        }
+        let c = pat.at(0);
+        if (!text.eq(c.name, "_")) {
+            let v = names.declare(c.name, pt, c.tok, true);
+            v.kind = .Ref;
+            v.reg = b.addrReg(pa);
+        }
+        return;
+    }
+    let nf = pt.fields.items.len;
+    if (pat.count() != nf) {
+        diag.at(pat.tok, text.f("{s}.{s} holds {} value(s), but the pattern captures {}", .{et.name, vr.name, nf, pat.count()}));
+    }
+    for (0..pat.count()) |i| {
+        let c = pat.at(i);
+        if (text.eq(c.name, "_")) { continue; }
+        let fd = &pt.fields.items[i];
+        let fa = b.aAdd(pa, fd.off as i64);
+        if (ty.isAgg(fd.t)) {
+            let v = names.declare(c.name, fd.t, c.tok, true);
+            v.kind = .Ref;
+            v.reg = b.addrReg(fa);
+        } else {
+            let v = stmt.newLocal(c.name, fd.t, c.tok, true);
+            b.store(fd.t, b.aSlot(v.slot, 0), b.R(b.load(fd.t, fa)));
+        }
+    }
+}
+
+// variants, tag values, tag type and payload structs of an enum
+pub fn declareEnum(e: *ast.Node) {
+    let t = names.findStruct(e.name).?;
+    var nv: usize = 0;
+    for (e.list.items) |x| { if (x.k == .Variant) { nv += 1; } }
+    if (nv == 0) { diag.at(e.tok, text.f("enum '{s}' needs at least one variant", .{e.name})); }
+    var next: i64 = 0;
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    for (e.list.items) |vn| {
+        if (vn.k != .Variant) { continue; }
+        for (t.variants.items) |*o| { if (text.eq(o.name, vn.name)) { diag.at(vn.tok, text.f("duplicate variant '{s}'", .{vn.name})); } }
+        var v = @zeroes(ty.Variant);
+        v.name = vn.name;
+        v.tok = vn.tok;
+        v.kind = vn.flag;
+        v.value = if (vn.c) |c| globals.evalConstInt(c, "an enum value") else next;
+        for (t.variants.items) |*o| {
+            if (o.value == v.value) {
+                diag.at(vn.tok, text.f("{s}.{s} has the same value ({}) as {s}.{s}", .{e.name, v.name, v.value, e.name, o.name}));
+            }
+        }
+        next = v.value +% 1;
+        let first = t.variants.items.len == 0;
+        if (first || v.value < lo) { lo = v.value; }
+        if (first || v.value > hi) { hi = v.value; }
+        if (v.kind != 0) {
+            t.has_payload = true;
+            let p = alloc.new(ty.Type);
+            p.k = .Struct;
+            p.name = text.f("{s}.{s}", .{e.name, v.name});
+            for (0..vn.count()) |j| {
+                let f = vn.at(j);
+                var fd = @zeroes(ty.Field);
+                fd.name = if (v.kind == 1) text.f("_{}", .{j}) else f.name;
+                fd.t = names.resolve(if (v.kind == 1) f else f.a.?);
+                fd.tok = f.tok;
+                for (p.fields.items) |*o| { if (text.eq(o.name, fd.name)) { diag.at(f.tok, text.f("duplicate field '{s}'", .{fd.name})); } }
+                p.fields.push(fd);
+            }
+            v.payload = p;
+        }
+        t.variants.push(v);
+    }
+    if (e.b) |tb| {
+        let tg = names.resolve(tb);
+        t.tagt = tg;
+        if (!ty.isInt(tg)) { diag.at(tb.tok, text.f("an enum's tag type must be an integer type, not {s}", .{ty.tname(tg)})); }
+        for (t.variants.items) |*v| {
+            if (cv.truncExt(v.value, tg) != v.value) {
+                diag.at(v.tok, text.f("{s}.{s} = {} doesn't fit in {s}", .{e.name, v.name, v.value, ty.tname(tg)}));
+            }
+        }
+    } else if (lo >= 0) {
+        t.tagt = if (hi < 256) ty.u8_ else if (hi < 65536) ty.u16_ else if (hi <= 0xffffffff) ty.u32_ else ty.u64_;
+    } else {
+        t.tagt = if (lo >= -128 && hi < 128) ty.i8_ else if (lo >= -32768 && hi < 32768) ty.i16_
+                 else if (lo >= -2147483648 && hi <= 2147483647) ty.i32_ else ty.i64_;
+    }
+}

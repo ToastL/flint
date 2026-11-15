@@ -1,0 +1,65 @@
+// Formatted output: format strings are checked against their arguments at compile time.
+
+import std.fmt;
+import std.io;
+import std.mem;
+
+struct Point { x: i32, y: i32 }
+enum Shape { Circle(f64), Square { side: f64 } }
+error Oops { Bad }
+
+fn half(x: i64) -> Oops!i64 {
+    if (x % 2 != 0) { return error.Bad; }
+    return x / 2;
+}
+
+fn main() -> !void {
+    // the default format for each type
+    let p = Point { x: 3, y: -4 };
+    let maybe: ?u8 = 7;
+    let nothing: ?u8 = null;
+    let e: anyerror = error.NotFound;
+    try io.print("{} {} {} {} {} {}\n", .{ 42, -7, 2.5, true, maybe, nothing });
+    try io.print("{} {} {} {any}\n", .{ e, mem.Order.lt, Shape.Circle(1.5), p });
+    try io.print("{!} {!}\n", .{ half(10), half(3) });
+
+    // numbers: bases, characters, precision, scientific
+    let b: u8 = 'z';
+    try io.print("{x} {X} {b} {o} {c} {d}\n", .{ 255, 3054, 5, 8, b, b });
+    try io.print("{d:.3} {d:.0} {e} {e:.2} {}\n", .{ 3.14159, 2.5, 1234.5, 0.000123, 1.0 / 3.0 });
+    let f: f32 = 0.1;
+    try io.print("{} {} {d:.2}\n", .{ f, f * 3, f });
+    try io.print("{} {} {}\n", .{ @minInt(i64), @maxInt(u64), -0.0 });
+
+    // width, alignment and fill
+    try io.print("[{:5}] [{:<5}] [{:^5}] [{:>5}]\n", .{ 42, 42, 42, 42 });
+    try io.print("[{s:5}] [{s:>5}] [{s:^6}] [{s:*^7}]\n", .{ "ab", "ab", "ab", "ab" });
+    try io.print("[{x:0>8}] [{d:_<6}] [{d:8.2}] [{s:3}]\n", .{ 48879, -12, 3.14159, "toolong" });
+
+    // strings, bytes and C strings
+    let s = "hey";
+    let c: cstr = "for C";
+    try io.print("{s} {any} {x} {X} {s}\n", .{ s, s, s, "\x01\xff", c });
+
+    // composite values with {any}
+    let arr = [_]i32 { 1, 2, 3 };
+    let pts = [_]Point { p, .{ x: 0, y: 0 } };
+    let nested = .{ 1, .{ "two", 3.5 }, arr };
+    try io.print("{any} {any} {any}\n", .{ arr, arr[1..], pts });
+    try io.print("{any}\n", .{nested});
+    let empty: []const i32 = &[_]i32 {};
+    try io.print("{any} {any}\n", .{ empty, .{} });
+
+    // braces
+    try io.print("{{}} {{{}}}\n", .{1});
+
+    // into a buffer, through a Writer, and counted
+    var buf: [32]u8 = undefined;
+    let out = try fmt.bufPrint(&buf, "{}-{}", .{ 12, 34 });
+    try io.print("{s} {} {}\n", .{ out, out.len, fmt.count("{}-{}", .{ 12, 34 }) });
+    var tiny: [4]u8 = undefined;
+    if (fmt.bufPrint(&tiny, "{}", .{123456})) |_| {} else |err| { try io.print("too long: {}\n", .{err}); }
+    let w = io.stdout;
+    try w.print("via a writer: {}\n", .{p.x});
+    try w.writeAll("raw bytes\n");
+}

@@ -1,0 +1,7 @@
+var counter: i32 = 0;
+fn bump() -> i32 {
+    counter = 5;
+    return 1;
+}
+let X = comptime bump();
+fn main() {}

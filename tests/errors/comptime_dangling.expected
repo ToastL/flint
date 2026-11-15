@@ -1,0 +1,1 @@
+the value made at compile time points at memory that's gone (a local variable of a function that returned)

@@ -1,0 +1,65 @@
+// Tuples (A, B) are anonymous structs with fields .0, .1, ...; .{ ... } takes its type from context.
+
+import std.io;
+
+struct Point { x: f64, y: f64 = 0 }
+struct Line { from: Point, to: Point }
+
+fn divmod(a: u32, b: u32) -> (u32, u32) {
+    return .{ a / b, a % b };
+}
+
+fn minmax(xs: []const i32) -> (i32, i32, usize) {
+    var lo = xs[0];
+    var hi = xs[0];
+    for (xs) |x| {
+        lo = min(lo, x);
+        hi = max(hi, x);
+    }
+    return .{ lo, hi, xs.len };
+}
+
+fn mid(l: Line) -> Point {
+    return .{ x: (l.from.x + l.to.x) / 2, y: (l.from.y + l.to.y) / 2 };
+}
+
+fn find(xs: []const i32, want: i32) -> ?(usize, i32) {
+    for (xs) |x, i| {
+        if (x == want) { return .{ i, x * 10 }; }
+    }
+    return null;
+}
+
+fn main() -> !void {
+    let (q, r) = divmod(17, 5);
+    try io.print("{} {}\n", .{ q, r });
+    let t = divmod(100, 7);
+    try io.print("{} {}\n", .{ t.0, t.1 });
+
+    let xs = [_]i32 { 4, -2, 9, 0 };
+    let (lo, hi, n) = minmax(&xs);
+    let (_, top, _) = minmax(xs[1..]);
+    try io.print("{} {} {} {}\n", .{ lo, hi, n, top });
+
+    var pair: (i32, (bool, f64)) = .{ 1, .{ true, 2.5 } };
+    pair.1.1 *= 2;
+    pair.0 = 7;
+    try io.print("{} {} {}\n", .{ pair.0, pair.1.0, pair.1.1 });
+
+    let l = Line { from: .{ x: 0, y: 0 }, to: .{ x: 4, y: 8 } };
+    let m = mid(l);
+    try io.print("{} {}\n", .{ m.x, m.y });
+    let p: Point = .{ x: 3 }; // y has a default
+    try io.print("{} {}\n", .{ p.x, p.y });
+
+    let grid: [2][2]u8 = .{ .{ 1, 2 }, .{ 3, 4 } };
+    try io.print("{}\n", .{grid[1][0]});
+
+    if (find(&xs, 9)) |hit| { try io.print("found at {} {}\n", .{ hit.0, hit.1 }); }
+    try io.print("{}\n", .{find(&xs, 5) == null});
+
+    var a: i32 = 1;
+    var b: i32 = 2;
+    let (b2, a2): (i32, i32) = .{ a, b };
+    try io.print("{} {}\n", .{ a2, b2 });
+}

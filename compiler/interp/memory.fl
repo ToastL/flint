@@ -1,0 +1,319 @@
+// interp.memory - the comptime interpreter's memory: a set of regions (one per call frame, string
+// literal, global and function). A pointer is (region << 32) | offset, so every load and store is
+// checked against the region it points into: out-of-bounds accesses, uses of a frame after its
+// function returned, writes to runtime globals and calls to C are errors, not UB. Also the
+// interpreter's error record, and failing with it.
+
+import base.alloc;
+import base.text;
+import syntax.token;
+import ir.ir;
+
+pub error CtFail { Fail }
+
+pub enum CR { None, Frame, Str, Global, Func, Extern, Const }
+
+pub struct Region {
+    kind: CR,
+    sym: []const u8,
+    data: []u8,
+    size: i64,
+    dead: bool,     // a frame whose function returned
+    readonly: bool, // string literals, `let` globals
+    noread: bool,   // a `var` global: its value at run time isn't known now
+    name: []const u8,
+    fn_: ?*ir.IRFunc, // Func
+    why: []const u8,  // Extern: why it can't be called
+}
+
+// a failed evaluation: what went wrong, where, and the calls that led there (innermost first)
+pub struct CtError {
+    msg: []const u8,
+    tok: ?*token.Token,
+    calls: [16]?*token.Token,
+    fns: [16][]const u8,
+    ncalls: i32,
+}
+
+// the call chain, for error notes
+pub struct Frame {
+    f: *ir.IRFunc,
+    call: ?*token.Token, // the call instruction in the caller
+}
+
+pub var MOD: *ir.Module = undefined;
+pub var LOOKUP: fn([]const u8, *[]const u8) -> ?*ir.IRFunc = undefined;
+pub var regs: alloc.Vec(*Region) = @zeroes(alloc.Vec(*Region));
+pub var first_frame: usize = 0; // regions from here on belong to the current run
+pub var steps: i64 = 0;
+pub var ERR: ?*CtError = null;
+pub var depth: usize = 0;
+pub var stack: alloc.Vec(Frame) = @zeroes(alloc.Vec(Frame)); // calls nest at most 1000 deep
+pub var cur_tok: ?*token.Token = null;
+
+// ---------- symbols -> regions (cached across runs: strings, globals and functions don't change) ----------
+
+struct SymEnt {
+    sym: []const u8,
+    region: i32,
+}
+
+var symtab: []SymEnt = @zeroes([]SymEnt);
+var symn: usize = 0;
+
+fn hashStr(s: []const u8) -> u64 {
+    var h: u64 = 1469598103934665603;
+    for (s) |c| { h = (h ^ c as u64) *% 1099511628211; }
+    return h;
+}
+
+pub fn newRegion(kind: CR, size: i64) -> i32 {
+    let r = alloc.new(Region);
+    r.kind = kind;
+    r.size = size;
+    r.data = alloc.make(u8, if (size > 0) size as usize else 1);
+    if (regs.items.len == 0) { regs.push(alloc.new(Region)); } // region 0 is null
+    regs.push(r);
+    return (regs.items.len - 1) as i32;
+}
+
+pub fn mkptr(region: i32, off: i64) -> u64 { return (region as u64 << 32) +% @bitcast(u64, off); }
+
+pub fn symLookup(sym: []const u8) -> i32 {
+    let cap = symtab.len;
+    if (cap == 0) { return 0; }
+    var h = hashStr(sym) & (cap as u64 - 1);
+    while (symtab[h as usize].sym.len > 0) {
+        if (text.eq(symtab[h as usize].sym, sym)) { return symtab[h as usize].region; }
+        h = (h + 1) & (cap as u64 - 1);
+    }
+    return 0;
+}
+
+pub fn symInsert(sym: []const u8, region: i32) {
+    if (2 * (symn + 1) > symtab.len) {
+        let old = symtab;
+        symtab = alloc.make(SymEnt, if (old.len == 0) 256 else old.len * 2);
+        symn = 0;
+        for (old) |*e| { if (e.sym.len > 0) { symInsert(e.sym, e.region); } }
+    }
+    let cap = symtab.len as u64;
+    var h = hashStr(sym) & (cap - 1);
+    while (symtab[h as usize].sym.len > 0) { h = (h + 1) & (cap - 1); }
+    symtab[h as usize] = SymEnt { sym: sym, region: region };
+    symn += 1;
+}
+
+// little-endian bytes
+pub fn putBytes(d: []u8, off: usize, v: u64, n: usize) {
+    var x = v;
+    for (0..n) |i| {
+        d[off + i] = @truncate(u8, x);
+        x >>= 8;
+    }
+}
+
+pub fn getBytes(d: []const u8, off: usize, n: usize) -> u64 {
+    var x: u64 = 0;
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        x = (x << 8) | d[off + i] as u64;
+    }
+    return x;
+}
+
+// fill a global's region from its initial data
+fn initGlobal(r: i32, gi: usize, tok: ?*token.Token) {
+    let g = &MOD.globals.items[gi];
+    let d = regs.items[r as usize].data;
+    switch (g.kind) {
+        .Zero => {}
+        .Fill => { for (0..g.size as usize) |i| { d[i] = 0xAA; } }
+        .Int => { putBytes(d, 0, @bitcast(u64, g.ival), if (g.size < 8) g.size as usize else 8); }
+        .Str => {
+            let s = &MOD.strs.items[g.sidx as usize];
+            let p = mkptr(regionForSym(s.label, false, tok), 0);
+            putBytes(d, 0, p, 8);
+            putBytes(d, 8, s.data.len as u64, 8);
+        }
+        .Data => {
+            for (g.items.items) |di| {
+                var v = @bitcast(u64, di.val);
+                if (di.sym.len > 0) { v = mkptr(regionForSym(di.sym, false, tok), di.val); }
+                putBytes(d, di.off as usize, v, di.size as usize);
+            }
+        }
+    }
+}
+
+fn atoi(s: []const u8) -> usize {
+    var n: usize = 0;
+    for (s) |c| {
+        if (c < '0' || c > '9') { break; }
+        n = n * 10 + (c - '0') as usize;
+    }
+    return n;
+}
+
+pub fn regionForSym(sym: []const u8, got: bool, tok: ?*token.Token) -> i32 {
+    let found = symLookup(sym);
+    if (found != 0) { return found; }
+    if (text.startsWith(sym, "l_fl_str_") && !got) {
+        let s = &MOD.strs.items[atoi(sym[9..])];
+        let r = newRegion(.Str, s.data.len as i64 + 1); // with its NUL, like the emitted data
+        let reg = regs.items[r as usize];
+        for (0..s.data.len) |i| { reg.data[i] = s.data[i]; }
+        reg.readonly = true;
+        reg.sym = sym;
+        reg.name = "a string literal";
+        symInsert(sym, r);
+        return r;
+    }
+    if (!got) {
+        for (0..MOD.globals.items.len) |i| {
+            let g = &MOD.globals.items[i];
+            if (!text.eq(g.sym, sym)) { continue; }
+            let r = newRegion(.Global, g.size as i64);
+            let reg = regs.items[r as usize];
+            reg.sym = g.sym;
+            reg.name = if (g.name.len > 0) g.name else g.sym;
+            reg.readonly = true; // comptime code never changes a runtime global
+            reg.noread = !g.is_const;
+            symInsert(sym, r); // before its data: it may point at itself
+            initGlobal(r, i, tok);
+            return r;
+        }
+    }
+    var why: []const u8 = "";
+    let f = if (got) null else LOOKUP(sym, &why);
+    let r = newRegion(if (f != null) .Func else .Extern, 0);
+    let reg = regs.items[r as usize];
+    reg.sym = sym;
+    reg.fn_ = f;
+    reg.why = why;
+    reg.name = if (f != null && f.?.name.len > 0) f.?.name else if (sym.len > 0 && sym[0] == '_') sym[1..] else sym;
+    if (f != null || got) { symInsert(sym, r); } // a function still being compiled may be ready next time
+    return r;
+}
+
+// ---------- errors ----------
+
+// records the failure (at tok, or the current instruction) and the call chain
+pub fn fail(tok: ?*token.Token, msg: []const u8) -> CtFail {
+    let e = ERR.?;
+    e.msg = msg;
+    e.tok = if (tok != null) tok else cur_tok;
+    e.ncalls = 0;
+    var i = depth;
+    while (i > 1 && e.ncalls < 16) {
+        i -= 1;
+        let fr = &stack.items[i];
+        e.calls[e.ncalls as usize] = fr.call;
+        e.fns[e.ncalls as usize] = if (fr.f.name.len > 0) fr.f.name else fr.f.sym;
+        e.ncalls += 1;
+    }
+    return error.Fail;
+}
+
+// ---------- memory ----------
+
+// the region p points into, checked for n bytes; returns it and the offset
+pub fn memAt(p: u64, n: i64, write: bool) -> CtFail!(*Region, i64) {
+    let ri = p >> 32;
+    let o = @bitcast(i64, p & 0xffffffff);
+    if (p == 0) { return fail(null, "comptime code used a null pointer"); }
+    if (ri == 0 || ri >= regs.items.len as u64) {
+        return fail(null, text.f("comptime code used a pointer that doesn't point at anything (0x{x})", .{p}));
+    }
+    let r = regs.items[ri as usize];
+    if (r.dead) { return fail(null, "comptime code used a pointer to a local variable of a function that already returned"); }
+    if (r.kind == .Func || r.kind == .Extern) {
+        return fail(null, text.f("comptime code read or wrote the memory of '{s}', which is a function", .{r.name}));
+    }
+    if (o + n > r.size) {
+        return fail(null, text.f("comptime code accessed memory out of bounds ({} bytes at offset {} of {s}, which has {})",
+                                 .{n, o, if (r.name.len > 0) r.name else "a value", r.size}));
+    }
+    if (write && r.readonly) {
+        if (r.kind == .Global) { return fail(null, text.f("comptime code can't change the runtime global '{s}'", .{r.name})); }
+        return fail(null, text.f("comptime code wrote to read-only memory ({s})", .{r.name}));
+    }
+    if (!write && r.noread) {
+        return fail(null, text.f("comptime code can't read '{s}': it's a 'var', so its value is only known at run time", .{r.name}));
+    }
+    return .{r, o};
+}
+
+// the bytes at p (n of them), checked; empty for n <= 0
+pub fn memSpan(p: u64, n: i64, write: bool) -> CtFail![]u8 {
+    if (n <= 0) { return alloc.make(u8, 0); }
+    let (r, o) = try memAt(p, n, write);
+    return r.data[o as usize..(o + n) as usize];
+}
+
+pub fn memRead(p: u64, out: []u8) -> CtFail!void {
+    if (out.len == 0) { return; }
+    let src = try memSpan(p, out.len as i64, false);
+    for (0..out.len) |i| { out[i] = src[i]; }
+}
+
+pub fn memWrite(p: u64, in: []const u8) -> CtFail!void {
+    if (in.len == 0) { return; }
+    let dst = try memSpan(p, in.len as i64, true);
+    for (0..in.len) |i| { dst[i] = in[i]; }
+}
+
+// an n-byte little-endian value at p
+pub fn readU(p: u64, n: usize) -> CtFail!u64 {
+    let s = try memSpan(p, n as i64, false);
+    return getBytes(s, 0, n);
+}
+
+pub fn writeU(p: u64, v: u64, n: usize) -> CtFail!void {
+    let s = try memSpan(p, n as i64, true);
+    putBytes(s, 0, v, n);
+}
+
+pub fn loadInt(p: u64, mem: i32) -> CtFail!i64 {
+    let size = (mem & 0x7f) as usize;
+    let sg = (mem & 0x80) != 0;
+    let v = try readU(p, size);
+    if (size < 8) {
+        let sh = (64 - 8 * size) as u64;
+        if (sg) { return @bitcast(i64, v << sh) >> sh; }
+    }
+    return @bitcast(i64, v);
+}
+
+// ---------- frames ----------
+
+pub struct Layout {
+    f: *ir.IRFunc,
+    off: []i64, // slot offsets in the frame region
+    size: i64,
+}
+
+var layouts: alloc.Vec(*Layout) = @zeroes(alloc.Vec(*Layout));
+
+pub fn layoutOf(f: *ir.IRFunc) -> *Layout {
+    var i = layouts.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (layouts.items[i].f == f) { return layouts.items[i]; }
+    }
+    let l = alloc.new(Layout);
+    l.f = f;
+    l.off = alloc.make(i64, f.slots.items.len + 1);
+    var cur: i64 = 0;
+    for (0..f.slots.items.len) |s| {
+        let sl = f.slots.items[s];
+        let al = if (sl.align < 1) 1 else sl.align as i64;
+        cur = (cur + al - 1) / al * al;
+        l.off[s] = cur;
+        cur += sl.size as i64;
+    }
+    l.size = cur;
+    layouts.push(l);
+    return l;
+}

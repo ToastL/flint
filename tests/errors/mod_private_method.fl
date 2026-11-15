@@ -1,0 +1,6 @@
+import mods.priv;
+
+fn main() {
+    let p = priv.Open { x: 1 };
+    _ = p.inner();
+}

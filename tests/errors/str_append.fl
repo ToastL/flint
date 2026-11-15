@@ -1,0 +1,4 @@
+fn main() {
+    var s: []const u8 = "a";
+    s += "b";
+}

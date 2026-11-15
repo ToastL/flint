@@ -1,0 +1,3 @@
+fn main() {
+    if (comptime 1 + 2) { }
+}

@@ -1,0 +1,1 @@
+type mismatch: expected fn(i64) -> i32, found fn(i32) -> i32 for 'g'

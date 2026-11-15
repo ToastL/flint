@@ -1,0 +1,4 @@
+before
+--- stderr
+error: NotANumber
+--- exit 1

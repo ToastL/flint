@@ -1,0 +1,178 @@
+// cimport.clex - tokens of preprocessed C (and of macro bodies).
+
+import base.alloc;
+import base.text;
+
+pub enum CK { Id, Num, Str, Char, P, Eof }
+
+pub struct CTok {
+    k: CK,
+    s: []const u8,   // identifier, punctuator or number text
+    str: []const u8, // string literal bytes
+    cval: i64,       // character literal
+}
+
+fn isDigit(c: u8) -> bool { return c >= '0' && c <= '9'; }
+fn isAlpha(c: u8) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+fn isAlnum(c: u8) -> bool { return isDigit(c) || isAlpha(c); }
+fn isXDigit(c: u8) -> bool { return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+fn isSpace(c: u8) -> bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12; }
+fn lower(c: u8) -> u8 { return if (c >= 'A' && c <= 'Z') c + 32 else c; }
+
+// the byte at i, or 0 past the end
+fn at(s: []const u8, i: usize) -> u8 { return if (i < s.len) s[i] else 0; }
+
+// the escape after a backslash at src[p]; returns the byte value and where it ends
+fn escape(src: []const u8, p0: usize) -> (i64, usize) {
+    var p = p0;
+    var c = at(src, p) as i64;
+    p += 1;
+    switch (c) {
+        'n' => { c = 10; }
+        't' => { c = 9; }
+        'r' => { c = 13; }
+        '0'..='7' => {
+            c -= '0';
+            var i: i32 = 0;
+            while (i < 2 && at(src, p) >= '0' && at(src, p) <= '7') {
+                c = c * 8 + (src[p] - '0') as i64;
+                p += 1;
+                i += 1;
+            }
+        }
+        'x' => {
+            c = 0;
+            while (isXDigit(at(src, p))) {
+                let d = src[p];
+                c = c *% 16 +% (if (isDigit(d)) (d - '0') as i64 else (lower(d) - 'a' + 10) as i64);
+                p += 1;
+            }
+        }
+        'a' => { c = 7; }
+        'b' => { c = 8; }
+        'f' => { c = 12; }
+        'v' => { c = 11; }
+        else => {} // \\ \' \" \?
+    }
+    return .{c, p};
+}
+
+let OPS = [_][]const u8 {
+    "...", "<<=", ">>=", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&",
+    "||", "##", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+};
+
+fn isExpChar(c: u8) -> bool { return c == 'e' || c == 'E' || c == 'p' || c == 'P'; }
+
+// The tokens of src, ending with an Eof token (not counted in the length returned).
+pub fn lex(src: []const u8) -> ([]CTok, usize) {
+    var toks: alloc.Vec(CTok) = .{};
+    var p: usize = 0;
+    var line_start = true;
+    while (p < src.len && src[p] != 0) {
+        let ch = src[p];
+        if (ch == '\n') {
+            line_start = true;
+            p += 1;
+            continue;
+        }
+        if (isSpace(ch)) {
+            p += 1;
+            continue;
+        }
+        if (line_start && ch == '#') { // #pragma and friends
+            while (p < src.len && src[p] != '\n') { p += 1; }
+            continue;
+        }
+        line_start = false;
+        if (ch == '/' && at(src, p + 1) == '/') {
+            while (p < src.len && src[p] != '\n') { p += 1; }
+            continue;
+        }
+        if (ch == '/' && at(src, p + 1) == '*') {
+            p += 2;
+            while (p < src.len && !(src[p] == '*' && at(src, p + 1) == '/')) { p += 1; }
+            if (p < src.len) { p += 2; }
+            continue;
+        }
+        var t = CTok { k: .P, s: "", str: "", cval: 0 };
+        let s = p;
+        if (isAlpha(ch) || ch == '_' || ch == '$') {
+            while (isAlnum(at(src, p)) || at(src, p) == '_' || at(src, p) == '$') { p += 1; }
+            t.k = .Id;
+            t.s = src[s..p];
+        } else if (isDigit(ch) || (ch == '.' && isDigit(at(src, p + 1)))) {
+            let hex = src[s] == '0' && (at(src, s + 1) == 'x' || at(src, s + 1) == 'X');
+            while (true) {
+                let c = at(src, p);
+                if (isAlnum(c) || c == '.' || c == '_') {
+                    p += 1;
+                    continue;
+                }
+                let prev = src[p - 1];
+                if ((c == '+' || c == '-') && isExpChar(prev) && !(hex && (prev == 'e' || prev == 'E'))) {
+                    p += 1;
+                    continue;
+                }
+                break;
+            }
+            t.k = .Num;
+            t.s = src[s..p];
+        } else if (ch == '"' || (ch == 'L' && at(src, p + 1) == '"')) {
+            if (ch == 'L') { p += 1; }
+            p += 1;
+            var buf: text.Buf = .{};
+            while (p < src.len && src[p] != '"') {
+                if (src[p] == '\\') {
+                    let (v, np) = escape(src, p + 1);
+                    buf.byte(@truncate(u8, v));
+                    p = np;
+                } else {
+                    buf.byte(src[p]);
+                    p += 1;
+                }
+            }
+            if (p < src.len) { p += 1; }
+            let n = toks.items.len;
+            if (n > 0 && toks.items[n - 1].k == .Str) { // "a" "b" is one string
+                toks.items[n - 1].str = text.cat(toks.items[n - 1].str, buf.items);
+                continue;
+            }
+            t.k = .Str;
+            t.str = buf.items;
+        } else if (ch == '\'') {
+            p += 1;
+            var v: i64 = 0;
+            while (p < src.len && src[p] != '\'') {
+                var b: i64 = 0;
+                if (src[p] == '\\') {
+                    let (e, np) = escape(src, p + 1);
+                    b = e;
+                    p = np;
+                } else {
+                    b = src[p] as i64;
+                    p += 1;
+                }
+                v = (v << 8) | b;
+            }
+            if (p < src.len) { p += 1; }
+            t.k = .Char;
+            t.cval = v;
+        } else {
+            var len: usize = 1;
+            for (OPS) |o| {
+                if (text.startsWith(src[p..], o)) {
+                    len = o.len;
+                    break;
+                }
+            }
+            t.k = .P;
+            t.s = src[p..p + len];
+            p += len;
+        }
+        toks.push(t);
+    }
+    let n = toks.items.len;
+    toks.push(CTok { k: .Eof, s: "", str: "", cval: 0 });
+    return .{toks.items, n};
+}

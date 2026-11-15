@@ -1,0 +1,5 @@
+bench/*.c.out
+/tmp
+*.o
+build/
+out/

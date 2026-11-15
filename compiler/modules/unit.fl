@@ -1,0 +1,47 @@
+// modules.unit - files (units), their imports, and packages.
+
+import base.alloc;
+import syntax.token;
+import syntax.ast;
+import cimport.ctypes;
+
+pub struct Import {
+    alias: []const u8,  // the name the file uses: `io` for `import std.io;`
+    mpath: []const u8,  // "std.io" ("" for a C header)
+    header: []const u8, // import c "stdio.h" as c: the header ("" for a module)
+    u: ?*Unit,          // the module it names (resolved by the loader)
+    c: ?*ctypes.CHeader, // ... or the C header
+    tok: *token.Token,
+}
+
+pub struct Unit {
+    path: []const u8,   // dotted module path: "std.io", "net.http" (the root file: its stem)
+    file: []const u8,   // where it was read from
+    prefix: []const u8, // symbol prefix: "" for the root module, "net_http__" otherwise
+    dname: []const u8,  // display prefix for its types: "http." ("" for the root module)
+    pkg: ?*Package,
+    is_std: bool,
+    is_root: bool,
+    toks: []token.Token,
+    items: []*ast.Node,
+    imports: alloc.Vec(Import),
+}
+
+// a package's dependency, by the name the package uses for it
+pub struct Dep {
+    name: []const u8,
+    pkg: *Package,
+}
+
+// a package: a directory with a flint.toml (or, without one, the root file's directory)
+pub struct Package {
+    name: []const u8,
+    dir: []const u8,     // the manifest's directory
+    root: []const u8,    // the root source file
+    rootdir: []const u8, // module paths are resolved from here: the root file's directory
+    deps: alloc.Vec(Dep),
+    csrc: alloc.Vec([]const u8),
+    cinc: alloc.Vec([]const u8),
+    cflags: alloc.Vec([]const u8),
+    clink: alloc.Vec([]const u8),
+}

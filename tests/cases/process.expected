@@ -1,0 +1,8 @@
+before
+hi from sh
+status 3
+killed 137
+unset: true
+PATH set: true
+exe path: true
+SpawnFailed

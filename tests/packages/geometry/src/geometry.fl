@@ -1,0 +1,4 @@
+// the root module of the geometry package: `import geometry;`
+pub struct Rect { w: i64, h: i64 }
+
+pub fn area(r: Rect) -> i64 { return r.w * r.h; }

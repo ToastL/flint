@@ -1,0 +1,79 @@
+// Allocators: every allocation goes through an Allocator value, and running out is an error.
+
+import std.heap;
+import std.io;
+import std.mem;
+
+struct Point { x: i32, y: i32 }
+
+// takes an allocator, so it may allocate; the caller owns the result
+fn squares(alloc: mem.Allocator, n: usize) -> mem.AllocError![]u64 {
+    let xs = try alloc.alloc(u64, n);
+    for (xs) |*x, i| { x.* = i * i; }
+    return xs;
+}
+
+fn use(name: str, alloc: mem.Allocator) -> !void {
+    let xs = try squares(alloc, 10);
+    defer alloc.free(xs);
+    let p = try alloc.create(Point);
+    defer alloc.destroy(p);
+    p.* = .{ x: 3, y: 4 };
+    var grown = try alloc.realloc(u64, try alloc.dupe(u64, xs), 20); // dupe, then grow
+    defer alloc.free(grown);
+    grown[19] = 1;
+    let empty = try alloc.alloc(i32, 0);
+    alloc.free(empty);
+    try io.print("{s}: {} {} {} {} {}\n", .{ name, xs[9], p.x + p.y, grown[9], grown.len, empty.len });
+}
+
+fn main() -> !void {
+    try use("c", heap.c_allocator);
+    try use("page", heap.page_allocator);
+
+    // an arena: many allocations, freed together
+    var arena = heap.Arena.init(heap.page_allocator);
+    defer arena.deinit();
+    try use("arena", arena.allocator());
+    let a = arena.allocator();
+    var total: i64 = 0;
+    for (0..10000) |i| {
+        let p = try a.create(Point);
+        p.* = .{ x: i as i32, y: 1 };
+        total += p.x + p.y;
+    }
+    let big = try a.alloc(u8, 100000); // bigger than a chunk
+    big[99999] = 7;
+    try io.print("arena total {} {}\n", .{ total, big[99999] });
+
+    // a fixed buffer: no heap at all, and a clean error when it's full
+    var buf: [256]u8 = undefined;
+    var fb = heap.FixedBuffer.init(&buf);
+    try use("fixed", fb.allocator());
+    let f = fb.allocator();
+    let first = try f.alloc(u8, 100);
+    _ = first;
+    let second = try f.alloc(u8, 100);
+    f.free(second); // the newest allocation is given back
+    let third = try f.alloc(u8, 150);
+    _ = third;
+    if (f.alloc(u8, 10)) |_| {
+        try io.print("unexpected\n", .{});
+    } else |e| {
+        try io.print("fixed buffer full: {}\n", .{e});
+    }
+    fb.reset();
+    let again = try f.alloc(u64, 32);
+    try io.print("after reset {}\n", .{again.len});
+
+    // the debug allocator checks everything, and finds nothing wrong here
+    var gpa = heap.DebugAllocator.init();
+    defer gpa.deinit();
+    try use("debug", gpa.allocator());
+    let d = gpa.allocator();
+    var xs = try d.alloc(i32, 4);
+    xs = try d.realloc(i32, xs, 1000);
+    xs[999] = 5;
+    d.free(xs);
+    try io.print("leaks: {}\n", .{gpa.leakCount()});
+}

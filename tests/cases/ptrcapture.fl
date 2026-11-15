@@ -1,0 +1,53 @@
+// |*v| points at the value inside an optional or error union, so it can be changed in place.
+
+import std.io;
+
+struct Point { x: i32, y: i32 }
+
+fn load(ok: bool) -> !Point {
+    if (!ok) { return error.Missing; }
+    return Point { x: 1, y: 1 };
+}
+
+struct Counter { hits: ?u32 }
+
+fn main() -> !void {
+    var n: ?i32 = 5;
+    if (n) |*v| { v.* += 10; }
+    try io.print("{}\n", .{n.?});
+
+    var p: ?Point = Point { x: 1, y: 2 };
+    if (p) |*q| { q.x = 100; }
+    try io.print("{} {}\n", .{ p.?.x, p.?.y });
+
+    var none: ?Point = null;
+    if (none) |*q| { q.x = 1; } else { try io.print("nothing to change\n", .{}); }
+
+    var r = load(true);
+    if (r) |*pt| { pt.y = -7; } else |err| { try io.print("{}\n", .{err}); }
+    let got = r catch Point { x: 0, y: 0 };
+    try io.print("{}\n", .{got.y});
+
+    var c = Counter { hits: 0 };
+    for (0..3) |i| {
+        if (c.hits) |*h| { h.* += 1; }
+    }
+    try io.print("{}\n", .{c.hits.?});
+
+    var x: i32 = 1;
+    var maybe_ptr: ?*i32 = &x;
+    if (maybe_ptr) |*pp| { pp.*.* = 42; }
+    try io.print("{}\n", .{x});
+
+    var budget: ?u32 = 3;
+    var spent: u32 = 0;
+    while (budget) |*b| {
+        spent += 1;
+        if (b.* == 0) { budget = null; } else { b.* -= 1; }
+    }
+    try io.print("{}\n", .{spent});
+
+    var w: ?f64 = 1.5;
+    let doubled = if (w) |*f| f.* * 2 else 0;
+    try io.print("{}\n", .{doubled});
+}

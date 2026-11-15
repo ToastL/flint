@@ -1,0 +1,83 @@
+// opt.copyprop - copy propagation: "t = mov s" makes later uses of t use s. Globally when both are
+// defined exactly once, and within a block when only t is (until s or t changes).
+
+import base.alloc;
+import ir.ir;
+import opt.opt;
+
+fn replaceUses(in: *ir.Inst, rep: []i32) -> bool {
+    var ch = false;
+    if (in.op == .Call) {
+        for (in.args) |*a| {
+            if (a.k == .Reg && rep[a.v as usize] >= 0) {
+                a.v = rep[a.v as usize] as i64;
+                ch = true;
+            }
+        }
+        return ch;
+    }
+    if (in.a.k == .Reg && rep[in.a.v as usize] >= 0) { in.a.v = rep[in.a.v as usize] as i64; ch = true; }
+    if (in.b.k == .Reg && rep[in.b.v as usize] >= 0) { in.b.v = rep[in.b.v as usize] as i64; ch = true; }
+    if (in.c.k == .Reg && rep[in.c.v as usize] >= 0) { in.c.v = rep[in.c.v as usize] as i64; ch = true; }
+    return ch;
+}
+
+pub fn run(f: *ir.IRFunc) -> bool {
+    opt.count(f);
+    var ch = false;
+    let nv = f.vcls.items.len;
+    let rep = alloc.make(i32, nv + 1);
+    for (0..nv + 1) |i| { rep[i] = -1; }
+    // global: t = mov s, both defined exactly once -> t is always s
+    for (f.blocks.items) |*blk| {
+        if (blk.dead) { continue; }
+        for (blk.insts.items) |*in| {
+            if (in.op == .Mov && in.a.k == .Reg && opt.defcnt[in.dst as usize] == 1 && opt.defcnt[in.a.v as usize] == 1 &&
+                in.dst as i64 != in.a.v) {
+                rep[in.dst as usize] = in.a.v as i32;
+            }
+        }
+    }
+    for (0..nv) |v| {
+        var r = rep[v];
+        var guard: i32 = 0;
+        while (r >= 0 && rep[r as usize] >= 0 && guard < 64) {
+            guard += 1;
+            r = rep[r as usize];
+        }
+        rep[v] = r;
+    }
+    for (f.blocks.items) |*blk| {
+        if (blk.dead) { continue; }
+        for (blk.insts.items) |*in| { ch = replaceUses(in, rep) || ch; }
+    }
+    // block-local: t = mov s (t defined once, s may change later)
+    for (0..nv + 1) |i| { rep[i] = -1; }
+    let live = alloc.make(i32, nv + 1);
+    for (f.blocks.items) |*blk| {
+        if (blk.dead) { continue; }
+        var nl: usize = 0;
+        for (blk.insts.items) |*in| {
+            ch = replaceUses(in, rep) || ch;
+            if (in.dst >= 0) {
+                var k: usize = 0;
+                while (k < nl) {
+                    if (rep[live[k] as usize] == in.dst || live[k] == in.dst) {
+                        rep[live[k] as usize] = -1;
+                        nl -= 1;
+                        live[k] = live[nl];
+                    } else {
+                        k += 1;
+                    }
+                }
+                if (in.op == .Mov && in.a.k == .Reg && opt.defcnt[in.dst as usize] == 1 && in.a.v != in.dst as i64) {
+                    rep[in.dst as usize] = in.a.v as i32;
+                    live[nl] = in.dst;
+                    nl += 1;
+                }
+            }
+        }
+        for (0..nl) |k| { rep[live[k] as usize] = -1; }
+    }
+    return ch;
+}

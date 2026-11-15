@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    let maybe: ?i64 = 5;
+    if (maybe) { try io.print("yes\n", .{}); }
+}

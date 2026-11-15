@@ -1,0 +1,5 @@
+# The release that bootstraps the compiler: version, download URL and sha256 of the tarball.
+# Empty until the first release is published; until then `make` starts from the C compiler (src/).
+version=
+url=
+sha256=

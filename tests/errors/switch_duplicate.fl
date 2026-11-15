@@ -1,0 +1,10 @@
+import std.io;
+
+fn main() -> !void {
+    let x: i64 = 5;
+    switch (x) {
+        1..=10 => try io.print("a\n", .{}),
+        7 => try io.print("b\n", .{}),
+        else => {},
+    }
+}

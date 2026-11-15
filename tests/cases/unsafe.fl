@@ -1,0 +1,39 @@
+// What `unsafe { }` allows (design.md section 6.1), and what it doesn't turn off.
+
+import std.io;
+
+extern union Bits { f: f64, u: u64 }
+
+// the caller promises that p points at n items
+unsafe fn sum(p: [*]const i32, n: usize) -> i64 {
+    var s: i64 = 0;
+    for (0..n) |i| { s += p[i]; }
+    return s;
+}
+
+fn get(x: i32) -> i32 { return x; }
+
+fn main() -> !void {
+    var xs = [_]i32 { 1, 2, 3, 4 };
+    var x: i32 = 7;
+    unsafe {
+        try io.print("sum {}\n", .{sum(&xs, xs.len)});
+        let p: [*]i32 = &xs;
+        (p + 1)[0] = 20;
+        try io.print("many {} {} {}\n", .{ p[1], (p + 3)[0], p[0..2].len });
+        try io.print("unchecked {}\n", .{xs[3]});                       // no bounds check in here
+
+        let raw: *void = &x;
+        let back = @ptrCast(*i32, raw);
+        back.* += 1;
+        let addr = @ptrToInt(back);
+        try io.print("ptr {} {} {}\n", .{ x, @intToPtr(*i32, addr).*, addr == @ptrToInt(&x) });
+
+        let b = Bits { f: 1.0 };
+        try io.print("union {}\n", .{b.u});
+
+        @assume(x == 8);
+        try io.print("wraps {}\n", .{get(2147483647) + 1});              // overflow wraps inside unsafe
+    }
+    try io.print("safe again {}\n", .{@ptrToInt(&x) != 0});
+}

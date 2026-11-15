@@ -1,0 +1,18 @@
+// DebugAllocator.deinit reports what was never freed (on stderr)
+
+import std.heap;
+import std.io;
+
+fn main() -> !void {
+    var gpa = heap.DebugAllocator.init();
+    let alloc = gpa.allocator();
+    let kept = try alloc.alloc(u8, 10);
+    let freed = try alloc.alloc(u8, 20);
+    alloc.free(freed);
+    let point = try alloc.create(i64);
+    _ = kept;
+    _ = point;
+    try io.print("leaks before deinit: {}\n", .{gpa.leakCount()});
+    gpa.deinit();
+    exit(3);
+}

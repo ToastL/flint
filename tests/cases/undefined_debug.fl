@@ -1,0 +1,19 @@
+// flint: -O Debug
+// Debug builds fill `undefined` memory with 0xAA bytes, so reading it by mistake stands out.
+
+import std.io;
+
+struct Rec { id: u32, tag: u8 = undefined, buf: [3]u16 }
+
+var gbuf: [4]u8 = undefined;
+
+fn main() -> !void {
+    var x: u32 = undefined;
+    var big: [300]u8 = undefined;
+    var f: i16 = undefined;
+    let r = Rec { id: 1, buf: undefined };
+    try io.print("{} {} {} {} {}\n", .{ x, big[0], big[299], f, gbuf[3] });
+    try io.print("{} {} {}\n", .{ r.id, r.tag, r.buf[2] });
+    x = 5;
+    try io.print("{}\n", .{x});
+}

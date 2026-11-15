@@ -1,0 +1,1 @@
+give 'm' a type: 'var m: i64 = ...;' (an untyped number is a compile-time constant)

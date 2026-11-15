@@ -1,0 +1,6 @@
+import std.io;
+fn hello() -> i32 {
+    io.print("hi\n", .{}) catch {};
+    return 1;
+}
+fn main() { let x = comptime hello(); }

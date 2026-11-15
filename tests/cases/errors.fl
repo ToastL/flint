@@ -1,0 +1,105 @@
+// Error unions: !T, try, catch, errdefer, error sets, switch on errors.
+
+import std.fmt;
+import std.io;
+import std.mem;
+
+error ConfigError { Missing, Malformed }
+error IoError { NotFound, Denied }
+
+struct Config { port: i64, debug: bool }
+
+var cleanups: i64 = 0;
+
+fn read_file(name: str) -> IoError!str {
+    if (mem.eql(u8, name, "secret.cfg")) { return error.Denied; }
+    if (!mem.eql(u8, name, "app.cfg")) { return IoError.NotFound; }
+    return "port=8080 debug=yes";
+}
+
+fn parse_port(text: str) -> !i64 {
+    let at = mem.find(text, "port=") orelse return error.Missing;
+    let rest = text[at + 5..];
+    let end = mem.find(rest, " ") orelse rest.len;
+    return try fmt.parseInt(i64, rest[0..end], 10);
+}
+
+// errdefer runs only when we leave with an error; defer always runs
+fn load(name: str) -> !Config {
+    defer cleanups += 1;
+    errdefer |e| io.print("  load failed with {}\n", .{e}) catch {};
+    let text = try read_file(name);
+    let port = try parse_port(text);
+    if (port > 65535) { return error.Malformed; }
+    return Config { port: port, debug: mem.contains(text, "debug=yes") };
+}
+
+fn describe(e: anyerror) -> str {
+    return switch (e) {
+        error.NotFound => "no such file",
+        error.Denied => "permission denied",
+        error.NotANumber, error.Overflow => "bad number",
+        else => "something else",
+    };
+}
+
+fn io_only(e: IoError) -> str {
+    switch (e) {
+        .NotFound => return "nf",
+        .Denied => return "dn",
+    }
+}
+
+fn check(n: i64) -> !void {
+    if (n < 0) { return error.Negative; }
+}
+
+fn main() -> !void {
+    // try in a function that returns an error union
+    let cfg = try load("app.cfg");
+    try io.print("port {} debug {} cleanups {}\n", .{ cfg.port, cfg.debug, cleanups });
+
+    // catch with a default value
+    let a = load("missing.cfg") catch Config { port: 0, debug: false };
+    try io.print("default port {} cleanups {}\n", .{ a.port, cleanups });
+
+    // if / else with captures
+    if (load("secret.cfg")) |c| {
+        try io.print("unexpected {}\n", .{c.port});
+    } else |e| {
+        try io.print("else branch: {s} {s}\n", .{ describe(e), @errorName(e) });
+    }
+
+    // catch with a capture and a switch, or a block that leaves
+    for ([_][]const u8 { "7", "x", "99999999999999999999" }) |text| {
+        let n = fmt.parseInt(i64, text, 10) catch |e| switch (e) {
+            error.NotANumber => -1,
+            error.Overflow => -2,
+        };
+        try io.print("toInt {s} {}\n", .{ text, n });
+    }
+    var total: i64 = 0;
+    for ([_][]const u8 { "1", "oops", "2" }) |text| {
+        total += fmt.parseInt(i64, text, 10) catch { continue; };
+    }
+    try io.print("total {}\n", .{total});
+
+    // !void, catch {} to ignore an error on purpose, if-expressions
+    try check(5);
+    check(-1) catch {};
+    let ok = if (check(-3)) |_| "fine" else |e| @errorName(e);
+    try io.print("check {s}\n", .{ok});
+
+    // named error sets: exhaustive switch, qualified and inferred error values
+    try io.print("io {s} {s} {s}\n", .{ io_only(IoError.NotFound), io_only(.Denied), describe(error.Missing) });
+    let e: IoError = error.Denied;
+    try io.print("error values {} {} {} {} {} {}\n", .{ e, e == error.Denied, @sizeOf(IoError), @sizeOf(!void), @sizeOf(!i64), @sizeOf(!Config) });
+
+    // printing an error union shows its value or its error
+    try io.print("unions {!} {!} {!s}\n", .{ fmt.parseFloat(f64, "3.5"), fmt.parseFloat(f64, "nope"), read_file("app.cfg") });
+    try io.print("try in an argument: {}\n", .{try fmt.parseInt(i64, "41", 10) + 1});
+
+    // returning an error from main prints it and exits with status 1
+    _ = try load("nowhere.cfg");
+    try io.print("never reached\n", .{});
+}

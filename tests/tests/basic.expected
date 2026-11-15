@@ -1,0 +1,9 @@
+ok   add adds
+ok   parsing text
+expected 4, found 5
+FAIL a failing check (error.TestExpectedEqual)
+FAIL an error escapes (error.NotANumber)
+panic: index 3 out of bounds (len 3)
+FAIL a panic (panicked)
+2 passed, 3 failed
+--- exit 1

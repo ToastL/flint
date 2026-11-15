@@ -1,0 +1,10 @@
+import std.io;
+
+fn get(x: usize) -> usize { return x; }
+fn main() -> !void {
+    var n = get(1);
+    n -= 1;
+    try io.print("{}\n", .{n});
+    n -= 1;
+    try io.print("{}\n", .{n});
+}

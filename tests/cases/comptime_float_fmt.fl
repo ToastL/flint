@@ -1,0 +1,12 @@
+// floats formatted at compile time keep full f64 precision (the interpreter once used f32 formatting)
+import std.io;
+import std.fmt;
+fn show() -> [32]u8 {
+    var b: [32]u8 = @splat(0);
+    _ = fmt.bufPrint(b[..], "{}", .{0.1 + 0.2}) catch unreachable;
+    return b;
+}
+fn main() -> !void {
+    let s = comptime show();
+    try io.print("{s}\n", .{s[0..19]});
+}

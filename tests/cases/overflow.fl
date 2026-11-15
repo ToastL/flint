@@ -1,0 +1,28 @@
+// Saturating operators, @addWithOverflow & co., and wrapping operators: same result in every mode.
+
+import std.io;
+
+fn get8(x: u8) -> u8 { return x; }
+fn geti8(x: i8) -> i8 { return x; }
+fn get64(x: i64) -> i64 { return x; }
+fn getu64(x: u64) -> u64 { return x; }
+fn main() -> !void {
+    let a: u8 = get8(200);
+    let b: u8 = get8(100);
+    try io.print("sat u8 {} {} {} {} {}\n", .{ a +| b, b -| a, a *| 2, a +| 1, get8(3) -| get8(1) });
+    try io.print("sat i8 {} {} {} {} {} {}\n", .{ geti8(100) +| geti8(100), geti8(-100) +| geti8(-100), geti8(-100) -| geti8(100), geti8(-100) *| geti8(2), geti8(-100) *| geti8(-2), geti8(10) *| geti8(-3) });
+    let big = get64(9223372036854775807);
+    try io.print("sat i64 {} {} {} {}\n", .{ big +| 1, -big -| 2, big *| get64(-2), get64(3) *| 4 });
+    try io.print("sat u64 {} {} {}\n", .{ getu64(18446744073709551615) +| 1, getu64(1) -| 2, getu64(4294967296) *| getu64(4294967296) });
+    var s: u8 = 250;
+    s +|= 10;
+    var d: i8 = -120;
+    d -|= 10;
+    try io.print("sat assign {} {}\n", .{ s, d });
+    let (sum, o1) = @addWithOverflow(a, b);
+    let (diff, o2) = @subWithOverflow(b, get8(50));
+    let (prod, o3) = @mulWithOverflow(get64(3037000500), get64(3037000500));
+    let (p2, o4) = @mulWithOverflow(geti8(-128), geti8(-1));
+    try io.print("with overflow {} {} {} {} {} {} {} {}\n", .{ sum, o1, diff, o2, prod, o3, p2, o4 });
+    try io.print("wrap {} {} {} {}\n", .{ a +% b, b -% a, a *% b, big +% 1 });
+}

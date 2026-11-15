@@ -1,0 +1,7 @@
+import std.io;
+
+fn get(x: i64) -> i64 { return x; }
+fn main() -> !void {
+    try io.print("{}\n", .{get(-9223372036854775807) / get(-1)});
+    try io.print("{}\n", .{get(-9223372036854775807 - 1) / get(-1)});
+}

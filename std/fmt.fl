@@ -1,0 +1,252 @@
+// std.fmt - formatting text, and parsing numbers out of it.
+//
+// A format string is checked against its arguments at compile time:
+//
+//   {}      the default for the argument's type      {s}   a string ([]const u8, cstr)
+//   {d}     a number in decimal                      {c}   a byte (u8) as a character
+//   {x} {X} hex (numbers, or a string's bytes)       {b} {o}  binary, octal
+//   {e}     a float in scientific notation           {*}   a pointer's address
+//   {any}   any value, including structs, arrays and slices
+//   {:>8}  {:<8}  {:^8}  {:0>8}  {d:.2}   width, alignment, fill and precision
+//   {{ }}   literal braces
+
+import std.mem;
+
+extern fn memcpy(dst: [*]u8, src: [*]const u8, n: usize) -> [*]u8;
+extern fn rt_fmt_f64(v: f64, buf: [*]u8) -> usize;
+extern fn rt_fmt_f32(v: f32, buf: [*]u8) -> usize;
+extern fn rt_fmt_f64_prec(v: f64, prec: i64, exp: bool, buf: [*]u8, cap: usize) -> usize;
+extern fn rt_parse_f64(p: [*]const u8, n: usize, ok: *bool) -> f64;
+
+// Why parsing text failed.
+pub error ParseError { NotANumber, Overflow }
+
+// Why writing failed.
+pub error WriteError { WriteFailed, NoSpaceLeft }
+
+// Anything bytes can be written to: stdout, a buffer, an ArrayList(u8), ...
+pub struct Writer {
+    ctx: *void,
+    writeFn: fn(*void, []const u8) -> !void,
+
+    pub fn writeAll(self: Writer, bytes: []const u8) -> !void { return self.writeFn(self.ctx, bytes); }
+
+    pub fn writeByte(self: Writer, b: u8) -> !void {
+        var one: [1]u8 = .{b};
+        return self.writeFn(self.ctx, one[..]);
+    }
+
+    // Formatted output; see fmt.format.
+    pub fn print(self: Writer, comptime f: []const u8, args: anytype) -> !void { @format(self, f, args); }
+}
+
+// Writes into a byte slice you own; error.NoSpaceLeft when it's full.
+pub struct FixedWriter {
+    buf: []u8,
+    pos: usize = 0,
+
+    pub fn writer(self: *Self) -> Writer { return Writer { ctx: self, writeFn: FixedWriter.write }; }
+
+    fn write(ctx: *void, bytes: []const u8) -> !void {
+        unsafe {
+            let self = @ptrCast(*FixedWriter, ctx);
+            if (bytes.len > self.buf.len - self.pos) { return error.NoSpaceLeft; }
+            _ = memcpy(self.buf.ptr + self.pos, bytes.ptr, bytes.len);
+            self.pos += bytes.len;
+        }
+    }
+}
+
+// Counts bytes instead of writing them.
+pub struct CountingWriter {
+    n: usize = 0,
+
+    pub fn writer(self: *Self) -> Writer { return Writer { ctx: self, writeFn: CountingWriter.write }; }
+
+    fn write(ctx: *void, bytes: []const u8) -> !void {
+        unsafe { @ptrCast(*CountingWriter, ctx).n += bytes.len; }
+    }
+}
+
+// How one {} is formatted (the compiler fills this in from the format string).
+pub struct FmtOpts {
+    width: usize = 0,
+    prec: usize = 0,
+    has_prec: bool = false,
+    fill: u8 = ' ',
+    align: u8 = 0, // '<', '>', '^', or 0 for the default (text left, numbers right)
+    base: u8 = 10,
+    upper: bool = false,
+}
+
+pub fn format(w: Writer, comptime f: []const u8, args: anytype) -> !void { @format(w, f, args); }
+
+// The text, written into buf (error.NoSpaceLeft if it doesn't fit): no allocation.
+pub fn bufPrint(buf: []u8, comptime f: []const u8, args: anytype) -> ![]u8 {
+    var fw = FixedWriter { buf: buf };
+    @format(fw.writer(), f, args);
+    return buf[0..fw.pos];
+}
+
+// The text, in memory from `alloc`: the caller frees it.
+pub fn allocPrint(alloc: mem.Allocator, comptime f: []const u8, args: anytype) -> ![]u8 {
+    let buf = try alloc.alloc(u8, count(f, args));
+    var fw = FixedWriter { buf: buf };
+    @format(fw.writer(), f, args);
+    return buf;
+}
+
+// How many bytes the text takes.
+pub fn count(comptime f: []const u8, args: anytype) -> usize {
+    var c = CountingWriter {};
+    countInto(&c, f, args) catch unreachable;
+    return c.n;
+}
+
+fn countInto(c: *CountingWriter, comptime f: []const u8, args: anytype) -> !void { @format(c.writer(), f, args); }
+
+// Parse an integer of type T (base 2 to 36, with an optional leading - or +).
+pub fn parseInt(comptime T: type, text: []const u8, base: u8) -> ParseError!T where @isInt(T) {
+    var i: usize = 0;
+    var neg = false;
+    if (text.len > 0 && (text[0] == '-' || text[0] == '+')) {
+        neg = text[0] == '-';
+        i = 1;
+    }
+    if (i >= text.len || base < 2 || base > 36) { return error.NotANumber; }
+    let b = base as u64;
+    var mag: u64 = 0;
+    while (i < text.len) {
+        let c = text[i];
+        var d: u64 = 99;
+        if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
+        else if (c >= 'a' && c <= 'z') { d = (c - 'a') as u64 + 10; }
+        else if (c >= 'A' && c <= 'Z') { d = (c - 'A') as u64 + 10; }
+        if (d >= b) { return error.NotANumber; }
+        if (mag > (0xffffffffffffffff - d) / b) { return error.Overflow; }
+        mag = mag * b + d;
+        i += 1;
+    }
+    if (neg) {
+        let lim = 0 -% @bitcast(u64, @minInt(T) as i64); // how far below zero T goes
+        if (mag > lim) { return error.Overflow; }
+        return @truncate(T, 0 -% @bitcast(i64, mag));
+    }
+    if (mag > @maxInt(T) as u64) { return error.Overflow; }
+    return @truncate(T, mag);
+}
+
+// Parse a number like "3.14", "-2" or "1e9" (surrounding whitespace is ignored).
+pub fn parseFloat(comptime T: type, text: []const u8) -> ParseError!T where @isFloat(T) {
+    var ok = false;
+    let v = rt_parse_f64(text.ptr, text.len, &ok);
+    if (!ok) { return error.NotANumber; }
+    return v as T;
+}
+
+// ---- what the compiler calls for each {} ----
+
+fn pad(w: Writer, n: usize, fill: u8) -> !void {
+    var buf: [16]u8 = @splat(fill);
+    var left = n;
+    while (left > 0) {
+        let k = if (left < 16) left else 16;
+        try w.writeAll(buf[0..k]);
+        left -= k;
+    }
+}
+
+fn padded(w: Writer, s: []const u8, o: FmtOpts, right: bool) -> !void {
+    if (s.len >= o.width) { return w.writeAll(s); }
+    let gap = o.width - s.len;
+    var a = o.align;
+    if (a == 0) { a = if (right) '>' else '<'; }
+    let before = if (a == '>') gap else if (a == '^') gap / 2 else 0;
+    try pad(w, before, o.fill);
+    try w.writeAll(s);
+    try pad(w, gap - before, o.fill);
+}
+
+fn formatStr(w: Writer, s: []const u8, o: FmtOpts) -> !void {
+    if (o.width == 0) { return w.writeAll(s); }
+    return padded(w, s, o, false);
+}
+
+fn formatCStr(w: Writer, c: cstr, o: FmtOpts) -> !void { return formatStr(w, mem.span(c), o); }
+
+fn formatBool(w: Writer, b: bool, o: FmtOpts) -> !void { return formatStr(w, if (b) "true" else "false", o); }
+
+fn formatByte(w: Writer, b: u8, o: FmtOpts) -> !void {
+    var one: [1]u8 = .{b};
+    return formatStr(w, one[..], o);
+}
+
+// v's digits in base `base`, at the end of buf; returns where they start
+fn digits(buf: []u8, v: u64, base: u8, upper: bool) -> usize {
+    var i = buf.len;
+    var x = v;
+    let b = base as u64;
+    let a: u8 = if (upper) 'A' else 'a';
+    while (true) {
+        let d = @truncate(u8, x % b);
+        i -= 1;
+        buf[i] = if (d < 10) '0' + d else a + d - 10;
+        x = x / b;
+        if (x == 0) { break; }
+    }
+    return i;
+}
+
+fn formatUint(w: Writer, v: u64, o: FmtOpts) -> !void {
+    var buf: [64]u8 = undefined;
+    let start = digits(buf[..], v, o.base, o.upper);
+    return padded(w, buf[start..], o, true);
+}
+
+fn formatInt(w: Writer, v: i64, o: FmtOpts) -> !void {
+    var buf: [65]u8 = undefined;
+    let mag: u64 = if (v < 0) 0 -% @bitcast(u64, v) else @bitcast(u64, v); // right even for the most negative i64
+    var start = digits(buf[..], mag, o.base, o.upper);
+    if (v < 0) {
+        start -= 1;
+        buf[start] = '-';
+    }
+    return padded(w, buf[start..], o, true);
+}
+
+// Floats print like JavaScript by default: the shortest text that reads back exactly.
+fn formatFloat(w: Writer, v: f64, o: FmtOpts) -> !void {
+    var buf: [160]u8 = undefined;
+    var n: usize = 0;
+    if (o.has_prec || o.upper) {
+        n = rt_fmt_f64_prec(v, if (o.has_prec) o.prec as i64 else -1, o.upper, &buf, 160);
+    } else {
+        n = rt_fmt_f64(v, &buf);
+    }
+    return padded(w, buf[0..n], o, true);
+}
+
+fn formatFloat32(w: Writer, v: f32, o: FmtOpts) -> !void {
+    if (o.has_prec || o.upper) { return formatFloat(w, v, o); }
+    var buf: [40]u8 = undefined;
+    let n = rt_fmt_f32(v, &buf);
+    return padded(w, buf[0..n], o, true);
+}
+
+fn formatPtr(w: Writer, v: u64, o: FmtOpts) -> !void {
+    if (v == 0) { return formatStr(w, "null", o); }
+    var buf: [64]u8 = undefined;
+    var start = digits(buf[..], v, 16, false);
+    start -= 2;
+    buf[start] = '0';
+    buf[start + 1] = 'x';
+    return padded(w, buf[start..], o, true);
+}
+
+fn formatHex(w: Writer, s: []const u8, o: FmtOpts) -> !void {
+    let hex = if (o.upper) "0123456789ABCDEF" else "0123456789abcdef";
+    for (s) |b| {
+        var two: [2]u8 = .{ hex[b >> 4], hex[b & 15] };
+        try w.writeAll(two[..]);
+    }
+}

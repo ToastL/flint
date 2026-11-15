@@ -1,0 +1,1 @@
+'TWICE' from mods/cdefs.h can't be used from Flint: it's a function-like macro

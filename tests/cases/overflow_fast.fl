@@ -1,0 +1,15 @@
+// flint: -O ReleaseFast
+// ReleaseFast: overflow wraps (defined), shift amounts are taken mod the width
+
+import std.io;
+
+fn get8(x: u8) -> u8 { return x; }
+fn get32(x: i32) -> i32 { return x; }
+fn get64(x: i64) -> i64 { return x; }
+fn amt(x: u32) -> u32 { return x; }
+fn main() -> !void {
+    try io.print("{} {} {}\n", .{ get8(200) + get8(100), get32(2147483647) + get32(1), get64(-9223372036854775807 - 1) - get64(1) });
+    try io.print("{} {} {}\n", .{ -get32(-2147483647 - 1), get32(-2147483647 - 1) / get32(-1), get64(-9223372036854775807 - 1) / get64(-1) });
+    let one: u32 = 1;
+    try io.print("{} {}\n", .{ one << amt(33), get8(1) << amt(9) as u8 });
+}

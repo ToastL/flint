@@ -1,0 +1,218 @@
+// opt.constprop - constant propagation: a vreg defined once by a constant becomes an immediate
+// where it's used; operations on immediates are folded; x + 0, x * 1 become moves; branches and
+// selects on known conditions are resolved.
+
+import base.alloc;
+import ir.ir;
+import opt.opt;
+
+fn extVal(x: i64, mem: i32) -> i64 {
+    let bits = ((mem & 0x7f) * 8) as u64;
+    if (bits >= 64) { return x; }
+    let m = (@bitcast(u64, 1 as i64) << bits) - 1;
+    var u = @bitcast(u64, x) & m;
+    if ((mem & 0x80) != 0 && (u >> (bits - 1)) != 0) { u |= ~m; }
+    return @bitcast(i64, u);
+}
+
+fn ccEval(cc: ir.CC, a: i64, c: i64) -> bool {
+    let ua = @bitcast(u64, a);
+    let uc = @bitcast(u64, c);
+    switch (cc) {
+        .EQ => { return a == c; }
+        .NE => { return a != c; }
+        .LT => { return a < c; }
+        .LE => { return a <= c; }
+        .GT => { return a > c; }
+        .GE => { return a >= c; }
+        .LO => { return ua < uc; }
+        .LS => { return ua <= uc; }
+        .HI => { return ua > uc; }
+        .HS => { return ua >= uc; }
+        else => { return false; }
+    }
+}
+
+fn umulh(a: u64, c: u64) -> u64 {
+    let al = a & 0xffffffff;
+    let ah = a >> 32;
+    let bl = c & 0xffffffff;
+    let bh = c >> 32;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid = (ll >> 32) + (lh & 0xffffffff) + (hl & 0xffffffff);
+    return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+
+let MIN: i64 = -0x7fffffffffffffff - 1;
+
+// a op b on constants, or null when it can't be folded (division by zero, MIN / -1)
+fn foldBin(op: ir.Op, a: i64, c: i64) -> ?i64 {
+    let ua = @bitcast(u64, a);
+    let uc = @bitcast(u64, c);
+    switch (op) {
+        .Add => { return a +% c; }
+        .Sub => { return a -% c; }
+        .Mul => { return a *% c; }
+        .And => { return a & c; }
+        .Or => { return a | c; }
+        .Xor => { return a ^ c; }
+        .Shl => { return @bitcast(i64, ua << (uc & 63)); }
+        .Asr => { return a >> (uc & 63); }
+        .Lsr => { return @bitcast(i64, ua >> (uc & 63)); }
+        .SDiv => { return if (c == 0 || (a == MIN && c == -1)) null else a / c; }
+        .UDiv => { return if (c == 0) null else @bitcast(i64, ua / uc); }
+        .SRem => { return if (c == 0 || (a == MIN && c == -1)) null else a % c; }
+        .URem => { return if (c == 0) null else @bitcast(i64, ua % uc); }
+        .SMulH => {
+            var h = umulh(ua, uc);
+            if (a < 0) { h -%= uc; }
+            if (c < 0) { h -%= ua; }
+            return @bitcast(i64, h);
+        }
+        .UMulH => { return @bitcast(i64, umulh(ua, uc)); }
+        else => { return null; }
+    }
+}
+
+fn makeConst(in: *ir.Inst, v: i64) {
+    let d = in.dst;
+    in.* = @zeroes(ir.Inst);
+    in.op = .IConst;
+    in.dst = d;
+    in.imm = v;
+    in.slot = -1;
+    in.t1 = -1;
+    in.t2 = -1;
+}
+
+let MIRROR = [_]ir.CC { .EQ, .NE, .GT, .GE, .LT, .LE, .HI, .HS, .LO, .LS, .MI, .PL };
+
+struct State {
+    isc: []bool,
+    cv: []i64,
+    ch: bool,
+
+    // a register operand known to be a constant becomes that immediate
+    fn sub(self: *Self, o: *ir.Opd) -> bool {
+        if (o.k == .Reg && self.isc[o.v as usize]) {
+            o.* = ir.IMM(self.cv[o.v as usize]);
+            self.ch = true;
+            return true;
+        }
+        return false;
+    }
+}
+
+pub fn run(f: *ir.IRFunc) -> bool {
+    opt.count(f);
+    let nv = f.vcls.items.len;
+    var s = State { isc: alloc.make(bool, nv + 1), cv: alloc.make(i64, nv + 1), ch: false };
+    for (f.blocks.items) |*blk| {
+        if (blk.dead) { continue; }
+        for (blk.insts.items) |*in| {
+            if (in.op == .Mov && in.cls == .I && in.a.k == .Imm) {
+                makeConst(in, in.a.v);
+                s.ch = true;
+            }
+            if (in.op == .IConst && opt.defcnt[in.dst as usize] == 1) {
+                s.isc[in.dst as usize] = true;
+                s.cv[in.dst as usize] = in.imm;
+            }
+        }
+    }
+    for (f.blocks.items) |*blk| {
+        if (blk.dead) { continue; }
+        for (blk.insts.items) |*in| {
+            switch (in.op) {
+                .Add, .Mul, .And, .Or, .Xor => {
+                    _ = s.sub(&in.a);
+                    _ = s.sub(&in.b);
+                    if (in.a.k == .Imm && in.b.k == .Reg) {
+                        let t = in.a;
+                        in.a = in.b;
+                        in.b = t;
+                    }
+                    var folded: ?i64 = null;
+                    if (in.a.k == .Imm && in.b.k == .Imm) { folded = foldBin(in.op, in.a.v, in.b.v); }
+                    if (folded) |r| {
+                        makeConst(in, r);
+                        s.ch = true;
+                    } else if (in.b.k == .Imm && (in.op == .Add || in.op == .Or || in.op == .Xor) && in.b.v == 0) {
+                        in.op = .Mov; // x + 0
+                        in.b.k = .None;
+                        s.ch = true;
+                    } else if (in.b.k == .Imm && in.op == .Mul && in.b.v == 1) {
+                        in.op = .Mov;
+                        in.b.k = .None;
+                        s.ch = true;
+                    }
+                }
+                .Sub, .Shl, .Asr, .Lsr, .SDiv, .UDiv, .SRem, .URem, .SMulH, .UMulH => {
+                    _ = s.sub(&in.a);
+                    _ = s.sub(&in.b);
+                    var folded: ?i64 = null;
+                    if (in.a.k == .Imm && in.b.k == .Imm) { folded = foldBin(in.op, in.a.v, in.b.v); }
+                    if (folded) |r| {
+                        makeConst(in, r);
+                        s.ch = true;
+                    } else if (in.b.k == .Imm && in.b.v == 0 && (in.op == .Sub || in.op == .Shl || in.op == .Asr || in.op == .Lsr) && in.a.k == .Reg) {
+                        in.op = .Mov;
+                        in.b.k = .None;
+                        s.ch = true;
+                    }
+                }
+                .Neg, .Not, .Ext => {
+                    if (s.sub(&in.a)) {
+                        let x = in.a.v;
+                        makeConst(in, if (in.op == .Neg) 0 -% x else if (in.op == .Not) ~x else extVal(x, in.mem));
+                    }
+                }
+                .Cmp => {
+                    _ = s.sub(&in.a);
+                    _ = s.sub(&in.b);
+                    if (in.a.k == .Imm && in.b.k == .Imm) {
+                        makeConst(in, if (ccEval(in.mem as ir.CC, in.a.v, in.b.v)) 1 else 0);
+                    } else if (in.a.k == .Imm) {
+                        let t = in.a;
+                        in.a = in.b;
+                        in.b = t;
+                        in.mem = MIRROR[in.mem as usize] as i32;
+                    }
+                }
+                .Mov => {
+                    if (in.cls == .I && s.sub(&in.a)) { makeConst(in, in.a.v); }
+                }
+                .Store => {
+                    if (in.cls == .I) { _ = s.sub(&in.b); }
+                }
+                .Call => {
+                    for (0..in.args.len) |k| { if (in.argcls[k] == .I) { _ = s.sub(&in.args[k]); } }
+                }
+                .Ret => {
+                    if (in.cls == .I) { _ = s.sub(&in.a); }
+                }
+                .Br => {
+                    if (s.sub(&in.a)) {
+                        let t = if (in.a.v != 0) in.t1 else in.t2;
+                        in.op = .Jmp;
+                        in.t1 = t;
+                        in.a.k = .None;
+                    }
+                }
+                .Sel => {
+                    if (s.sub(&in.a)) {
+                        in.op = .Mov;
+                        in.a = if (in.a.v != 0) in.b else in.c;
+                        in.b.k = .None;
+                        in.c.k = .None;
+                    }
+                }
+                else => {}
+            }
+        }
+    }
+    return s.ch;
+}

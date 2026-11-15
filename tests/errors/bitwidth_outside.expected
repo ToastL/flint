@@ -1,0 +1,1 @@
+'u3' can only be the type of a packed struct field (bit fields); use a full-width integer here

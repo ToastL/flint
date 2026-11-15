@@ -1,0 +1,8 @@
+import std.io;
+
+fn get(x: u8) -> u8 { return x; }
+fn main() -> !void {
+    let a = get(200);
+    try io.print("before\n", .{});
+    try io.print("{}\n", .{a + get(100)});
+}

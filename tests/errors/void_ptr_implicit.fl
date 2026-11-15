@@ -1,0 +1,6 @@
+fn main() -> !void {
+    var x: i32 = 1;
+    let v: *void = &x;
+    let back: *i32 = v;
+    _ = back;
+}

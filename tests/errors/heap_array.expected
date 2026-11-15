@@ -1,0 +1,1 @@
+'[a, b, ...]' allocated on the heap, so it was removed: write a stack array [_]T { a, b, ... } (or .{ a, b } where the type is known), or build an ArrayList with an allocator

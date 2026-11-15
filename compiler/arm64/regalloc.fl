@@ -1,0 +1,226 @@
+// arm64.regalloc - linear scan register allocation over live intervals:
+//   - liveness is computed per block with bitsets, then each vreg gets one interval [first live
+//     position, last live position] in layout order
+//   - intervals that span a call only get callee-saved registers (x19-x28, d8-d15); others prefer
+//     caller-saved ones (x9-x15, d16-d28)
+//   - when registers run out, the interval ending furthest away is spilled
+
+import base.alloc;
+import ir.ir;
+import arm64.insn as A;
+
+let INT_CALLER = [_]i32 { 9, 10, 11, 12, 13, 14, 15 };
+let INT_CALLEE = [_]i32 { 19, 20, 21, 22, 23, 24, 25, 26, 27, 28 };
+let FP_CALLER = [_]i32 { 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28 };
+let FP_CALLEE = [_]i32 { 8, 9, 10, 11, 12, 13, 14, 15 };
+
+struct Iv {
+    v: i32,
+    start: i32,
+    end: i32,
+    cross: bool,
+}
+
+fn ivLess(x: *const Iv, y: *const Iv) -> bool {
+    if (x.start != y.start) { return x.start < y.start; }
+    return x.v < y.v;
+}
+
+// sorts by (start, vreg): a merge sort (the keys are unique, so the order is the C compiler's)
+fn sortIvs(a: []Iv) {
+    if (a.len < 2) { return; }
+    let tmp = alloc.make(Iv, a.len);
+    var width: usize = 1;
+    while (width < a.len) {
+        var lo: usize = 0;
+        while (lo < a.len) {
+            let mid = if (lo + width < a.len) lo + width else a.len;
+            let hi = if (lo + 2 * width < a.len) lo + 2 * width else a.len;
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (i < mid && j < hi) {
+                if (ivLess(&a[j], &a[i])) {
+                    tmp[k] = a[j];
+                    j += 1;
+                } else {
+                    tmp[k] = a[i];
+                    i += 1;
+                }
+                k += 1;
+            }
+            while (i < mid) { tmp[k] = a[i]; i += 1; k += 1; }
+            while (j < hi) { tmp[k] = a[j]; j += 1; k += 1; }
+            lo = hi;
+        }
+        for (0..a.len) |x| { a[x] = tmp[x]; }
+        width *= 2;
+    }
+}
+
+fn isCalleeSaved(r: i32, file: usize) -> bool {
+    return if (file == 0) r >= 19 && r <= 28 else r >= 8 && r <= 15;
+}
+
+fn markSaved(r: i32, file: usize) {
+    let list = if (file == 0) &A.saved_int else &A.saved_fp;
+    for (list.items) |x| { if (x == r) { return; } }
+    list.push(r);
+}
+
+fn fileOf(v: i32) -> usize { return if (A.F.vcls.items[v as usize] == .I) 0 else 1; }
+
+pub fn regalloc() {
+    let F = A.F;
+    let nv = F.vcls.items.len;
+    let nb = F.blocks.items.len;
+    var W = (nv + 63) / 64;
+    if (W == 0) { W = 1; }
+    let bstart = alloc.make(i32, nb + 1);
+    let bend = alloc.make(i32, nb + 1);
+    var pos: i32 = 0;
+    for (A.order.items) |b| {
+        bstart[b as usize] = pos;
+        pos += F.blocks.items[b as usize].insts.items.len as i32;
+        bend[b as usize] = pos - 1;
+    }
+    let use = alloc.make(u64, nb * W + 1);
+    let def = alloc.make(u64, nb * W + 1);
+    let lin = alloc.make(u64, nb * W + 1);
+    let lout = alloc.make(u64, nb * W + 1);
+    var u: alloc.Vec(i32) = .{};
+    for (A.order.items) |b| {
+        let bu = b as usize;
+        for (F.blocks.items[bu].insts.items) |*in| {
+            ir.instUses(in, &u);
+            for (u.items) |x| {
+                let w = bu * W + x as usize / 64;
+                let bit = @bitcast(u64, 1 as i64) << (x as u64 % 64);
+                if ((def[w] & bit) == 0) { use[w] |= bit; }
+            }
+            if (in.dst >= 0) { def[bu * W + in.dst as usize / 64] |= @bitcast(u64, 1 as i64) << (in.dst as u64 % 64); }
+        }
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var k = A.order.items.len;
+        while (k > 0) {
+            k -= 1;
+            let b = A.order.items[k] as usize;
+            let (s, ns) = ir.succs(&F.blocks.items[b]);
+            for (0..W) |w| {
+                var o: u64 = 0;
+                for (0..ns) |j| { o |= lin[s[j] as usize * W + w]; }
+                let i2 = use[b * W + w] | (o & ~def[b * W + w]);
+                if (o != lout[b * W + w] || i2 != lin[b * W + w]) { changed = true; }
+                lout[b * W + w] = o;
+                lin[b * W + w] = i2;
+            }
+        }
+    }
+    let start = alloc.make(i32, nv + 1);
+    let end = alloc.make(i32, nv + 1);
+    for (0..nv) |v| {
+        start[v] = 0x7fffffff;
+        end[v] = -1;
+    }
+    var calls: alloc.Vec(i32) = .{};
+    for (A.order.items) |b| {
+        let bu = b as usize;
+        for (0..nv) |v| {
+            let bit = @bitcast(u64, 1 as i64) << (v as u64 % 64);
+            if ((lin[bu * W + v / 64] & bit) != 0) { ext(start, end, v, bstart[bu]); }
+            if ((lout[bu * W + v / 64] & bit) != 0) { ext(start, end, v, bend[bu]); }
+        }
+        let insts = F.blocks.items[bu].insts.items;
+        for (0..insts.len) |i| {
+            let p = bstart[bu] + i as i32;
+            let in = &insts[i];
+            ir.instUses(in, &u);
+            for (u.items) |x| { ext(start, end, x as usize, p); }
+            if (in.dst >= 0) { ext(start, end, in.dst as usize, p); }
+            if (in.op == .Call) { calls.push(p); }
+        }
+    }
+    var ivs: alloc.Vec(Iv) = .{};
+    for (0..nv) |v| {
+        if (end[v] < 0) { continue; }
+        var iv = Iv { v: v as i32, start: start[v], end: end[v], cross: false };
+        for (calls.items) |c| {
+            if (c > iv.start && c < iv.end) {
+                iv.cross = true;
+                break;
+            }
+        }
+        ivs.push(iv);
+    }
+    sortIvs(ivs.items);
+
+    for (0..nv) |v| {
+        A.vreg_reg[v] = -1;
+        A.vreg_off[v] = 0;
+    }
+    var holder: [2][32]i32 = undefined; // register -> interval index holding it
+    for (0..2) |f| { for (0..32) |r| { holder[f][r] = -1; } }
+    let iv = ivs.items;
+    let active = alloc.make(usize, iv.len + 1);
+    var nact: usize = 0;
+    var nspill: i32 = 0;
+    for (0..iv.len) |i| {
+        let cur = &iv[i];
+        let file = fileOf(cur.v);
+        var a: usize = 0;
+        while (a < nact) {
+            let o = &iv[active[a]];
+            if (o.end <= cur.start) {
+                let of = fileOf(o.v);
+                if (A.vreg_reg[o.v as usize] >= 0) { holder[of][A.vreg_reg[o.v as usize] as usize] = -1; }
+                nact -= 1;
+                active[a] = active[nact];
+            } else {
+                a += 1;
+            }
+        }
+        let caller = if (file == 1) FP_CALLER[..] else INT_CALLER[..];
+        let callee = if (file == 1) FP_CALLEE[..] else INT_CALLEE[..];
+        var reg: i32 = -1;
+        if (!cur.cross) {
+            for (caller) |r| { if (reg < 0 && holder[file][r as usize] < 0) { reg = r; } }
+        }
+        for (callee) |r| { if (reg < 0 && holder[file][r as usize] < 0) { reg = r; } }
+        if (reg < 0) {
+            // spill the active interval that ends furthest away, if that beats spilling cur
+            var best: ?usize = null;
+            for (0..nact) |x| {
+                let o = &iv[active[x]];
+                if (fileOf(o.v) != file || A.vreg_reg[o.v as usize] < 0) { continue; }
+                if (cur.cross && !isCalleeSaved(A.vreg_reg[o.v as usize], file)) { continue; }
+                if (best == null || o.end > iv[active[best.?]].end) { best = x; }
+            }
+            if (best != null && iv[active[best.?]].end > cur.end) {
+                let o = &iv[active[best.?]];
+                reg = A.vreg_reg[o.v as usize];
+                A.vreg_reg[o.v as usize] = -1;
+                nspill += 1;
+                A.vreg_off[o.v as usize] = nspill; // resolved to a frame offset later
+                nact -= 1;
+                active[best.?] = active[nact];
+            } else {
+                nspill += 1;
+                A.vreg_off[cur.v as usize] = nspill;
+                continue;
+            }
+        }
+        A.vreg_reg[cur.v as usize] = reg;
+        holder[file][reg as usize] = i as i32;
+        active[nact] = i;
+        nact += 1;
+        if (isCalleeSaved(reg, file)) { markSaved(reg, file); }
+    }
+}
+
+fn ext(start: []i32, end: []i32, v: usize, p: i32) {
+    if (p < start[v]) { start[v] = p; }
+    if (p > end[v]) { end[v] = p; }
+}

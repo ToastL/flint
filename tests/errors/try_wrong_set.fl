@@ -1,0 +1,5 @@
+error A { X }
+error B { Y }
+fn f() -> A!i64 { return error.X; }
+fn g() -> B!i64 { return try f(); }
+fn main() -> !void {}

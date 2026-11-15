@@ -1,0 +1,18 @@
+import std.io;
+
+// @bitcast between a float and an integer of the same size: the same bits, reinterpreted
+fn bits(x: f64) -> u64 { return @bitcast(u64, x); }
+fn fromBits(x: u64) -> f64 { return @bitcast(f64, x); }
+
+fn main() -> !void {
+    try io.print("{x}\n", .{bits(1.0)});
+    try io.print("{x}\n", .{@bitcast(u64, -2.5)});
+    try io.print("{}\n", .{fromBits(0x4000000000000000)});
+    let f: f32 = 1.5;
+    try io.print("{x}\n", .{@bitcast(u32, f)});
+    try io.print("{}\n", .{@bitcast(f32, @bitcast(u32, f))});
+    let z: f64 = -0.0;
+    try io.print("sign bit: {}\n", .{(@bitcast(u64, z) >> 63) == 1});
+    let k = comptime bits(3.0);
+    try io.print("{x}\n", .{k});
+}

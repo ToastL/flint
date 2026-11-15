@@ -1,0 +1,9 @@
+import std.io;
+
+fn main() -> !void {
+    let x: u8 = 5;
+    switch (x) {
+        0..=99 => try io.print("low\n", .{}),
+        101..=255 => try io.print("high\n", .{}),
+    }
+}

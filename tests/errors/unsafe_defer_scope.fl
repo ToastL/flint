@@ -1,0 +1,11 @@
+import std.io;
+
+fn main() -> !void {
+    var arr: [4]i32 = undefined;
+    let xs: []i32 = &arr;
+    let p = xs.ptr;
+    defer io.print("{}\n", .{p[0]}) catch {};
+    unsafe {
+        return;
+    }
+}

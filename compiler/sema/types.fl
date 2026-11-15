@@ -1,0 +1,653 @@
+// sema.types - Flint's types: the Type record, the built-in types, derived types (pointers,
+// slices, optionals, error unions, arrays, vectors, tuples, function types: all interned, so two
+// equal types are the same pointer), layout, names for messages, and flattening aggregates.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import modules.unit;
+import ir.ir;
+import sema.state as st;
+
+pub enum TyKind {
+    Void, Bool, I8, I16, I32, I64, U8, U16, U32, U64,
+    F32, F64, Ptr, Slice, Struct, Null, LitInt, LitFloat, Enum,
+    Opt, NoReturn, ErrSet, ErrUnion, Fn, Array,
+    Type,   // a type, as a compile-time value (its id)
+    Vector, // @Vector(N, T): elem, alen; 8 or 16 bytes
+}
+
+pub struct Field {
+    name: []const u8,
+    t: *Type,
+    off: i32,
+    tok: ?*token.Token,
+    def: ?*ast.Node, // default value, or null
+    bits: i32,       // packed struct: width and position in the backing integer
+    bitoff: i32,
+    sbits: bool,     // packed struct: the field is signed (sign-extended when read)
+}
+
+pub struct Variant {
+    name: []const u8,
+    value: i64,      // the tag
+    kind: i32,       // 0 = no payload, 1 = tuple payload Circle(f32), 2 = struct payload Rect { w: f32 }
+    payload: ?*Type, // anonymous struct holding the payload (fields _0, _1, ... for tuples)
+    tok: ?*token.Token,
+}
+
+pub struct Type {
+    k: TyKind,
+    elem: ?*Type,      // pointee / slice element
+    ptr: ?*Type,       // cached derived types
+    slice: ?*Type,
+    cptr: ?*Type,      // ... and their const-pointee versions
+    cslice: ?*Type,
+    opt: ?*Type,       // ?T
+    eus: ?*Type,       // error unions E!T with this T (a list), and the next in that list
+    eu_next: ?*Type,
+    eset: ?*Type,      // E!T: the error set E
+    errcodes: alloc.Vec(i32), // error set: its errors' global codes
+    all_errors: bool,  // anyerror
+    is_const: bool,    // pointer/slice: the pointee is read-only
+    many: bool,        // [*]T: a pointer to an unknown number of items (indexable)
+    mptr: ?*Type,      // cached [*]T and [*]const T
+    cmptr: ?*Type,
+    params: []*Type,   // fn(...) -> T: parameter types (elem is the result)
+    variadic: bool,
+    alen: i64,         // [N]T: N
+    tuple: bool,       // (A, B): a struct with fields named 0, 1, ...
+    is_packed: bool,      // packed struct: bit fields in one integer (tagt is that integer)
+    is_union: bool,    // extern union: every field at offset 0
+    pbits: i32,        // packed struct: total bits
+    variants: alloc.Vec(Variant), // enums
+    tagt: ?*Type,      // enum tag type (u8, u16, ...)
+    has_payload: bool, // tagged union: { tag, payload }; otherwise a plain integer
+    payload_off: i32,
+    name: []const u8,  // struct name
+    mname: []const u8, // its name in symbols (generic instances, nested and module types)
+    dname: []const u8, // its name in messages, when that differs from `name` (io.Writer)
+    unit: ?*unit.Unit, // the module that declares it
+    is_pub: bool,
+    opaque: bool,      // a C struct Flint can't lay out (no body, bit fields): only usable behind a pointer
+    opaque_why: []const u8,
+    genv: ?*st.TEnv,   // ... and the compile-time bindings its declarations see
+    fields: alloc.Vec(Field),
+    size: i32,
+    align: i32,
+    state: i32,        // struct layout: 0 = todo, 1 = in progress, 2 = done
+    tid: i64,          // its id as a comptime value (0 = none yet)
+
+    pub fn E(self: *const Type) -> *Type { return self.elem.?; }
+}
+
+pub var void_: *Type = undefined;
+pub var bool_: *Type = undefined;
+pub var i8_: *Type = undefined;
+pub var i16_: *Type = undefined;
+pub var i32_: *Type = undefined;
+pub var i64_: *Type = undefined;
+pub var u8_: *Type = undefined;
+pub var u16_: *Type = undefined;
+pub var u32_: *Type = undefined;
+pub var u64_: *Type = undefined;
+pub var f32_: *Type = undefined;
+pub var f64_: *Type = undefined;
+pub var str_: *Type = undefined;
+pub var null_: *Type = undefined;
+pub var litint: *Type = undefined;
+pub var litfloat: *Type = undefined;
+pub var noreturn_: *Type = undefined;
+pub var anyerror: *Type = undefined;
+pub var errlit: *Type = undefined;
+pub var usize_: *Type = undefined;
+pub var isize_: *Type = undefined;
+pub var cstr_: *Type = undefined;
+pub var type_: *Type = undefined;
+
+pub fn mkprim(k: TyKind, size: i32, align: i32) -> *Type {
+    let t = alloc.new(Type);
+    t.k = k;
+    t.size = size;
+    t.align = align;
+    t.state = 2;
+    return t;
+}
+
+pub fn init() {
+    void_ = mkprim(.Void, 0, 1);
+    bool_ = mkprim(.Bool, 1, 1);
+    i8_ = mkprim(.I8, 1, 1);
+    i16_ = mkprim(.I16, 2, 2);
+    i32_ = mkprim(.I32, 4, 4);
+    i64_ = mkprim(.I64, 8, 8);
+    u8_ = mkprim(.U8, 1, 1);
+    u16_ = mkprim(.U16, 2, 2);
+    u32_ = mkprim(.U32, 4, 4);
+    u64_ = mkprim(.U64, 8, 8);
+    f32_ = mkprim(.F32, 4, 4);
+    f64_ = mkprim(.F64, 8, 8);
+    null_ = mkprim(.Null, 8, 8);
+    litint = mkprim(.LitInt, 8, 8);
+    litfloat = mkprim(.LitFloat, 8, 8);
+    noreturn_ = mkprim(.NoReturn, 0, 1);
+    usize_ = mkprim(.U64, 8, 8); // distinct from u64: pointer-sized, 32 to 64 bits
+    usize_.name = "usize";
+    isize_ = mkprim(.I64, 8, 8);
+    isize_.name = "isize";
+    cstr_ = mkprim(.Ptr, 8, 8); // [*]const u8 that promises a NUL terminator: for C
+    cstr_.elem = u8_;
+    cstr_.many = true;
+    cstr_.is_const = true;
+    cstr_.name = "cstr";
+    str_ = sliceOfQ(u8_, true); // a string is just []const u8
+    anyerror = mkprim(.ErrSet, 2, 2);
+    anyerror.name = "anyerror";
+    anyerror.all_errors = true;
+    errlit = mkprim(.ErrSet, 2, 2); // error.X before it meets a set
+    errlit.name = "error";
+    errlit.all_errors = true;
+    type_ = mkprim(.Type, 8, 8);
+}
+
+pub fn ptrTo(t: *Type) -> *Type {
+    if (t.ptr == null) {
+        let p = mkprim(.Ptr, 8, 8);
+        p.elem = t;
+        t.ptr = p;
+    }
+    return t.ptr.?;
+}
+
+pub fn sliceOf(t: *Type) -> *Type {
+    if (t.slice == null) {
+        let s = mkprim(.Slice, 16, 8);
+        s.elem = t;
+        t.slice = s;
+    }
+    return t.slice.?;
+}
+
+pub fn ptrToQ(t: *Type, c: bool) -> *Type {
+    if (!c) { return ptrTo(t); }
+    if (t.cptr == null) {
+        let p = mkprim(.Ptr, 8, 8);
+        p.elem = t;
+        p.is_const = true;
+        t.cptr = p;
+    }
+    return t.cptr.?;
+}
+
+// [*]T / [*]const T
+pub fn manyPtrQ(t: *Type, c: bool) -> *Type {
+    let cached = if (c) t.cmptr else t.mptr;
+    if (cached) |m| { return m; }
+    let p = mkprim(.Ptr, 8, 8);
+    p.elem = t;
+    p.is_const = c;
+    p.many = true;
+    if (c) { t.cmptr = p; } else { t.mptr = p; }
+    return p;
+}
+
+pub fn sliceOfQ(t: *Type, c: bool) -> *Type {
+    if (!c) { return sliceOf(t); }
+    if (t.cslice == null) {
+        let s = mkprim(.Slice, 16, 8);
+        s.elem = t;
+        s.is_const = true;
+        t.cslice = s;
+    }
+    return t.cslice.?;
+}
+
+// ?T: a pointer-sized value (null = 0) for ?*T, otherwise { value, present }
+pub fn optOf(t: *Type) -> *Type {
+    if (t.opt == null) {
+        let o = mkprim(.Opt, 8, 8);
+        o.elem = t;
+        if (t.k != .Ptr && t.k != .Fn) { o.state = 0; } // laid out on demand
+        t.opt = o;
+    }
+    return t.opt.?;
+}
+
+// ?*T, ?[*]T and ?fn(...): null is address 0, so the optional is just the pointer
+pub fn isOptPtr(t: *const Type) -> bool { return t.k == .Opt && (t.E().k == .Ptr || t.E().k == .Fn); }
+
+// E!T: just the u16 error code for !void, otherwise { value, err: u16 }
+pub fn errUnion(set: *Type, t: *Type) -> *Type {
+    var u = t.eus;
+    while (u) |x| {
+        if (x.eset == set) { return x; }
+        u = x.eu_next;
+    }
+    let n = mkprim(.ErrUnion, 2, 2);
+    n.elem = t;
+    n.eset = set;
+    if (t.k != .Void) { n.state = 0; } // laid out on demand
+    n.eu_next = t.eus;
+    t.eus = n;
+    return n;
+}
+
+pub fn errOff(eu: *const Type) -> i32 { return (eu.E().size + 1) & ~1; }
+
+fn kindIn(k: TyKind, lo: TyKind, hi: TyKind) -> bool { return k as i32 >= lo as i32 && k as i32 <= hi as i32; }
+
+pub fn isInt(t: *const Type) -> bool { return kindIn(t.k, .I8, .U64) || t.k == .LitInt; }
+pub fn isFloat(t: *const Type) -> bool { return t.k == .F32 || t.k == .F64 || t.k == .LitFloat; }
+pub fn isNum(t: *const Type) -> bool { return isInt(t) || isFloat(t); }
+pub fn isSigned(t: *const Type) -> bool { return kindIn(t.k, .I8, .I64) || t.k == .LitInt; }
+pub fn isLit(t: *const Type) -> bool { return t.k == .LitInt || t.k == .LitFloat; }
+pub fn isPtr(t: *const Type) -> bool { return t.k == .Ptr; }
+pub fn isSlice(t: *const Type) -> bool { return t.k == .Slice; }
+pub fn isMany(t: *const Type) -> bool { return t.k == .Ptr && t.many; }
+pub fn isFn(t: *const Type) -> bool { return t.k == .Fn; }
+pub fn isArray(t: *const Type) -> bool { return t.k == .Array || t.k == .Vector; } // a vector indexes like an array
+pub fn isVector(t: *const Type) -> bool { return t.k == .Vector; }
+pub fn isArrayPtr(t: *const Type) -> bool { return t.k == .Ptr && !t.many && t.E().k == .Array; }
+pub fn isAgg(t: *const Type) -> bool {
+    return t.k == .Slice || t.k == .Struct || t.k == .Array || t.k == .Vector || (t.k == .Enum && t.has_payload) ||
+           (t.k == .Opt && t.E().k != .Ptr && t.E().k != .Fn) || (t.k == .ErrUnion && t.E().k != .Void);
+}
+pub fn isBytes(t: *const Type) -> bool { return t.k == .Slice && t.E().k == .U8; } // []u8 or []const u8: a string
+pub fn isPlainEnum(t: *const Type) -> bool { return t.k == .Enum && !t.has_payload; }
+
+fn nameOr(t: *const Type) -> []const u8 { return if (t.dname.len > 0) t.dname else t.name; }
+
+// the type as messages show it
+pub fn tname(t: *Type) -> []const u8 {
+    if (t == usize_ || t == isize_ || t == cstr_) { return t.name; }
+    switch (t.k) {
+        .Void => { return "void"; }
+        .Bool => { return "bool"; }
+        .I8 => { return "i8"; }
+        .I16 => { return "i16"; }
+        .I32 => { return "i32"; }
+        .I64 => { return "i64"; }
+        .U8 => { return "u8"; }
+        .U16 => { return "u16"; }
+        .U32 => { return "u32"; }
+        .U64 => { return "u64"; }
+        .F32 => { return "f32"; }
+        .F64 => { return "f64"; }
+        .Ptr => { return text.f("{s}{s}{s}", .{if (t.many) "[*]" else "*", if (t.is_const) "const " else "", tname(t.E())}); }
+        .Slice => { return text.f("[]{s}{s}", .{if (t.is_const) "const " else "", tname(t.E())}); }
+        .Struct, .Enum, .ErrSet => { return nameOr(t); }
+        .Opt => { return text.f("?{s}", .{tname(t.E())}); }
+        .NoReturn => { return "noreturn"; }
+        .ErrUnion => {
+            if (t.eset.?.all_errors) { return text.f("!{s}", .{tname(t.E())}); }
+            return text.f("{s}!{s}", .{tname(t.eset.?), tname(t.E())});
+        }
+        .Array => { return text.f("[{}]{s}", .{t.alen, tname(t.E())}); }
+        .Fn => {
+            var s: []const u8 = "fn(";
+            for (0..t.params.len) |i| { s = text.f("{s}{s}{s}", .{s, if (i > 0) ", " else "", tname(t.params[i])}); }
+            if (t.variadic) { s = text.f("{s}{s}...", .{s, if (t.params.len > 0) ", " else ""}); }
+            s = text.f("{s})", .{s});
+            return if (t.E() == void_) s else text.f("{s} -> {s}", .{s, tname(t.E())});
+        }
+        .Null => { return "null"; }
+        .LitInt => { return "integer literal"; }
+        .LitFloat => { return "float literal"; }
+        .Type => { return "type"; }
+        .Vector => { return text.f("@Vector({}, {s})", .{t.alen, tname(t.E())}); }
+    }
+}
+
+// types as comptime values: a type's id indexes this table
+var type_tab: alloc.Vec(*Type) = @zeroes(alloc.Vec(*Type));
+
+pub fn typeId(t: *Type) -> i64 {
+    if (t.tid == 0) {
+        type_tab.push(t);
+        t.tid = type_tab.items.len as i64;
+    }
+    return t.tid;
+}
+
+pub fn typeFromId(id: i64) -> ?*Type {
+    if (id >= 1 && id <= type_tab.items.len as i64) { return type_tab.items[(id - 1) as usize]; }
+    return null;
+}
+
+pub fn defaultT(t: *Type) -> *Type {
+    if (t.k == .LitInt) { return i64_; }
+    if (t.k == .LitFloat) { return f64_; }
+    return t;
+}
+
+pub fn clsOf(t: *const Type) -> ir.Cls {
+    if (t.k == .F32) { return .F32; }
+    if (t.k == .F64 || t.k == .LitFloat) { return .F64; }
+    return .I;
+}
+
+pub fn memcode(t: *Type) -> i32 {
+    if (t.k == .Enum) { return memcode(t.tagt.?); }
+    if (isInt(t)) { return defaultT(t).size | (if (isSigned(t)) 0x80 else 0); }
+    return t.size;
+}
+
+// tagged union: { tag, payload } with the payload at the largest payload alignment
+fn layoutEnum(t: *Type, tok: ?*token.Token) {
+    if (t.state == 2) { return; }
+    if (t.state == 1) { diag.at(tok, text.f("enum '{s}' contains itself by value (use a pointer)", .{t.name})); }
+    t.state = 1;
+    let tg = t.tagt.?;
+    var al = tg.align;
+    var pal: i32 = 1;
+    var maxsz: i32 = 0;
+    for (t.variants.items) |*v| {
+        let p = v.payload orelse continue;
+        layout(p, v.tok);
+        if (p.align > pal) { pal = p.align; }
+        if (p.size > maxsz) { maxsz = p.size; }
+    }
+    if (!t.has_payload) {
+        t.size = tg.size;
+        t.align = tg.align;
+    } else {
+        if (pal > al) { al = pal; }
+        t.payload_off = (tg.size + pal - 1) / pal * pal;
+        t.size = (t.payload_off + maxsz + al - 1) / al * al;
+        t.align = al;
+    }
+    t.state = 2;
+}
+
+pub fn layout(t: *Type, tok: ?*token.Token) {
+    if (t.opaque) { diag.at(tok, text.f("{s} can only be used behind a pointer ({s})", .{tname(t), t.opaque_why})); }
+    if (t.k == .Enum) {
+        layoutEnum(t, tok);
+        return;
+    }
+    if (t.k == .Array) {
+        if (t.state == 2) { return; }
+        let e = t.E();
+        layout(e, tok);
+        if (e.size != 0 && t.alen > (0x7fffffff / e.size) as i64) { diag.at(tok, text.f("{s} is too big", .{tname(t)})); }
+        t.size = (t.alen * e.size as i64) as i32;
+        t.align = e.align;
+        t.state = 2;
+        return;
+    }
+    if (t.k == .ErrUnion) { // { value, err }
+        if (t.state == 2) { return; }
+        layout(t.E(), tok);
+        let al: i32 = if (t.E().align > 2) t.E().align else 2;
+        t.size = (errOff(t) + 2 + al - 1) / al * al;
+        t.align = al;
+        t.state = 2;
+        return;
+    }
+    if (t.k == .Opt) { // { value, present }
+        if (t.state == 2) { return; }
+        layout(t.E(), tok);
+        let al: i32 = if (t.E().align != 0) t.E().align else 1;
+        t.size = (t.E().size + 1 + al - 1) / al * al;
+        t.align = al;
+        t.state = 2;
+        return;
+    }
+    if (t.k != .Struct || t.state == 2) { return; }
+    if (t.state == 1) {
+        diag.at(tok, text.f("struct '{s}' contains itself by value (use a pointer: *{s})", .{t.name, t.name}));
+    }
+    t.state = 1;
+    if (t.is_packed) { // fields at bit offsets, first field in the lowest bits (like C bitfields)
+        var off: i32 = 0;
+        for (t.fields.items) |*f| {
+            layout(f.t, f.tok);
+            if (f.bits == 0) {
+                let ft = f.t;
+                if (ft == bool_) {
+                    f.bits = 1;
+                } else if (isInt(ft)) {
+                    f.bits = ft.size * 8;
+                    f.sbits = isSigned(ft);
+                } else if (ft.k == .Enum && !ft.has_payload) {
+                    f.bits = ft.tagt.?.size * 8;
+                    f.sbits = isSigned(ft.tagt.?);
+                } else if (ft.k == .Struct && ft.is_packed) {
+                    f.bits = ft.pbits;
+                } else {
+                    diag.at(f.tok, text.f("a packed struct field must be an integer, bool, plain enum or packed struct, not {s}", .{tname(ft)}));
+                }
+            }
+            f.off = 0;
+            f.bitoff = off;
+            off += f.bits;
+            if (off > 64) { diag.at(f.tok, text.f("packed struct '{s}' needs more than 64 bits (it can't be bigger than u64)", .{t.name})); }
+        }
+        t.pbits = off;
+        let tg = if (off <= 8) u8_ else if (off <= 16) u16_ else if (off <= 32) u32_ else u64_;
+        t.tagt = tg;
+        t.size = tg.size;
+        t.align = tg.size;
+        t.state = 2;
+        return;
+    }
+    if (t.is_union) { // every field at offset 0
+        var sz: i32 = 0;
+        var al: i32 = 1;
+        for (t.fields.items) |*f| {
+            layout(f.t, f.tok);
+            f.off = 0;
+            if (f.t.size > sz) { sz = f.t.size; }
+            if (f.t.align > al) { al = f.t.align; }
+        }
+        t.size = if (sz != 0) (sz + al - 1) / al * al else 1;
+        t.align = al;
+        t.state = 2;
+        return;
+    }
+    var off: i32 = 0;
+    var al: i32 = 1;
+    for (t.fields.items) |*f| {
+        layout(f.t, f.tok);
+        let a = f.t.align;
+        off = (off + a - 1) / a * a;
+        f.off = off;
+        off += f.t.size;
+        if (a > al) { al = a; }
+    }
+    if (off == 0) { off = 1; }
+    t.size = (off + al - 1) / al * al;
+    t.align = al;
+    t.state = 2;
+}
+
+// function types are interned, so two equal signatures are the same Type
+var fntys: alloc.Vec(*Type) = @zeroes(alloc.Vec(*Type));
+
+pub fn fnType(pt: []const *Type, ret: *Type, variadic: bool) -> *Type {
+    for (fntys.items) |t| {
+        if (t.params.len != pt.len || t.elem != ret || t.variadic != variadic) { continue; }
+        var k: usize = 0;
+        while (k < pt.len && t.params[k] == pt[k]) { k += 1; }
+        if (k == pt.len) { return t; }
+    }
+    let t = mkprim(.Fn, 8, 8);
+    t.params = alloc.dupe(*Type, pt);
+    t.elem = ret;
+    t.variadic = variadic;
+    fntys.push(t);
+    return t;
+}
+
+var arrtys: alloc.Vec(*Type) = @zeroes(alloc.Vec(*Type)); // interned [N]T types
+
+pub fn arrayOf(e: *Type, n: i64) -> *Type {
+    for (arrtys.items) |t| { if (t.elem == e && t.alen == n) { return t; } }
+    let t = mkprim(.Array, 0, 1);
+    t.elem = e;
+    t.alen = n;
+    t.state = 0; // laid out on demand: the element may not be laid out yet
+    arrtys.push(t);
+    return t;
+}
+
+var vectys: alloc.Vec(*Type) = @zeroes(alloc.Vec(*Type)); // interned @Vector(N, T) types
+
+pub fn vectorOf(e: *Type, n: i64) -> *Type {
+    for (vectys.items) |t| { if (t.elem == e && t.alen == n) { return t; } }
+    let total = (n * e.size as i64) as i32;
+    let t = mkprim(.Vector, total, total);
+    t.elem = e;
+    t.alen = n;
+    vectys.push(t);
+    return t;
+}
+
+var tuptys: alloc.Vec(*Type) = @zeroes(alloc.Vec(*Type)); // interned tuple types
+
+pub fn tupleOf(ts: []const *Type) -> *Type {
+    for (tuptys.items) |t| {
+        if (t.fields.items.len != ts.len) { continue; }
+        var k: usize = 0;
+        while (k < ts.len && t.fields.items[k].t == ts[k]) { k += 1; }
+        if (k == ts.len) { return t; }
+    }
+    let t = alloc.new(Type);
+    t.k = .Struct;
+    t.tuple = true;
+    var name: []const u8 = "(";
+    for (0..ts.len) |i| {
+        var f = @zeroes(Field);
+        f.name = text.f("{}", .{i});
+        f.t = ts[i];
+        t.fields.push(f);
+        name = text.f("{s}{s}{s}", .{name, if (i > 0) ", " else "", tname(ts[i])});
+    }
+    t.name = text.f("{s})", .{name});
+    tuptys.push(t);
+    return t;
+}
+
+// u3, i12, ...: a width that isn't 8/16/32/64, allowed only in packed structs. Returns the width
+// (0 if it isn't one) and whether it's signed.
+pub fn bitwidthName(s: []const u8) -> (i32, bool) {
+    if (s.len < 2 || (s[0] != 'u' && s[0] != 'i')) { return .{0, false}; }
+    var w: i32 = 0;
+    for (s[1..]) |c| {
+        if (c < '0' || c > '9' || w > 64) { return .{0, false}; }
+        w = w * 10 + (c - '0') as i32;
+    }
+    if (s[1] == '0' || w < 1 || w > 64 || w == 8 || w == 16 || w == 32 || w == 64) { return .{0, false}; }
+    return .{w, s[0] == 'i'};
+}
+
+pub fn primType(name: []const u8) -> ?*Type {
+    if (text.eq(name, "void")) { return void_; }
+    if (text.eq(name, "bool")) { return bool_; }
+    if (text.eq(name, "i8")) { return i8_; }
+    if (text.eq(name, "i16")) { return i16_; }
+    if (text.eq(name, "i32")) { return i32_; }
+    if (text.eq(name, "i64")) { return i64_; }
+    if (text.eq(name, "u8")) { return u8_; }
+    if (text.eq(name, "u16")) { return u16_; }
+    if (text.eq(name, "u32")) { return u32_; }
+    if (text.eq(name, "u64")) { return u64_; }
+    if (text.eq(name, "f32")) { return f32_; }
+    if (text.eq(name, "f64")) { return f64_; }
+    if (text.eq(name, "str")) { return str_; }
+    if (text.eq(name, "anyerror")) { return anyerror; }
+    if (text.eq(name, "usize")) { return usize_; }
+    if (text.eq(name, "isize")) { return isize_; }
+    if (text.eq(name, "cstr")) { return cstr_; }
+    if (text.eq(name, "noreturn")) { return noreturn_; }
+    return null;
+}
+
+pub struct Leaf {
+    off: i32,
+    t: *Type,
+}
+
+fn byteLeaves(size: i32, base: i32, out: *alloc.Vec(Leaf), max: usize) -> bool {
+    var off: i32 = 0;
+    while (off < size) {
+        let rem = size - off;
+        let ct = if (rem >= 8) u64_ else if (rem >= 4) u32_ else if (rem >= 2) u16_ else u8_;
+        if (out.items.len + 1 > max) { return false; }
+        out.push(Leaf { off: base + off, t: ct });
+        off += ct.size;
+    }
+    return true;
+}
+
+// Flattens an aggregate into its scalar pieces (appended to out). False if more than max.
+pub fn leaves(t: *Type, base: i32, out: *alloc.Vec(Leaf), max: usize) -> bool {
+    switch (t.k) {
+        .Slice => {
+            if (out.items.len + 2 > max) { return false; }
+            out.push(Leaf { off: base, t: ptrTo(t.E()) });
+            out.push(Leaf { off: base + 8, t: usize_ });
+            return true;
+        }
+        .Vector => { // its bytes, as 64-bit pieces
+            var off: i32 = 0;
+            while (off < t.size) {
+                if (out.items.len + 1 > max) { return false; }
+                out.push(Leaf { off: base + off, t: u64_ });
+                off += 8;
+            }
+            return true;
+        }
+        .Array => {
+            layout(t, null);
+            if (t.alen > max as i64) { return false; }
+            var i: i64 = 0;
+            while (i < t.alen) {
+                if (!leaves(t.E(), base + i as i32 * t.E().size, out, max)) { return false; }
+                i += 1;
+            }
+            return true;
+        }
+        .Struct => {
+            layout(t, null);
+            if (t.is_packed) { // one integer
+                if (out.items.len + 1 > max) { return false; }
+                out.push(Leaf { off: base, t: t.tagt.? });
+                return true;
+            }
+            if (t.is_union) { return byteLeaves(t.size, base, out, max); } // overlapping fields: copy the bytes
+            for (t.fields.items) |*f| {
+                if (!leaves(f.t, base + f.off, out, max)) { return false; }
+            }
+            return true;
+        }
+        .ErrUnion => {
+            if (t.E() != void_) {
+                layout(t, null);
+                if (!leaves(t.E(), base, out, max) || out.items.len + 1 > max) { return false; }
+                out.push(Leaf { off: base + errOff(t), t: u16_ });
+                return true;
+            }
+        }
+        .Opt => {
+            if (!isOptPtr(t)) {
+                layout(t, null);
+                if (!leaves(t.E(), base, out, max) || out.items.len + 1 > max) { return false; }
+                out.push(Leaf { off: base + t.E().size, t: bool_ });
+                return true;
+            }
+        }
+        .Enum => {
+            if (t.has_payload) { // a union: copy its bytes, not its fields
+                layout(t, null);
+                return byteLeaves(t.size, base, out, max);
+            }
+        }
+        else => {}
+    }
+    if (out.items.len + 1 > max) { return false; }
+    out.push(Leaf { off: base, t: t });
+    return true;
+}

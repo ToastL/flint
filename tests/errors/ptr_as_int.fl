@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    var x: i32 = 1;
+    try io.print("{}\n", .{&x as u64});
+}

@@ -1,0 +1,1 @@
+template literals were removed because they allocate behind your back; use fmt.allocPrint(alloc, "...{}...", .{x}), fmt.bufPrint(&buf, ...) or io.print(...)

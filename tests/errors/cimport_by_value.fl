@@ -1,0 +1,5 @@
+import c "mods/cdefs.h" as c;
+
+fn main() {
+    _ = c.make_pair(1);
+}

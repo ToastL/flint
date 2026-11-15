@@ -1,0 +1,4 @@
+fn main() -> !void {
+    let n: ?i32 = 1;
+    if (n) |*v| { v.* = 2; }
+}

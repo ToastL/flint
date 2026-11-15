@@ -1,0 +1,318 @@
+// sema.convert - conversions between types: implicit coercions (the complete list is in the
+// design, section 3.11), widening, `as` for numbers, error unions and optionals as values, and
+// error codes.
+
+import base.text;
+import base.diag;
+import syntax.token;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+
+// C's (int64_t)d on ARM64 (fcvtzs): saturating, NaN is 0
+pub fn f2i(d: f64) -> i64 {
+    if (d != d) { return 0; }
+    if (d >= 9223372036854775807.0) { return 0x7fffffffffffffff; }
+    if (d <= -9223372036854775808.0) { return -0x7fffffffffffffff - 1; }
+    return d as i64;
+}
+
+// C's (uint64_t)d on ARM64 (fcvtzu): saturating, NaN and negatives are 0
+pub fn f2u(d: f64) -> u64 {
+    if (d != d || d <= 0.0) { return 0; }
+    if (d >= 18446744073709551615.0) { return 0xffffffffffffffff; }
+    if (d < 1.0) { return 0; }
+    return d as u64;
+}
+
+pub fn u2f(x: i64) -> f64 { return @bitcast(u64, x) as f64; }
+
+// rounds a double to float precision, like C's (float)d
+pub fn toF32(d: f64) -> f64 { return (d as f32) as f64; }
+
+pub fn truncExt(x: i64, t: *ty.Type) -> i64 {
+    let bits = t.size * 8;
+    if (bits >= 64) { return x; }
+    let m = (@bitcast(u64, 1 as i64) << bits as u64) - 1;
+    var u = @bitcast(u64, x) & m;
+    if (ty.isSigned(t) && (u >> (bits - 1) as u64) != 0) { u |= ~m; }
+    return @bitcast(i64, u);
+}
+
+// keep narrow integers sign/zero-extended to 64 bits in registers
+pub fn norm(r: i32, t: *ty.Type) -> i32 {
+    if (!ty.isInt(t) || ty.isLit(t) || t.size >= 8) { return r; }
+    let d = b.newVreg(.I);
+    let i = b.emit(.Ext);
+    i.dst = d;
+    i.a = b.R(r);
+    i.mem = ty.memcode(t);
+    return d;
+}
+
+pub fn widens(a: *ty.Type, t: *ty.Type) -> bool {
+    if (ty.isInt(a) && !ty.isLit(a) && ty.isInt(t) && !ty.isLit(t)) {
+        let sa = ty.isSigned(a);
+        let sb = ty.isSigned(t);
+        // usize/isize are pointer-sized: at least 32 and at most 64 bits on any target
+        if (a == t) { return true; }
+        if (t == ty.usize_) { return !sa && a.size <= 4; }
+        if (t == ty.isize_) { return if (sa) a.size <= 4 else a.size < 4; }
+        if (a == ty.usize_) { return !sb && t.size == 8; }
+        if (a == ty.isize_) { return sb && t.size == 8; }
+        if (sa == sb) { return a.size <= t.size; }
+        return !sa && sb && a.size < t.size;
+    }
+    if (ty.isInt(a) && !ty.isLit(a) && t.k == .F64) { return true; }
+    if (ty.isInt(a) && !ty.isLit(a) && t.k == .F32) { return a.size <= 2; }
+    return a.k == .F32 && t.k == .F64;
+}
+
+// explicit numeric / pointer conversion (used by `as` and implicit widening)
+pub fn convert(v: b.Val, to: *ty.Type) -> b.Val {
+    let from = v.t;
+    if (from == to) { return v; }
+    if (v.isconst && (ty.isNum(from) || from.k == .Bool || from == ty.null_)) {
+        if (ty.isFloat(to)) {
+            var d = if (ty.isFloat(from)) v.fval else if (ty.isSigned(from)) v.ival as f64 else u2f(v.ival);
+            if (to.k == .F32) { d = toF32(d); }
+            return b.vFlt(to, d);
+        }
+        var x = v.ival;
+        if (ty.isFloat(from)) { x = if (ty.isSigned(to)) f2i(v.fval) else @bitcast(i64, f2u(v.fval)); }
+        if (ty.isInt(to)) { x = truncExt(x, to); }
+        return b.vInt(to, x);
+    }
+    if ((ty.isInt(from) || from.k == .Bool) && ty.isInt(to)) {
+        let same = from.size == to.size && ty.isSigned(from) == ty.isSigned(to);
+        let noop = same || to.size == 8 || (from.size < to.size && (!ty.isSigned(from) || ty.isSigned(to)));
+        let r = if (noop) v.reg else norm(v.reg, to);
+        return b.vReg(to, r);
+    }
+    if (ty.isInt(from) && ty.isFloat(to)) {
+        return b.vReg(to, b.op1(if (ty.isSigned(from)) .Scvtf else .Ucvtf, ty.clsOf(to), b.R(v.reg)));
+    }
+    if (ty.isFloat(from) && ty.isInt(to)) {
+        let r = b.op1(if (ty.isSigned(to)) .Fcvtzs else .Fcvtzu, .I, b.R(b.regOf(v)));
+        return b.vReg(to, norm(r, to));
+    }
+    if (ty.isFloat(from) && ty.isFloat(to)) { return b.vReg(to, b.op1(.Fcvt, ty.clsOf(to), b.R(b.regOf(v)))); }
+    var w = v;
+    w.t = to;
+    return w;
+}
+
+// every error name has one program-wide code; 0 means "no error"
+pub fn errCode(name: []const u8) -> i32 {
+    let m = st.M;
+    if (m.errnames.items.len == 0) { m.errnames.push("(no error)"); }
+    for (1..m.errnames.items.len) |i| { if (text.eq(m.errnames.items[i], name)) { return i as i32; } }
+    m.errnames.push(name);
+    return (m.errnames.items.len - 1) as i32;
+}
+
+pub fn setHas(set: *ty.Type, code: i64) -> bool {
+    if (set.all_errors) { return true; }
+    for (set.errcodes.items) |c| { if (c as i64 == code) { return true; } }
+    return false;
+}
+
+pub fn setSubset(a: *ty.Type, s: *ty.Type) -> bool {
+    if (s.all_errors) { return true; }
+    if (a.all_errors) { return false; }
+    for (a.errcodes.items) |c| { if (!setHas(s, c as i64)) { return false; } }
+    return true;
+}
+
+pub fn euOk(inner: b.Val, eu: *ty.Type) -> b.Val {
+    if (eu.E() == ty.void_) { return b.vInt(eu, 0); }
+    ty.layout(eu, null);
+    let a = b.temp(eu);
+    b.storeVal(eu.E(), a, inner);
+    b.store(ty.u16_, b.aAdd(a, ty.errOff(eu) as i64), b.IMM(0));
+    return b.vAgg(eu, a, true);
+}
+
+pub fn euFail(e: b.Val, eu: *ty.Type) -> b.Val {
+    if (eu.E() == ty.void_) { return if (e.isconst) b.vInt(eu, e.ival) else b.vReg(eu, e.reg); }
+    ty.layout(eu, null);
+    let a = b.temp(eu);
+    b.store(ty.u16_, b.aAdd(a, ty.errOff(eu) as i64), b.opdOf(e));
+    return b.vAgg(eu, a, true);
+}
+
+// the error code (0 = success)
+pub fn euErr(v: b.Val) -> ir.Opd {
+    if (v.t.E() == ty.void_) { return if (v.isconst) b.IMM(v.ival) else b.R(b.regOf(v)); }
+    return b.R(b.load(ty.u16_, b.aAdd(v.a, ty.errOff(v.t) as i64)));
+}
+
+pub fn euValue(v: b.Val) -> b.Val {
+    if (v.t.E() == ty.void_) { return b.vVoid(); }
+    return b.loadVal(v.t.E(), v.a);
+}
+
+pub fn optNull(ot: *ty.Type) -> b.Val {
+    if (ty.isOptPtr(ot)) { return b.vInt(ot, 0); }
+    ty.layout(ot, null);
+    let a = b.temp(ot);
+    b.zeroAt(ot, a);
+    return b.vAgg(ot, a, true);
+}
+
+pub fn optWrap(inner: b.Val, ot: *ty.Type) -> b.Val {
+    if (ty.isOptPtr(ot)) {
+        var w = inner;
+        w.t = ot;
+        return w;
+    }
+    ty.layout(ot, null);
+    let a = b.temp(ot);
+    b.storeVal(ot.E(), a, inner);
+    b.store(ty.bool_, b.aAdd(a, ot.E().size as i64), b.IMM(1));
+    return b.vAgg(ot, a, true);
+}
+
+pub fn optHas(v: b.Val) -> i32 {
+    if (ty.isOptPtr(v.t)) { return b.cmp(.NE, b.opdOf(v), b.IMM(0)); }
+    return b.load(ty.bool_, b.aAdd(v.a, v.t.E().size as i64));
+}
+
+pub fn optValue(v: b.Val) -> b.Val {
+    if (ty.isOptPtr(v.t)) { return b.vReg(v.t.E(), b.regOf(v)); }
+    return b.loadVal(v.t.E(), v.a);
+}
+
+// the value of an expression that never finishes (return, break, panic): never used
+pub fn deadValue(want: *ty.Type) -> b.Val {
+    if (want == ty.void_) { return b.vVoid(); }
+    if (ty.isAgg(want)) { return b.vAgg(want, b.temp(want), true); }
+    return if (ty.isFloat(want)) b.vFlt(want, 0.0) else b.vInt(want, 0);
+}
+
+pub fn coerce(v0: b.Val, want: *ty.Type, tok: ?*token.Token, what: []const u8) -> b.Val {
+    var v = v0;
+    let t = v.t;
+    if (t == want) { return v; }
+    if (t == ty.noreturn_) { return deadValue(want); }
+    if (want.k == .ErrUnion) {
+        if (t.k == .ErrSet) { return euFail(coerce(v, want.eset.?, tok, what), want); } // return error.X
+        if (t.k == .ErrUnion) {
+            if (t.elem == want.elem) {
+                if (!setSubset(t.eset.?, want.eset.?)) {
+                    diag.at(tok, text.f("{s} can fail with errors that {s} doesn't include", .{ty.tname(t), ty.tname(want)}));
+                }
+                v.t = want;
+                return v;
+            }
+        } else {
+            return euOk(coerce(v, want.E(), tok, what), want);
+        }
+    }
+    if (want.k == .ErrSet && t.k == .ErrSet) {
+        if (t == ty.errlit) {
+            if (!setHas(want, v.ival)) {
+                diag.at(tok, text.f("{s} has no error {s}", .{ty.tname(want), st.M.errnames.items[v.ival as usize]}));
+            }
+        } else if (!setSubset(t, want)) {
+            diag.at(tok, text.f("{s} includes errors that {s} doesn't", .{ty.tname(t), ty.tname(want)}));
+        }
+        v.t = want;
+        return v;
+    }
+    if (want.k == .Opt && t.k != .Opt) { // T -> ?T
+        if (t == ty.null_) { return optNull(want); }
+        return optWrap(coerce(v, want.E(), tok, what), want);
+    }
+    if (ty.isOptPtr(t) && ty.isOptPtr(want)) { // ?*T -> ?*const T, ?*void
+        let a = t.E();
+        let w = want.E();
+        if ((a.elem == w.elem && a.many == w.many && (w.is_const || !a.is_const) && (w != ty.cstr_ || a == ty.cstr_)) ||
+            w.elem == ty.void_) {
+            v.t = want;
+            return v;
+        }
+    }
+    if (t.k == .LitInt && ty.isInt(want)) {
+        if (want.size < 8) {
+            if (truncExt(v.ival, want) != v.ival) {
+                diag.at(tok, text.f("integer literal {} does not fit in {s}", .{v.ival, ty.tname(want)}));
+            }
+        } else if (want.k == .U64 && v.ival < 0) {
+            diag.at(tok, text.f("integer literal {} does not fit in {s}", .{v.ival, ty.tname(want)}));
+        }
+        v.t = want;
+        return v;
+    }
+    if (t.k == .LitInt && ty.isFloat(want)) { return b.vFlt(want, v.ival as f64); }
+    if (t.k == .LitFloat && ty.isFloat(want)) {
+        if (want.k == .F32) { v.fval = toF32(v.fval); }
+        v.t = want;
+        return v;
+    }
+    if (ty.isArrayPtr(t) && (ty.isSlice(want) || ty.isMany(want)) && t.E().elem == want.elem &&
+        (want.is_const || !t.is_const)) { // &arr as a slice or a [*]T
+        if (ty.isMany(want)) {
+            v.t = want;
+            return v;
+        }
+        let a = b.temp(want);
+        b.store(ty.ptrTo(want.E()), a, b.opdOf(v));
+        b.store(ty.usize_, b.aAdd(a, 8), b.IMM(t.E().alen));
+        return b.vAgg(want, a, true);
+    }
+    if (want == ty.cstr_ && ty.isBytes(t)) {
+        if (v.strlit == 0) {
+            diag.at(tok, text.f("only a string literal converts to cstr for {s}: other strings have no NUL terminator (use mem.dupeZ)", .{what}));
+        }
+        return b.vReg(ty.cstr_, b.addrSym(st.M.strs.items[(v.strlit - 1) as usize].label));
+    }
+    if (t == ty.null_ && ty.isFn(want)) {
+        diag.at(tok, text.f("{s} can't be null; use ?{s} for a function that might be missing", .{ty.tname(want), ty.tname(want)}));
+    }
+    if (t == ty.null_ && ty.isPtr(want)) {
+        diag.at(tok, text.f("{s} can't be null; use ?{s} for a pointer that might be null", .{ty.tname(want), ty.tname(want)}));
+    }
+    if (((ty.isPtr(t) && ty.isPtr(want) && t.many == want.many && (want != ty.cstr_ || t == ty.cstr_)) ||
+         (ty.isSlice(t) && ty.isSlice(want))) && t.elem == want.elem && want.is_const) {
+        v.t = want; // adding const is always fine
+        return v;
+    }
+    if (widens(t, want)) { return convert(v, want); }
+    if (ty.isPtr(t) && ty.isPtr(want) && want.E() == ty.void_) { // *T -> *void: forgetting the type is safe
+        v.t = want;
+        return v;
+    }
+    if ((ty.isPtr(t) || ty.isOptPtr(t)) && (ty.isPtr(want) || ty.isOptPtr(want)) &&
+        (if (t.k == .Opt) t.E() else t).elem == ty.void_) {
+        diag.at(tok, text.f("type mismatch: expected {s}, found {s} for {s} (converting from *void is unchecked: use '@ptrCast({s}, p)' inside an 'unsafe' block)",
+                            .{ty.tname(want), ty.tname(t), what, ty.tname(want)}));
+    }
+    var hint: []const u8 = if (ty.isNum(t) && ty.isNum(want)) text.f(" (convert explicitly with 'as {s}')", .{ty.tname(want)}) else "";
+    if (t.k == .Opt) { hint = " (it might be null: unwrap it with 'x.?' or 'if (x) |v| { ... }')"; }
+    if (t.k == .ErrUnion) { hint = " (it can fail: handle the error with 'try' or 'catch')"; }
+    diag.at(tok, text.f("type mismatch: expected {s}, found {s} for {s}{s}", .{ty.tname(want), ty.tname(t), what, hint}));
+}
+
+pub fn unify(a: *ty.Type, c: *ty.Type, tok: ?*token.Token, op: []const u8) -> *ty.Type {
+    if (a == c) { return a; }
+    if (ty.isLit(a) && ty.isLit(c)) { return ty.litfloat; }
+    if ((a.k == .LitInt && ty.isNum(c)) || (a.k == .LitFloat && ty.isFloat(c))) { return c; }
+    if ((c.k == .LitInt && ty.isNum(a)) || (c.k == .LitFloat && ty.isFloat(a))) { return a; }
+    if (widens(a, c)) { return c; }
+    if (widens(c, a)) { return a; }
+    diag.at(tok, text.f("operator '{s}' can't mix {s} and {s}{s}", .{op, ty.tname(a), ty.tname(c),
+                        if (ty.isNum(a) && ty.isNum(c)) " (use 'as' to convert)" else ""}));
+}
+
+pub fn defaulted(v0: b.Val) -> b.Val {
+    var v = v0;
+    if (v.t == ty.errlit) { v.t = ty.anyerror; }
+    if (v.t.k == .LitInt) {
+        v.t = ty.i64_;
+    } else if (v.t.k == .LitFloat) {
+        v.t = ty.f64_;
+    }
+    return v;
+}

@@ -1,0 +1,4 @@
+before: 42
+--- stderr
+panic: use after free: an access 16 bytes into memory that was freed
+--- exit 101

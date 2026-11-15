@@ -1,0 +1,2 @@
+fn Matrix(comptime T: type, comptime n: usize) -> type where n > 0 { return struct { m: [n][n]T }; }
+fn main() { var m: Matrix(f32, 0) = undefined; }

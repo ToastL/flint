@@ -1,0 +1,1 @@
+[*]i32 points at many items, so '.*' is ambiguous; index it: p[0]

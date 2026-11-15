@@ -1,0 +1,7 @@
+fn get(xs: []const i32, i: usize) -> i32 { return xs[i]; }
+fn f() -> i32 {
+    let a = [_]i32 { 1, 2, 3 };
+    return get(a[..], 5);
+}
+let X = comptime f();
+fn main() {}

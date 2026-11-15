@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    let x: u8 = 5;
+    try io.print("{}\n", .{x << 8});
+}

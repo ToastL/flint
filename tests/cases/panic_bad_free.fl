@@ -1,0 +1,8 @@
+import std.heap;
+
+fn main() -> !void {
+    var gpa = heap.DebugAllocator.init();
+    let alloc = gpa.allocator();
+    var local = [_]u8 { 1, 2, 3 };
+    alloc.free(local[..]);
+}

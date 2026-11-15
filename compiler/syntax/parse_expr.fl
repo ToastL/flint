@@ -1,0 +1,423 @@
+// syntax.parse_expr - expressions: precedence climbing for binary operators, unary and postfix
+// operators, literals (struct, array, anonymous, variant), builtins, and types used as values.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import syntax.parser;
+import syntax.parse_type;
+import syntax.parse_stmt;
+import syntax.parse_decl;
+
+struct Prec { op: []const u8, p: i32 }
+
+// lowest to highest: || && comparison | ^ & shifts additive multiplicative
+let PRECS = [_]Prec {
+    .{ op: "||", p: 1 }, .{ op: "&&", p: 2 },
+    .{ op: "==", p: 3 }, .{ op: "!=", p: 3 }, .{ op: "<", p: 3 }, .{ op: "<=", p: 3 }, .{ op: ">", p: 3 }, .{ op: ">=", p: 3 },
+    .{ op: "|", p: 4 }, .{ op: "^", p: 5 }, .{ op: "&", p: 6 }, .{ op: "<<", p: 7 }, .{ op: ">>", p: 7 },
+    .{ op: "+", p: 8 }, .{ op: "-", p: 8 }, .{ op: "+%", p: 8 }, .{ op: "-%", p: 8 }, .{ op: "+|", p: 8 }, .{ op: "-|", p: 8 },
+    .{ op: "*", p: 9 }, .{ op: "/", p: 9 }, .{ op: "%", p: 9 }, .{ op: "*%", p: 9 }, .{ op: "*|", p: 9 },
+};
+
+fn binprec(t: *const token.Token) -> i32 {
+    if (t.k != .Op) { return -1; }
+    for (PRECS) |*e| { if (text.eq(t.s, e.op)) { return e.p; } }
+    return -1;
+}
+
+fn castExpr(p: *parser.Parser) -> *ast.Node {
+    var e = unary(p);
+    while (p.at("as")) {
+        let t = p.next();
+        let c = p.mk(.Cast, t);
+        c.a = e;
+        c.b = parse_type.type_(p);
+        e = c;
+    }
+    return e;
+}
+
+fn binary(p: *parser.Parser, minp: i32) -> *ast.Node {
+    var lhs = castExpr(p);
+    while (true) {
+        let t = p.cur();
+        let pr = binprec(t);
+        if (pr < 0 || pr < minp) { return lhs; }
+        _ = p.next();
+        let n = p.mk(.Binary, t);
+        n.name = t.s;
+        n.a = lhs;
+        n.b = binary(p, pr + 1);
+        if (pr == 3 && binprec(p.cur()) == 3) { diag.at(p.cur(), "comparisons can't be chained; write 'a < b && b < c'"); }
+        lhs = n;
+    }
+}
+
+pub fn expr(p: *parser.Parser) -> *ast.Node {
+    if (p.at("if")) { // if (cond) a else b
+        let t = p.next();
+        let n = p.mk(.Ternary, t);
+        n.a = parse_stmt.parenCond(p, "if");
+        n.name = parse_stmt.captureP(p, &n.flag2);
+        n.b = expr(p);
+        if (p.accept("else") == null) { diag.at(p.cur(), "an 'if' expression needs an 'else' branch"); }
+        n.name2 = parse_stmt.capture(p);
+        n.c = expr(p);
+        return n;
+    }
+    var e = binary(p, 1);
+    while (p.at("orelse") || p.at("catch")) { // lowest precedence: a orelse b orelse c
+        let t = p.next();
+        let o = p.mk(if (text.eq(t.s, "catch")) .Catch else .Orelse, t);
+        o.a = e;
+        if (o.k == .Catch) { o.name = parse_stmt.capture(p); }
+        if (p.at("{")) { // f() catch |e| { ... }   x orelse { ... }
+            o.b = parse_stmt.block(p);
+            e = o;
+            continue;
+        }
+        o.b = binary(p, 1);
+        e = o;
+    }
+    if (p.at("?")) { diag.at(p.cur(), "Flint has no '?:' operator; write 'if (cond) a else b'"); }
+    return e;
+}
+
+// can a type start at t? (used to tell [N]T { ... } from the old [a, b] literal)
+fn startsType(t: *const token.Token) -> bool {
+    if (t.k == .Id) { return t.s[0] != '@'; }
+    return parser.isOp(t, "[") || parser.isOp(t, "*") || parser.isOp(t, "?") || parser.isOp(t, "fn") || parser.isOp(t, "!");
+}
+
+// List(i32) or mod.List(i32): a call of a function that returns a type
+fn isTypeFnCall(p: *parser.Parser, e: *ast.Node) -> bool {
+    let callee = e.a orelse return false;
+    if (callee.k == .Name) { return p.isTypeFnName(callee.name); }
+    if (callee.k == .FieldAcc) { return p.isAliasNode(callee.a.?) && p.isTypeFnName(callee.name); }
+    return false;
+}
+
+fn postfix(p: *parser.Parser) -> *ast.Node {
+    var e = primary(p);
+    while (true) {
+        let t = p.cur();
+        if (p.accept("(") != null) {
+            let c = p.mk(.Call, t);
+            c.a = e;
+            while (!p.at(")")) {
+                c.add(expr(p));
+                if (p.accept(",") == null) { break; }
+            }
+            _ = p.expect(")", "')' or ',' in the argument list");
+            e = c;
+            if (p.no_lit == 0 && p.at("{") && isTypeFnCall(p, e)) { // List(i32) { ... }
+                let s = p.mk(.StructLit, t);
+                s.a = e;
+                _ = p.next();
+                parse_decl.fieldInits(p, s, "struct literal");
+                e = s;
+            }
+        } else if (p.accept("[") != null) {
+            let lo: ?*ast.Node = if (p.at("..")) null else expr(p);
+            if (p.accept("..") != null) {
+                let s = p.mk(.Slice, t);
+                s.a = e;
+                s.b = lo;
+                s.c = if (p.at("]")) null else expr(p);
+                e = s;
+            } else {
+                let ix = p.mk(.Index, t);
+                ix.a = e;
+                ix.b = lo;
+                e = ix;
+            }
+            _ = p.expect("]", "");
+        } else if (p.accept(".?") != null) {
+            let u = p.mk(.Unwrap, t);
+            u.a = e;
+            e = u;
+        } else if (p.accept(".*") != null) {
+            let d = p.mk(.Deref, t);
+            d.a = e;
+            e = d;
+        } else if (p.accept(".") != null) {
+            if (p.cur().k == .Int) { // t.0: a tuple element
+                let it = p.next();
+                let f = p.mk(.FieldAcc, it);
+                f.a = e;
+                f.name = text.f("{}", .{it.ival});
+                e = f;
+                continue;
+            }
+            let name = p.ident("a field or method name");
+            if (p.no_lit == 0 && p.at("{") && e.k == .Call && isTypeFnCall(p, e)) {
+                let f = p.mk(.FieldAcc, name); // Tree(i32).Node { ... }
+                f.a = e;
+                f.name = name.s;
+                let sl = p.mk(.StructLit, name);
+                sl.a = f;
+                _ = p.next();
+                parse_decl.fieldInits(p, sl, "struct literal");
+                e = sl;
+                continue;
+            }
+            let qual_enum = e.k == .FieldAcc && p.isAliasNode(e.a.?) && p.isEnumName(e.name); // geo.Shape.Rect { }
+            if (p.no_lit == 0 && ((e.k == .Name && p.isEnumName(e.name)) || qual_enum) && p.at("{")) { // Shape.Rect { w: 1, h: 2 }
+                _ = p.next();
+                let d = p.mk(.DotTag, name);
+                d.name = name.s;
+                d.name2 = if (qual_enum) text.f("{s}.{s}", .{e.a.?.name, e.name}) else e.name;
+                d.flag = 2;
+                parse_decl.fieldInits(p, d, "variant literal");
+                e = d;
+                continue;
+            }
+            if (p.no_lit == 0 && e.k == .Name && p.at("{") &&
+                (((p.isStructName(e.name) || p.isImportAlias(e.name)) && p.isStructName(name.s)) || p.isCAlias(e.name))) {
+                // Outer.Inner { ... }, geo.Point { ... }, c.struct_tm { ... }
+                e = structLit(p, name, text.f("{s}.{s}", .{e.name, name.s}));
+                continue;
+            }
+            let f = p.mk(.FieldAcc, name);
+            f.a = e;
+            f.name = name.s;
+            e = f;
+        } else {
+            return e;
+        }
+    }
+}
+
+fn unary(p: *parser.Parser) -> *ast.Node {
+    let t = p.cur();
+    if (t.k == .Op && (text.eq(t.s, "-") || text.eq(t.s, "!") || text.eq(t.s, "~") || text.eq(t.s, "&"))) {
+        _ = p.next();
+        let n = p.mk(.Unary, t);
+        n.name = t.s;
+        n.a = unary(p);
+        return n;
+    }
+    if (p.accept("try") != null) {
+        let n = p.mk(.Try, t);
+        n.a = unary(p);
+        return n;
+    }
+    if (p.accept("comptime") != null) { // comptime f(x) + 1: the whole expression after it runs at compile time
+        let n = p.mk(.Comptime, t);
+        if (p.at("{")) { diag.at(t, "a comptime block is a statement: 'comptime { ... }' on its own line"); }
+        n.a = expr(p);
+        return n;
+    }
+    if (p.at("++") || p.at("--")) {
+        diag.at(t, text.f("Flint has no '{s}'; write 'x {s}= 1;'", .{t.s, if (t.s[0] == '+') "+" else "-"}));
+    }
+    return postfix(p);
+}
+
+fn structLit(p: *parser.Parser, t: *token.Token, name: []const u8) -> *ast.Node {
+    _ = p.expect("{", "");
+    let s = p.mk(.StructLit, t);
+    s.name = name;
+    parse_decl.fieldInits(p, s, "struct literal");
+    return s;
+}
+
+// these take only values
+let WITH_VALUES = [_][]const u8 {
+    "@tagName", "@errorName", "@splat", "@addWithOverflow", "@subWithOverflow",
+    "@mulWithOverflow", "@ptrToInt", "@assume", "@format", "@hash", "@eql",
+    "@reduceAdd", "@compileError", "@embedFile",
+};
+
+// these take a type first
+let WITH_TYPE = [_][]const u8 {
+    "@sizeOf", "@alignOf", "@zeroes", "@truncate", "@bitcast", "@ptrCast", "@intToPtr",
+    "@minInt", "@maxInt", "@typeName", "@isInt", "@isFloat", "@isSigned",
+    "@hasField", "@hasMethod",
+};
+
+fn builtinCall(p: *parser.Parser, t: *token.Token) -> *ast.Node {
+    if (text.oneOf(t.s, WITH_VALUES[..])) {
+        let n = p.mk(.Builtin, t);
+        n.name = t.s;
+        _ = p.expect("(", text.f("'(' after {s}", .{t.s}));
+        n.add(expr(p));
+        while (p.accept(",") != null) { n.add(expr(p)); }
+        _ = p.expect(")", "");
+        return n;
+    }
+    if (!text.oneOf(t.s, WITH_TYPE[..])) {
+        diag.at(t, text.f("unknown builtin '{s}' (available: @sizeOf, @alignOf, @minInt, @maxInt, @zeroes, @truncate, @bitcast, @ptrCast, @intToPtr, @ptrToInt, @splat, @tagName, @errorName, @addWithOverflow, @subWithOverflow, @mulWithOverflow, @assume, @TypeOf, @format, @hash, @eql, @typeName, @isInt, @isFloat, @isSigned, @hasField, @hasMethod, @compileError, @Vector, @reduceAdd, @embedFile)", .{t.s}));
+    }
+    let n = p.mk(.Builtin, t);
+    n.name = t.s;
+    _ = p.expect("(", text.f("'(' after {s}", .{t.s}));
+    n.b = parse_type.type_(p);
+    while (p.accept(",") != null) { n.add(expr(p)); }
+    _ = p.expect(")", "");
+    return n;
+}
+
+fn primary(p: *parser.Parser) -> *ast.Node {
+    let t = p.cur();
+    switch (t.k) {
+        .Int => {
+            _ = p.next();
+            let n = p.mk(.Int, t);
+            n.ival = t.ival;
+            return n;
+        }
+        .Float => {
+            _ = p.next();
+            let n = p.mk(.Float, t);
+            n.fval = t.fval;
+            return n;
+        }
+        .Str => {
+            _ = p.next();
+            let n = p.mk(.Str, t);
+            n.str = t.str;
+            return n;
+        }
+        else => {}
+    }
+    if (p.accept("true") != null || p.accept("false") != null) {
+        let n = p.mk(.Bool, t);
+        n.ival = if (text.eq(t.s, "true")) 1 else 0;
+        return n;
+    }
+    if (p.accept("null") != null) { return p.mk(.Null, t); }
+    if (p.accept("unreachable") != null) { return p.mk(.Unreachable, t); }
+    if (p.accept("error") != null) {
+        _ = p.expect(".", "'.' and an error name after 'error' (like error.NotFound)");
+        let e = p.mk(.ErrLit, p.cur());
+        e.name = p.ident("an error name").s;
+        return e;
+    }
+    // control flow as an expression (type noreturn), as in `x orelse return 0`
+    if (p.accept("return") != null) {
+        let r = p.mk(.Return, t);
+        if (!p.at(";") && !p.at(",") && !p.at(")") && !p.at("}") && !p.at("]")) { r.a = expr(p); }
+        return r;
+    }
+    if (p.at("break") || p.at("continue")) {
+        let brk = p.at("break");
+        _ = p.next();
+        let r = p.mk(if (brk) .Break else .Continue, t);
+        if (p.accept(":") != null) { r.label = p.ident("a loop label").s; }
+        return r;
+    }
+    if (p.accept("switch") != null) { return parse_stmt.switchRest(p, t, true); }
+    if (p.at(".") && p.peek(1).k == .Id) { // .Red  .Circle(2.0)  .Rect { w: 1, h: 2 }
+        _ = p.next();
+        let name = p.ident("variant name");
+        let d = p.mk(.DotTag, name);
+        d.name = name.s;
+        if (p.accept("(") != null) {
+            d.flag = 1;
+            while (!p.at(")")) {
+                d.add(expr(p));
+                if (p.accept(",") == null) { break; }
+            }
+            _ = p.expect(")", "')' to close the payload");
+        } else if (p.accept("{") != null) {
+            d.flag = 2;
+            parse_decl.fieldInits(p, d, "variant literal");
+        }
+        return d;
+    }
+    if (p.at(".") && p.atN(1, "{")) { // .{ x: 1, y: 2 } or .{ 1, 2 }: the type comes from context
+        _ = p.next();
+        _ = p.next();
+        let a = p.mk(.AnonLit, t);
+        a.flag = if (p.cur().k == .Id && p.atN(1, ":")) 1 else 0; // named fields
+        if (a.flag != 0) {
+            parse_decl.fieldInits(p, a, "literal");
+            return a;
+        }
+        while (!p.at("}")) {
+            a.add(expr(p));
+            if (p.accept(",") == null) { break; }
+        }
+        _ = p.expect("}", "'}' or ',' in the literal");
+        return a;
+    }
+    if (p.accept("undefined") != null) { return p.mk(.Undefined, t); }
+    if (p.at("struct") && p.atN(1, "{")) { // struct { ... }: the type a `-> type` function returns
+        _ = p.next();
+        let owner = alloc.new(token.Token);
+        owner.* = t.*;
+        owner.s = "Self";
+        let s = p.mk(.Struct, t);
+        parse_decl.structMembers(p, s, owner, "struct");
+        return s;
+    }
+    let ct = p.cur();
+    if (p.at("*") || p.at("?") || p.at("fn") || (ct.k == .Id && (text.eq(ct.s, "@TypeOf") || text.eq(ct.s, "@Vector"))) ||
+        (p.at("[") && ((p.atN(1, "]") && (startsType(p.peek(2)) || parser.isOp(p.peek(2), "const"))) || (p.atN(1, "*") && p.atN(2, "]"))))) {
+        // a type as a value: alloc.create(*Node)
+        let n = p.mk(.TypeExpr, t);
+        n.a = parse_type.type_(p);
+        return n;
+    }
+    if (p.accept("(") != null) {
+        let e = expr(p);
+        _ = p.expect(")", "");
+        return e;
+    }
+    if (p.at("[")) { // [N]T { a, b }  or  [_]T { a, b }: an array value on the stack
+        let save = p.pos;
+        _ = p.next();
+        let ty = p.mk(.TArray, t);
+        var lit = false;
+        if (p.cur().k == .Id && text.eq(p.cur().s, "_") && p.atN(1, "]")) {
+            _ = p.next();
+            _ = p.next();
+            lit = true;
+        } else if (!p.at("]")) {
+            ty.c = expr(p);
+            lit = p.at("]") && startsType(p.peek(1));
+            if (lit) { _ = p.next(); }
+        }
+        if (lit) {
+            ty.a = parse_type.type_(p);
+            if (!p.at("{") && ty.c != null) { // [N]T used as a type argument
+                let te = p.mk(.TypeExpr, t);
+                te.a = ty;
+                return te;
+            }
+            let a = p.mk(.ArrayLit, t);
+            a.a = ty;
+            _ = p.expect("{", "'{' and the elements after the array type");
+            while (!p.at("}")) {
+                a.add(expr(p));
+                if (p.accept(",") == null) { break; }
+            }
+            _ = p.expect("}", "'}' or ',' in the array literal");
+            return a;
+        }
+        p.pos = save;
+    }
+    if (p.accept("[") != null) {
+        let a = p.mk(.Array, t);
+        while (!p.at("]")) {
+            a.add(expr(p));
+            if (p.accept(",") == null) { break; }
+        }
+        _ = p.expect("]", "']' or ',' in array literal");
+        return a;
+    }
+    if (t.k == .Id) {
+        _ = p.next();
+        if (t.s[0] == '@') { return builtinCall(p, t); }
+        let name = if (text.eq(t.s, "Self")) p.selfName(t) else t.s;
+        if (p.no_lit == 0 && p.isStructName(t.s) && p.at("{")) { return structLit(p, t, name); }
+        let n = p.mk(.Name, t);
+        n.name = name;
+        return n;
+    }
+    diag.at(t, text.f("expected an expression, found {s}", .{parser.desc(t)}));
+}

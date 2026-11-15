@@ -1,0 +1,8 @@
+import std.io;
+
+fn get(x: f64) -> f64 { return x; }
+fn main() -> !void {
+    try io.print("{}\n", .{get(2147483647.9) as i32});
+    let zero = get(0.0);
+    try io.print("{}\n", .{(zero / zero) as i32});
+}

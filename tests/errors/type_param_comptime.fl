@@ -1,0 +1,2 @@
+fn id(T: type, x: T) -> T { return x; }
+fn main() {}

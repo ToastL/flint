@@ -1,0 +1,4 @@
+9223372030926249001
+--- stderr
+panic: integer overflow
+--- exit 101

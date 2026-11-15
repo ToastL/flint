@@ -1,0 +1,4 @@
+extern let optind: i32;
+fn main() -> !void {
+    optind = 2;
+}

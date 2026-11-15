@@ -1,0 +1,19 @@
+42 -7 2.5 true 7 null
+error.NotFound lt Circle Point{ x: 3, y: -4 }
+5 error.Bad
+ff BEE 101 10 z 122
+3.142 2 1.2345e+03 1.23e-04 0.3333333333333333
+0.1 0.3 0.10
+-9223372036854775808 18446744073709551615 -0
+[   42] [42   ] [ 42  ] [   42]
+[ab   ] [   ab] [  ab  ] [**ab***]
+[0000beef] [-12___] [    3.14] [toolong]
+hey { 104, 101, 121 } 686579 01FF for C
+{ 1, 2, 3 } { 2, 3 } { Point{ x: 3, y: -4 }, Point{ x: 0, y: 0 } }
+.{ 1, .{ "two", 3.5 }, { 1, 2, 3 } }
+{} .{}
+{} {1}
+12-34 5 5
+too long: error.NoSpaceLeft
+via a writer: 3
+raw bytes

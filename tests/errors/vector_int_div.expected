@@ -1,0 +1,1 @@
+integer vectors have no '/': ARM64 has no SIMD integer division (divide the elements one by one)

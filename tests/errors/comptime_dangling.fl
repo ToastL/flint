@@ -1,0 +1,6 @@
+fn f() -> *const i32 {
+    let x: i32 = 5;
+    let p = &x;
+    return p;
+}
+fn main() { let p = comptime f(); }

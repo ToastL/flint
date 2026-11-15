@@ -1,0 +1,16 @@
+// `as` is a checked conversion: values that fit convert, everything else traps (see panic_cast_*).
+
+import std.io;
+
+fn i(x: i64) -> i64 { return x; }
+fn u(x: u64) -> u64 { return x; }
+fn f(x: f64) -> f64 { return x; }
+fn main() -> !void {
+    try io.print("narrow {} {} {} {} {}\n", .{ i(127) as i8, i(-128) as i8, i(255) as u8, u(4294967295) as u32, u(9223372036854775807) as i64 });
+    try io.print("sign {} {} {} {}\n", .{ i(0) as u64, i(5) as u8, u(200) as i16, (i(-1) as i32) as i64 });
+    let small: u8 = 200;
+    let wide: i32 = -5;
+    try io.print("widen {} {} {} {}\n", .{ small as u64, small as i16, wide as i64, wide as f64 });
+    try io.print("float {} {} {} {} {} {}\n", .{ f(3.99) as i32, f(-3.99) as i32, f(255.5) as u8, f(-0.5) as u8, f(9.2e18) as i64, f(1.8e19) as u64 });
+    try io.print("const {} {} {}\n", .{ 300 as u16, -1 as i8, 2.5 as u8 });
+}

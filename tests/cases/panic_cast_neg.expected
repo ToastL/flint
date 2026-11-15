@@ -1,0 +1,4 @@
+0
+--- stderr
+panic: value doesn't fit in u64 in 'as'
+--- exit 101

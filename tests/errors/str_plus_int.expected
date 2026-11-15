@@ -1,0 +1,1 @@
+operator '+' needs numbers, found []const u8 ('+' doesn't join strings, since that would allocate: use fmt.allocPrint(alloc, "{s}{s}", .{ a, b }) or fmt.bufPrint)

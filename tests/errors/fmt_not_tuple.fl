@@ -1,0 +1,5 @@
+import std.io;
+
+fn main() -> !void {
+    try io.print("{}\n", 5);
+}

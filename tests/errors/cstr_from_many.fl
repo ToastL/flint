@@ -1,0 +1,6 @@
+fn main() -> !void {
+    var arr: [3]u8 = undefined;
+    let xs: []u8 = &arr;
+    let p: [*]const u8 = xs.ptr;
+    let c: cstr = p;
+}

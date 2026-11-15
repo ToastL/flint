@@ -1,0 +1,8 @@
+import std.io;
+
+struct User { name: str }
+fn find() -> ?*User { return null; }
+fn main() -> !void {
+    let u = find();
+    try io.print("{}\n", .{u.name});
+}

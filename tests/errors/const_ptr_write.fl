@@ -1,0 +1,5 @@
+fn main() -> !void {
+    var n: i64 = 1;
+    let p: *const i64 = &n;
+    p.* = 2;
+}

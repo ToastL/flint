@@ -1,0 +1,4 @@
+fn main() {
+    var n: i32 = 3;
+    let x = comptime n + 1;
+}

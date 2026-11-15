@@ -1,0 +1,6 @@
+struct P { x: i32, xs: [4]i32 }
+fn f() -> *i32 {
+    var p = P { x: 1, xs: .{ 1, 2, 3, 4 } };
+    return &p.xs[2];
+}
+fn main() -> !void { _ = f(); }

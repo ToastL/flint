@@ -1,0 +1,4 @@
+import std.mem;
+import mods.priv as mem;
+
+fn main() {}

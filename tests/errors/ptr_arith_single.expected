@@ -1,0 +1,1 @@
+pointer arithmetic needs a pointer to many items ([*]i32), not *i32

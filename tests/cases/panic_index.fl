@@ -1,0 +1,8 @@
+import std.io;
+
+fn main() -> !void {
+    let arr = [_]i32 { 1, 2, 3 };
+    let xs: []const i32 = &arr;
+    try io.print("before\n", .{});
+    try io.print("{}\n", .{xs[3]});
+}

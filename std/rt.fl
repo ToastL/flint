@@ -1,0 +1,415 @@
+// std.rt - the Flint runtime: program entry, output, panics, float formatting, the test runner
+// and the DebugAllocator's quarantine. Every program includes it (like C's crt0); nothing imports
+// it. Its exported functions are what the compiler's generated code and other std modules call.
+// It never allocates on a program's behalf (argument strings are made once at startup).
+//
+// Standard output goes through C's stdio buffer, so it interleaves correctly with C code in the
+// same program that uses printf.
+
+extern fn fl_main() -> i32; // the program's main (or, in `flint test`, the generated test driver)
+extern let fl_error_names: cstr; // written by the compiler: the first of fl_error_count names
+extern let fl_error_count: i64;
+extern let fl_main_errors: i64; // 1 when main returns !void: its result is an error code
+
+extern var __stdoutp: *void;
+extern var __stderrp: *void;
+extern fn fwrite(p: [*]const u8, size: usize, n: usize, f: *void) -> usize;
+extern fn fflush(f: ?*void) -> i32;
+extern fn setvbuf(f: *void, buf: ?[*]u8, mode: i32, size: usize) -> i32;
+extern fn _exit(code: i32) -> noreturn;
+extern fn malloc(n: usize) -> ?[*]u8;
+extern fn free(p: ?[*]u8);
+extern fn strlen(s: cstr) -> usize;
+extern fn snprintf(buf: [*]u8, n: usize, f: cstr, ...) -> i32;
+extern fn strtod(s: cstr, end: ?*[*]u8) -> f64;
+extern fn strtof(s: cstr, end: ?*[*]u8) -> f32;
+extern fn fork() -> i32;
+extern fn pipe(fds: *[2]i32) -> i32;
+extern fn read(fd: i32, buf: [*]u8, n: usize) -> isize;
+extern fn write(fd: i32, buf: [*]const u8, n: usize) -> isize;
+extern fn close(fd: i32) -> i32;
+extern fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+extern fn clock_gettime(clock: i32, ts: *Timespec) -> i32;
+extern fn sigaction(sig: i32, act: *const SigAction, old: ?*SigAction) -> i32;
+extern fn mprotect(p: [*]u8, len: usize, prot: i32) -> i32;
+extern fn munmap(p: [*]u8, len: usize) -> i32;
+
+struct Timespec { sec: i64, nsec: i64 }
+
+// macOS's struct sigaction and the start of siginfo_t
+struct SigAction { handler: fn(i32, *SigInfo, *void), mask: u32, flags: i32 }
+struct SigInfo { signo: i32, errno: i32, code: i32, pid: i32, uid: u32, status: i32, addr: usize }
+
+let SIGBUS: i32 = 10;
+let SIGSEGV: i32 = 11;
+let SA_SIGINFO: i32 = 0x40;
+let CLOCK_MONOTONIC: i32 = 6;
+
+// Ends the process: every C stdio stream is flushed (our stdout among them), but C atexit
+// handlers don't run. (Returning from main runs them: that's libc's normal exit.)
+fn quit(code: i32) -> noreturn {
+    _ = fflush(null);
+    _exit(code);
+    unreachable;
+}
+
+var outbuf: [65536]u8 = @splat(0); // zeroed, not undefined: Debug would fill it with 0xAA in the binary
+var argstrs: []const []const u8 = undefined; // args(): made once at startup, owned by the runtime
+
+export fn main(argc: i32, argv: [*]cstr) -> i32 {
+    let n = argc as usize;
+    let p = malloc((n + 1) * 16) orelse return 101;
+    unsafe {
+        let strs = @ptrCast([*][]const u8, p);
+        for (0..n) |i| { strs[i] = span(argv[i]); }
+        argstrs = strs[0..n];
+    }
+    _ = setvbuf(__stdoutp, &outbuf, 0, outbuf.len); // _IOFBF
+    let r = fl_main();
+    _ = fflush(__stdoutp);
+    if (fl_main_errors != 0) {
+        if (r == 0) { return 0; }
+        unsafe { put(__stderrp, "error: "); put(__stderrp, span(rt_error_name(r as i64))); }
+        put(__stderrp, "\n");
+        return 1;
+    }
+    return r;
+}
+
+fn span(c: cstr) -> []const u8 {
+    unsafe { return @ptrCast([*]const u8, c)[0..strlen(c)]; }
+}
+
+fn put(f: *void, s: []const u8) {
+    if (s.len > 0) { _ = fwrite(s.ptr, 1, s.len, f); }
+}
+
+// decimal digits of v, into buf
+fn itoa(v: i64, buf: *[24]u8) -> []const u8 {
+    var t: [24]u8 = undefined;
+    var n: usize = 0;
+    var m: u64 = 0;
+    m = if (v < 0) 0 -% @bitcast(u64, v) else @bitcast(u64, v);
+    while (true) {
+        t[n] = '0' + (m % 10) as u8;
+        n += 1;
+        m /= 10;
+        if (m == 0) { break; }
+    }
+    var k: usize = 0;
+    if (v < 0) { buf[0] = '-'; k = 1; }
+    while (n > 0) {
+        n -= 1;
+        buf[k] = t[n];
+        k += 1;
+    }
+    return buf[0..k];
+}
+
+fn eputInt(v: i64) {
+    var b: [24]u8 = undefined;
+    put(__stderrp, itoa(v, &b));
+}
+
+export fn rt_error_name(code: i64) -> cstr {
+    if (code > 0 && code < fl_error_count) {
+        unsafe { return @ptrCast([*]const cstr, &fl_error_names)[code as usize]; }
+    }
+    return "UnknownError";
+}
+
+// ---- flint test: each test runs in a child process, so a panic fails only that test ----
+
+var t_passed: i64 = 0;
+var t_failed: i64 = 0;
+
+export fn rt_test_run(name: [*]const u8, len: i64, f: fn() -> i64) {
+    _ = fflush(__stdoutp);
+    _ = fflush(__stderrp);
+    var fds: [2]i32 = undefined;
+    if (pipe(&fds) != 0) { put(__stderrp, "flint test: pipe failed\n"); quit(1); }
+    let pid = fork();
+    if (pid < 0) { put(__stderrp, "flint test: fork failed\n"); quit(1); }
+    if (pid == 0) {
+        _ = close(fds[0]);
+        var code: i64 = f() & 0xffff; // a !void's error code (0: it passed)
+        _ = fflush(__stdoutp);
+        unsafe {
+            if (write(fds[1], @ptrCast([*]const u8, &code), 8) != 8) { _exit(1); }
+        }
+        _exit(0);
+    }
+    _ = close(fds[1]);
+    var code: i64 = -1;
+    var got: isize = 0;
+    unsafe { got = read(fds[0], @ptrCast([*]u8, &code), 8); }
+    _ = close(fds[0]);
+    var st: i32 = 0;
+    _ = waitpid(pid, &st, 0);
+    let exited = (st & 0x7f) == 0;
+    let status = (st >> 8) & 0xff;
+    var nm: []const u8 = undefined;
+    unsafe { nm = name[0..len as usize]; }
+    if (got == 8 && exited && status == 0 && code == 0) {
+        put(__stdoutp, "ok   ");
+        put(__stdoutp, nm);
+        put(__stdoutp, "\n");
+        t_passed += 1;
+    } else if (got == 8 && exited && status == 0) {
+        put(__stdoutp, "FAIL ");
+        put(__stdoutp, nm);
+        put(__stdoutp, " (error.");
+        put(__stdoutp, span(rt_error_name(code)));
+        put(__stdoutp, ")\n");
+        t_failed += 1;
+    } else {
+        put(__stdoutp, "FAIL ");
+        put(__stdoutp, nm);
+        put(__stdoutp, if (!exited) " (crashed)\n" else " (panicked)\n");
+        t_failed += 1;
+    }
+    _ = fflush(__stdoutp);
+}
+
+export fn rt_test_end() -> i64 {
+    var b: [24]u8 = undefined;
+    put(__stdoutp, itoa(t_passed, &b));
+    put(__stdoutp, " passed, ");
+    put(__stdoutp, itoa(t_failed, &b));
+    put(__stdoutp, " failed\n");
+    return if (t_failed != 0) 1 else 0;
+}
+
+// ---- panics ----
+
+export fn rt_panic(msg: [*]const u8, len: i64) -> noreturn {
+    _ = fflush(__stdoutp);
+    put(__stderrp, "panic: ");
+    unsafe { put(__stderrp, msg[0..len as usize]); }
+    put(__stderrp, "\n");
+    quit(101);
+}
+
+export fn rt_oob(i: i64, n: i64) -> noreturn {
+    _ = fflush(__stdoutp);
+    put(__stderrp, "panic: index ");
+    eputInt(i);
+    put(__stderrp, " out of bounds (len ");
+    eputInt(n);
+    put(__stderrp, ")\n");
+    quit(101);
+}
+
+export fn rt_range(a: i64, b: i64, n: i64) {
+    if (a < 0 || b < a || b > n) {
+        _ = fflush(__stdoutp);
+        put(__stderrp, "panic: slice [");
+        eputInt(a);
+        put(__stderrp, "..");
+        eputInt(b);
+        put(__stderrp, "] out of bounds (len ");
+        eputInt(n);
+        put(__stderrp, ")\n");
+        quit(101);
+    }
+}
+
+export fn rt_assert_fail(line: i64) -> noreturn {
+    _ = fflush(__stdoutp);
+    put(__stderrp, "panic: assertion failed at line ");
+    eputInt(line);
+    put(__stderrp, "\n");
+    quit(101);
+}
+
+export fn rt_exit(code: i64) -> noreturn {
+    _ = fflush(__stdoutp);
+    unsafe { quit(code as i32); }
+}
+
+// Writes bytes to stdout (fd 1, buffered) or stderr (fd 2: stdout is flushed first so the two
+// interleave in program order). 0 on success, -1 on failure.
+export fn rt_write(fd: i64, p: [*]const u8, n: usize) -> i64 {
+    if (fd == 1) { return if (fwrite(p, 1, n, __stdoutp) == n) 0 else -1; }
+    _ = fflush(__stdoutp);
+    return if (fwrite(p, 1, n, __stderrp) == n) 0 else -1;
+}
+
+export fn rt_flush() -> i64 { return if (fflush(__stdoutp) == 0) 0 else -1; }
+
+export fn rt_now() -> f64 {
+    var t = Timespec { sec: 0, nsec: 0 };
+    _ = clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.sec as f64 + t.nsec as f64 * 1e-9;
+}
+
+export fn rt_args(out: *[]const []const u8) { out.* = argstrs; }
+
+// ---- floats: the shortest text that reads back as the same number (like JavaScript) ----
+
+fn isNan(v: f64) -> bool { return v != v; }
+fn isInf(v: f64) -> bool { return v == v && v - v != v - v; }
+
+fn copyOut(src: []const u8, buf: [*]u8) -> usize {
+    unsafe { for (0..src.len) |i| { buf[i] = src[i]; } }
+    return src.len;
+}
+
+fn cbuf(b: *[64]u8) -> cstr {
+    unsafe { return @ptrCast(cstr, &b[0]); }
+}
+
+// Writes at most 31 bytes to buf.
+export fn rt_fmt_f64(v: f64, buf: [*]u8) -> usize {
+    if (isNan(v)) { return copyOut("NaN", buf); }
+    if (isInf(v)) { return copyOut(if (v > 0.0) "Infinity" else "-Infinity", buf); }
+    let neg_zero = v == 0.0 && 1.0 / v < 0.0;
+    if (v > -1e15 && v < 1e15 && !neg_zero) {
+        let x = v as i64;
+        if (x as f64 == v) { // whole numbers: plain integer digits (same output as %.15g, much faster)
+            var b: [24]u8 = undefined;
+            return copyOut(itoa(x, &b), buf);
+        }
+    }
+    var b: [64]u8 = undefined;
+    var prec: i32 = 15;
+    while (prec <= 17) {
+        _ = snprintf(&b, b.len, "%.*g", prec, v);
+        if (strtod(cbuf(&b), null) == v) { break; }
+        prec += 1;
+    }
+    return copyOut(span(cbuf(&b)), buf);
+}
+
+// The same for f32: the shortest text that reads back as the same f32.
+export fn rt_fmt_f32(v: f32, buf: [*]u8) -> usize {
+    let d = v as f64;
+    if (isNan(d) || isInf(d)) { return rt_fmt_f64(d, buf); }
+    var b: [64]u8 = undefined;
+    var prec: i32 = 6;
+    while (prec <= 9) {
+        _ = snprintf(&b, b.len, "%.*g", prec, d);
+        if (strtof(cbuf(&b), null) == v) { break; }
+        prec += 1;
+    }
+    return copyOut(span(cbuf(&b)), buf);
+}
+
+// Fixed point ({d:.2}) or, with exp, scientific ({e}, {e:.3}; prec < 0: the shortest that reads
+// back). Writes at most cap bytes, including a terminating NUL; returns the length without it.
+export fn rt_fmt_f64_prec(v: f64, prec_in: i64, exp: bool, buf: [*]u8, cap: usize) -> usize {
+    if (isNan(v) || isInf(v)) { return rt_fmt_f64(v, buf); }
+    let prec: i32 = if (prec_in > 100) 100 else prec_in as i32;
+    var n: i32 = 0;
+    if (exp && prec < 0) {
+        var b: [64]u8 = undefined;
+        var p: i32 = 0;
+        while (p <= 17) {
+            _ = snprintf(&b, b.len, "%.*e", p, v);
+            if (strtod(cbuf(&b), null) == v) { break; }
+            p += 1;
+        }
+        n = snprintf(buf, cap, "%s", cbuf(&b));
+    } else {
+        if (exp) { n = snprintf(buf, cap, "%.*e", prec, v); } else { n = snprintf(buf, cap, "%.*f", prec, v); }
+    }
+    if (n < 0) { return 0; }
+    if (n as usize >= cap) { return cap - 1; }
+    return n as usize;
+}
+
+// ok.* is set to whether the whole text was a number.
+export fn rt_parse_f64(p: [*]const u8, n: usize, ok: *bool) -> f64 {
+    var small: [64]u8 = undefined;
+    var s: [*]u8 = &small;
+    if (n >= small.len) {
+        if (malloc(n + 1)) |m| { s = m; } else {
+            ok.* = false;
+            return 0.0;
+        }
+    }
+    var end: [*]u8 = s;
+    var v: f64 = 0.0;
+    unsafe {
+        for (0..n) |i| { s[i] = p[i]; }
+        s[n] = 0;
+        v = strtod(@ptrCast(cstr, s), &end);
+        while (end[0] == ' ' || end[0] == '\t' || end[0] == '\n' || end[0] == '\r') { end += 1; }
+        ok.* = !(n == 0 || end == s || end[0] != 0);
+    }
+    if (n >= small.len) { free(s); }
+    return v;
+}
+
+// ---- DebugAllocator support: freed memory is made inaccessible, so a use after free faults,
+// and the fault handler says which allocation it was ----
+
+struct Range { lo: usize, hi: usize }
+
+var freed: [4096]Range = @zeroes([4096]Range); // the most recently freed allocations (older ones are unmapped)
+var nfreed: usize = 0;
+var freed_next: usize = 0;
+var debug_ready: bool = false;
+
+fn hex(v: usize, buf: *[24]u8) -> []const u8 {
+    let digits = "0123456789abcdef";
+    var t: [24]u8 = undefined;
+    var n: usize = 0;
+    var m = v;
+    while (true) {
+        t[n] = digits[m & 15];
+        n += 1;
+        m >>= 4;
+        if (m == 0) { break; }
+    }
+    var k: usize = 0;
+    while (n > 0) {
+        n -= 1;
+        buf[k] = t[n];
+        k += 1;
+    }
+    return buf[0..k];
+}
+
+fn fault(sig: i32, si: *SigInfo, ctx: *void) {
+    let a = si.addr;
+    var b: [24]u8 = undefined;
+    _ = fflush(__stdoutp);
+    for (0..nfreed) |i| {
+        if (a >= freed[i].lo && a < freed[i].hi) {
+            fdput("panic: use after free: an access ");
+            unsafe { fdput(itoa((a - freed[i].lo) as i64, &b)); }
+            fdput(" bytes into memory that was freed\n");
+            _exit(101);
+        }
+    }
+    fdput("panic: invalid memory access at address 0x");
+    fdput(hex(a, &b));
+    fdput(if (sig == SIGBUS) " (bus error)\n" else " (segmentation fault)\n");
+    _exit(101);
+}
+
+// straight to fd 2: the fault handler can't use stdio
+fn fdput(s: []const u8) { _ = write(2, s.ptr, s.len); }
+
+export fn rt_debug_init() {
+    if (debug_ready) { return; }
+    debug_ready = true;
+    let sa = SigAction { handler: fault, mask: 0, flags: SA_SIGINFO };
+    _ = sigaction(SIGSEGV, &sa, null);
+    _ = sigaction(SIGBUS, &sa, null);
+}
+
+// p..p+len (whole pages) was just freed: make it inaccessible, and unmap the oldest quarantined block
+export fn rt_debug_quarantine(p: [*]u8, len: usize) {
+    _ = mprotect(p, len, 0); // PROT_NONE
+    let slot = &freed[freed_next];
+    if (nfreed == freed.len) {
+        unsafe { _ = munmap(@intToPtr([*]u8, slot.lo), slot.hi - slot.lo); }
+    } else {
+        nfreed += 1;
+    }
+    let lo = @ptrToInt(p);
+    slot.* = Range { lo: lo, hi: lo + len };
+    freed_next = (freed_next + 1) % freed.len;
+}

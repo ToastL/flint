@@ -1,0 +1,18 @@
+port 8080 debug true cleanups 1
+  load failed with error.NotFound
+default port 0 cleanups 2
+  load failed with error.Denied
+else branch: permission denied Denied
+toInt 7 7
+toInt x -1
+toInt 99999999999999999999 -2
+total 3
+check Negative
+io nf dn something else
+error values error.Denied true 2 2 16 24
+unions 3.5 error.NotANumber port=8080 debug=yes
+try in an argument: 42
+  load failed with error.NotFound
+--- stderr
+error: NotFound
+--- exit 1

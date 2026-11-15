@@ -1,0 +1,4 @@
+fn main() {
+    let a = [_]i32 { 1, 2 };
+    let s = @reduceAdd(a);
+}

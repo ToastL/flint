@@ -1,0 +1,6 @@
+import c "mods/cdefs.h" as c;
+
+fn main() {
+    var f: c.struct_flags = undefined;
+    _ = f;
+}

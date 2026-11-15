@@ -1,0 +1,1 @@
+methods are declared inside their type's body; for a built-in type (str, u8, slices) write a plain function in a module instead, like 'pub fn trim(s: []const u8) -> []const u8'

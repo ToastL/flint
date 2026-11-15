@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    let t: (i32, bool) = .{ 1, true };
+    try io.print("{}\n", .{t.2});
+}

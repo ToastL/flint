@@ -1,0 +1,23 @@
+import std.heap;
+import std.io;
+import std.mem;
+
+fn main() -> !void {
+    let n: usize = 50_000_000;
+    let alloc = heap.page_allocator;
+    let composite = try alloc.alloc(bool, n + 1);
+    defer alloc.free(composite);
+    mem.set(bool, composite, false);
+    var count: usize = 0;
+    for (2..=n) |i| {
+        if (!composite[i]) {
+            count += 1;
+            var j = i * i;
+            while (j <= n) {
+                composite[j] = true;
+                j += i;
+            }
+        }
+    }
+    try io.print("{}\n", .{count});
+}

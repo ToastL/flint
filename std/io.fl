@@ -1,0 +1,28 @@
+// std.io - standard output and standard error.
+
+import std.fmt;
+
+extern fn rt_write(fd: i64, p: [*]const u8, n: usize) -> i64;
+extern fn rt_flush() -> i64;
+
+fn writeFd(fd: i64, bytes: []const u8) -> !void {
+    if (rt_write(fd, bytes.ptr, bytes.len) != 0) { return error.WriteFailed; }
+}
+
+fn stdoutWrite(ctx: *void, bytes: []const u8) -> !void { return writeFd(1, bytes); }
+
+fn stderrWrite(ctx: *void, bytes: []const u8) -> !void { return writeFd(2, bytes); }
+
+// Buffered: flushed when the program exits or panics, and before anything goes to stderr.
+pub let stdout: fmt.Writer = .{ ctx: undefined, writeFn: stdoutWrite };
+pub let stderr: fmt.Writer = .{ ctx: undefined, writeFn: stderrWrite };
+
+// Formatted output to stdout, checked at compile time: try io.print("x = {}\n", .{x});
+pub fn print(comptime f: []const u8, args: anytype) -> !void { @format(stdout, f, args); }
+
+// The same, to stderr.
+pub fn eprint(comptime f: []const u8, args: anytype) -> !void { @format(stderr, f, args); }
+
+pub fn flush() -> !void {
+    if (rt_flush() != 0) { return error.WriteFailed; }
+}

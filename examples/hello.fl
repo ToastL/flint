@@ -1,0 +1,6 @@
+import std.io;
+
+fn main() -> !void {
+    let name = "world";
+    try io.print("hello, {s}\n", .{name});
+}

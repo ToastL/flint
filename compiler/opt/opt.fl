@@ -1,0 +1,98 @@
+// opt.opt - IR optimizations (ReleaseSafe and ReleaseFast; Debug skips them), in this order:
+//
+//   cfg.simplify   thread jumps through empty blocks, drop unreachable blocks
+//   promote        slots whose address never escapes become vregs (mem2reg + scalar replacement
+//                  of aggregates: each field gets its own vreg)
+//   then, up to 8 rounds until nothing changes:
+//     constprop    fold constants, turn constant operands into immediates
+//     cfg.simplify
+//     copyprop     replace copies with their source
+//     ebb          copies, common subexpressions and known branches along extended basic blocks
+//     dce          remove instructions whose results are unused
+//   coalesce       "t = a op b; x = t"  ->  "x = a op b"
+//
+// Also what the passes share: definition/use counts, removing instructions.
+
+import base.alloc;
+import ir.ir;
+import opt.cfg;
+import opt.promote;
+import opt.constprop;
+import opt.copyprop;
+import opt.ebb;
+import opt.dce;
+
+pub var defcnt: []i32 = @zeroes([]i32);
+pub var usecnt: []i32 = @zeroes([]i32);
+
+// how often each vreg is defined and used (uses of calls with more than 64 arguments aren't
+// counted, as in the C compiler)
+pub fn count(f: *ir.IRFunc) {
+    let nv = f.vcls.items.len;
+    if (defcnt.len < nv + 1) {
+        defcnt = alloc.make(i32, nv * 2 + 16);
+        usecnt = alloc.make(i32, nv * 2 + 16);
+    }
+    for (0..nv + 1) |i| {
+        defcnt[i] = 0;
+        usecnt[i] = 0;
+    }
+    for (f.blocks.items) |*blk| {
+        if (blk.dead) { continue; }
+        for (blk.insts.items) |*in| {
+            if (in.dst >= 0) { defcnt[in.dst as usize] += 1; }
+            if (in.op == .Call) {
+                if (in.args.len > 64) { continue; }
+                for (in.args) |a| { if (a.k == .Reg) { usecnt[a.v as usize] += 1; } }
+                continue;
+            }
+            if (in.a.k == .Reg) { usecnt[in.a.v as usize] += 1; }
+            if (in.b.k == .Reg) { usecnt[in.b.v as usize] += 1; }
+            if (in.c.k == .Reg) { usecnt[in.c.v as usize] += 1; }
+        }
+    }
+}
+
+// drops the Nop instructions
+pub fn compact(f: *ir.IRFunc) {
+    for (f.blocks.items) |*blk| {
+        let xs = blk.insts.items;
+        var j: usize = 0;
+        for (0..xs.len) |i| {
+            if (xs[i].op != .Nop) {
+                xs[j] = xs[i];
+                j += 1;
+            }
+        }
+        blk.insts.truncate(j);
+    }
+}
+
+pub fn nop(in: *ir.Inst) {
+    in.op = .Nop;
+    in.dst = -1;
+    in.a.k = .None;
+    in.b.k = .None;
+    in.c.k = .None;
+}
+
+pub fn optimize(m: *ir.Module) {
+    for (m.funcs.items) |f| {
+        _ = cfg.simplify(f);
+        promote.promote(f);
+        var iter: i32 = 0;
+        while (iter < 8) {
+            var ch = false;
+            ch = constprop.run(f) || ch;
+            ch = cfg.simplify(f) || ch;
+            ch = copyprop.run(f) || ch;
+            ch = ebb.run(f) || ch;
+            ch = dce.run(f) || ch;
+            if (!ch) { break; }
+            iter += 1;
+        }
+        dce.coalesce(f);
+        _ = dce.run(f);
+        _ = cfg.simplify(f);
+    }
+}

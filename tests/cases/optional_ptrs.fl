@@ -1,0 +1,27 @@
+import std.io;
+
+struct Node { v: i32, next: ?*Node }
+
+fn find(list: ?*Node, v: i32) -> ?*Node {
+    var cur = list;
+    while (cur) |n| {
+        if (n.v == v) { return n; }
+        cur = n.next;
+    }
+    return null;
+}
+
+fn main() -> !void {
+    var c = Node { v: 3, next: null };
+    var b = Node { v: 2, next: &c };
+    var a = Node { v: 1, next: &b };
+    let head: ?*Node = &a;
+    // optional pointers compare by address, with each other and with plain pointers
+    try io.print("{} {} {}\n", .{find(head, 2) == &b, find(head, 3) == find(head, 3), find(head, 9) == null});
+    try io.print("{}\n", .{find(head, 1) != find(head, 2)});
+    // if-expressions: a pointer or null is ?*T; T or ?T is ?T
+    let p = if (a.v == 1) &a else null;
+    let q: ?i32 = null;
+    let r = if (q == null) 5 else q;
+    try io.print("{} {}\n", .{p != null, r});
+}

@@ -1,0 +1,18 @@
+import std.io;
+import geometry;
+import geometry.units;
+import report;
+
+extern fn fm_triangle(n: i64) -> i64; // from c/fastmath.c, built from flint.toml's [c] table
+extern fn fm_hypot(a: f64, b: f64) -> f64;
+
+fn main() -> !void {
+    let r = geometry.Rect { w: 3, h: 4 };
+    try io.print("area {} in {s}\n", .{ geometry.area(r), units.name() });
+    try io.print("triangle {} hypot {}\n", .{ fm_triangle(10), fm_hypot(3, 4) });
+    try report.show(args());
+}
+
+test "area" {
+    if (geometry.area(geometry.Rect { w: 2, h: 2 }) != 4) { return error.WrongArea; }
+}

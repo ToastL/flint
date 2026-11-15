@@ -1,0 +1,4 @@
+var limit: i32 = 10;
+fn twice() -> i32 { return limit * 2; }
+let X = comptime twice();
+fn main() {}

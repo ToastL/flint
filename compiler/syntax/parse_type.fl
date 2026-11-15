@@ -1,0 +1,132 @@
+// syntax.parse_type - types: *T, [*]T, []T, [N]T, (A, B), ?T, E!T, fn(..) -> T, @Vector,
+// @TypeOf, names (heap.Arena) and type function calls (List(i32), Tree(i32).Node).
+
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import syntax.parser;
+import syntax.parse_expr;
+
+pub fn type_(p: *parser.Parser) -> *ast.Node {
+    let t = p.cur();
+    if (p.accept("*") != null) {
+        let n = p.mk(.TPtr, t);
+        n.flag = if (p.accept("const") != null) 1 else 0;
+        n.a = type_(p);
+        return n;
+    }
+    if (p.accept("[") != null) {
+        if (p.at("*") && p.atN(1, "]")) { // [*]T
+            _ = p.next();
+            _ = p.next();
+            let n = p.mk(.TPtr, t);
+            n.flag2 = 1;
+            n.flag = if (p.accept("const") != null) 1 else 0;
+            n.a = type_(p);
+            return n;
+        }
+        if (!p.at("]")) { // [N]T, or [_]T in an array literal
+            let n = p.mk(.TArray, t);
+            if (p.cur().k == .Id && text.eq(p.cur().s, "_") && p.atN(1, "]")) { _ = p.next(); } else { n.c = parse_expr.expr(p); }
+            _ = p.expect("]", "']' after the array length");
+            n.a = type_(p);
+            return n;
+        }
+        _ = p.next();
+        let n = p.mk(.TSlice, t);
+        n.flag = if (p.accept("const") != null) 1 else 0;
+        n.a = type_(p);
+        return n;
+    }
+    if (p.accept("(") != null) { // (A, B): a tuple
+        let n = p.mk(.TTuple, t);
+        n.add(type_(p));
+        if (!p.at(",")) { diag.at(p.cur(), "a tuple type needs at least two elements: (A, B)"); }
+        while (p.accept(",") != null) {
+            if (p.at(")")) { break; }
+            n.add(type_(p));
+        }
+        _ = p.expect(")", "')' to close the tuple type");
+        return n;
+    }
+    if (p.accept("?") != null) {
+        let n = p.mk(.TOpt, t);
+        n.a = type_(p);
+        return n;
+    }
+    if (p.at("!")) { // !T: can fail with any error
+        _ = p.next();
+        let n = p.mk(.TErrU, t);
+        n.b = type_(p);
+        return n;
+    }
+    if (p.accept("fn") != null) { // fn(i32, i32) -> i32
+        let n = p.mk(.TFn, t);
+        _ = p.expect("(", "'(' and parameter types after 'fn'");
+        while (!p.at(")")) {
+            if (p.accept("...") != null) {
+                n.flag = 1;
+                break;
+            }
+            if (p.cur().k == .Id && p.atN(1, ":")) {
+                diag.at(p.cur(), "function types list just the parameter types: write fn(T) without names");
+            }
+            n.add(type_(p));
+            if (p.accept(",") == null) { break; }
+        }
+        _ = p.expect(")", "')' or ',' in the parameter types");
+        if (p.accept("->") != null) { n.b = type_(p); }
+        return n;
+    }
+    if (p.cur().k == .Id && text.eq(p.cur().s, "@Vector")) { // @Vector(4, f32): a SIMD vector
+        let n = p.mk(.TVector, p.next());
+        _ = p.expect("(", "'(' after @Vector");
+        n.c = parse_expr.expr(p);
+        _ = p.expect(",", "',' and the element type: @Vector(4, f32)");
+        n.a = type_(p);
+        _ = p.expect(")", "')' to close @Vector");
+        return n;
+    }
+    if (p.cur().k == .Id && text.eq(p.cur().s, "@TypeOf")) { // @TypeOf(expr)
+        let n = p.mk(.TTypeOf, p.next());
+        _ = p.expect("(", "'(' after @TypeOf");
+        n.a = parse_expr.expr(p);
+        _ = p.expect(")", "')' to close @TypeOf");
+        return n;
+    }
+    let id = p.ident("a type");
+    let n = p.mk(.TName, id);
+    n.name = if (text.eq(id.s, "Self")) p.selfName(id) else id.s;
+    while (!p.in_receiver && p.at(".") && p.peek(1).k == .Id && p.peek(1).s[0] != '@') { // heap.Arena: a type inside a type
+        _ = p.next();
+        n.name = text.f("{s}.{s}", .{n.name, p.next().s});
+    }
+    if (!p.in_receiver && p.at("(")) { // List(i32): a type made by a function that returns `type`
+        _ = p.next();
+        n.k = .TGeneric;
+        while (!p.at(")")) {
+            let a = p.cur();
+            if (a.k == .Int || a.k == .Str || a.k == .Float || parser.isOp(a, "-") || parser.isOp(a, "true") || parser.isOp(a, "false")) {
+                n.add(parse_expr.expr(p));
+            } else {
+                n.add(type_(p));
+            }
+            if (p.accept(",") == null) { break; }
+        }
+        _ = p.expect(")", "')' or ',' after the type arguments");
+        while (p.at(".") && p.peek(1).k == .Id) { // Tree(i32).Node: a type inside an instance
+            _ = p.next();
+            let m = p.next().s;
+            n.name2 = if (n.name2.len > 0) text.f("{s}.{s}", .{n.name2, m}) else m;
+        }
+    }
+    if (p.at("!") && p.cur().k == .Op) { // E!T
+        let bang = p.next();
+        let u = p.mk(.TErrU, bang);
+        u.a = n;
+        u.b = type_(p);
+        return u;
+    }
+    return n;
+}

@@ -1,0 +1,8 @@
+import std.io;
+
+fn show(f: []const u8) -> !void {
+    try io.print(f, .{});
+}
+fn main() -> !void {
+    try show("x");
+}

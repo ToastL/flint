@@ -1,0 +1,11 @@
+import std.io;
+
+enum Dir { North = -1, South = 1 }
+fn main() -> !void {
+    var x: i32 = 1;
+    try io.print("{}\n", .{x as Dir});
+    x = -1;
+    try io.print("{}\n", .{x as Dir});
+    x = 0;
+    try io.print("{}\n", .{x as Dir});
+}

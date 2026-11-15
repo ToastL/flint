@@ -1,0 +1,4 @@
+fn get() -> ?i32 { return 1; }
+fn main() -> !void {
+    if (get()) |*v| { v.* = 2; }
+}

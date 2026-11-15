@@ -1,0 +1,1 @@
+a packed struct field must be an integer, bool, plain enum or packed struct, not []const u8

@@ -1,0 +1,10 @@
+fn isNumber(comptime T: type) -> bool { return @isInt(T) || @isFloat(T); }
+fn sum(comptime T: type, xs: []const T) -> T where isNumber(T) {
+    var s: T = 0;
+    for (xs) |x| { s += x; }
+    return s;
+}
+fn main() {
+    let w = [_]bool { true };
+    let s = sum(bool, w[..]);
+}

@@ -1,0 +1,10 @@
+len2 25 scaled Point{ x: 6, y: 8 }
+area 10 9
+stack 2 8
+counter 6 limit 100
+helper 1 4
+origin 10 20
+shout HEY words 3
+check -1 40
+ring 12 2
+fn value 42

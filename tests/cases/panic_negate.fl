@@ -1,0 +1,7 @@
+import std.io;
+
+fn get(x: i32) -> i32 { return x; }
+fn main() -> !void {
+    try io.print("{}\n", .{-get(-2147483647)});
+    try io.print("{}\n", .{-get(-2147483647 - 1)});
+}

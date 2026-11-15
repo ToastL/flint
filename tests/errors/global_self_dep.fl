@@ -1,0 +1,4 @@
+let a: i64 = b;
+let b: i64 = a;
+
+fn main() {}

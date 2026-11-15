@@ -1,0 +1,48 @@
+// opt.dce - dead code: instructions whose results are unused (and that have no effects) go away,
+// as do moves of a register to itself. Also coalescing: "t = a op b; x = mov t" becomes
+// "x = a op b" when t has no other use.
+
+import ir.ir;
+import opt.opt;
+
+pub fn run(f: *ir.IRFunc) -> bool {
+    var ch = false;
+    var again = true;
+    while (again) {
+        again = false;
+        opt.count(f);
+        for (f.blocks.items) |*blk| {
+            if (blk.dead) { continue; }
+            for (blk.insts.items) |*in| {
+                let self_mov = in.op == .Mov && in.a.k == .Reg && in.a.v == in.dst as i64;
+                if ((in.dst >= 0 && opt.usecnt[in.dst as usize] == 0 && !ir.hasEffects(in)) || self_mov) {
+                    if (in.op == .Call) { continue; }
+                    opt.nop(in);
+                    again = true;
+                    ch = true;
+                }
+            }
+        }
+        opt.compact(f);
+    }
+    return ch;
+}
+
+pub fn coalesce(f: *ir.IRFunc) {
+    opt.count(f);
+    for (f.blocks.items) |*blk| {
+        let xs = blk.insts.items;
+        for (1..xs.len) |i| {
+            let m = &xs[i];
+            let p = &xs[i - 1];
+            if (m.op != .Mov || m.a.k != .Reg) { continue; }
+            let s = m.a.v as i32;
+            if (p.dst == s && opt.defcnt[s as usize] == 1 && opt.usecnt[s as usize] == 1 &&
+                f.vcls.items[s as usize] == f.vcls.items[m.dst as usize]) {
+                p.dst = m.dst;
+                opt.nop(m);
+            }
+        }
+    }
+    opt.compact(f);
+}

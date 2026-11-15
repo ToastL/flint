@@ -1,0 +1,75 @@
+// opt.promote - slots whose address never escapes become vregs: mem2reg plus scalar replacement
+// of aggregates (each distinct offset of a slot gets its own vreg). A slot whose address is taken,
+// or that is accessed at overlapping offsets or with different sizes, stays in memory.
+
+import base.alloc;
+import ir.ir;
+
+struct Acc {
+    off: i64,
+    mem: i32,
+    cls: ir.Cls,
+    vreg: i32,
+}
+
+pub fn promote(f: *ir.IRFunc) {
+    let ns = f.slots.items.len;
+    if (ns == 0) { return; }
+    let esc = alloc.make(bool, ns);
+    let acc = alloc.make(alloc.Vec(Acc), ns);
+    for (f.blocks.items) |*blk| {
+        for (blk.insts.items) |*in| {
+            if (in.op == .AddrSlot) { esc[in.slot as usize] = true; }
+            if ((in.op == .Load || in.op == .Store) && in.slot >= 0) {
+                let s = in.slot as usize;
+                var found: ?usize = null;
+                for (0..acc[s].items.len) |k| { if (found == null && acc[s].items[k].off == in.imm) { found = k; } }
+                if (found) |k| {
+                    if (acc[s].items[k].mem != in.mem || acc[s].items[k].cls != in.cls) { esc[s] = true; }
+                } else {
+                    acc[s].push(Acc { off: in.imm, mem: in.mem, cls: in.cls, vreg: -1 });
+                }
+            }
+        }
+    }
+    for (0..ns) |s| {
+        if (esc[s]) { continue; }
+        let as_ = acc[s].items;
+        var i: usize = 0;
+        while (i < as_.len && !esc[s]) {
+            for (i + 1..as_.len) |j| {
+                let a0 = as_[i].off;
+                let a1 = a0 + (as_[i].mem & 0x7f) as i64;
+                let b0 = as_[j].off;
+                let b1 = b0 + (as_[j].mem & 0x7f) as i64;
+                if (a0 < b1 && b0 < a1) {
+                    esc[s] = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if (!esc[s]) {
+            for (as_) |*a| { a.vreg = ir.newVreg(f, a.cls); }
+        }
+    }
+    for (f.blocks.items) |*blk| {
+        for (blk.insts.items) |*in| {
+            if ((in.op != .Load && in.op != .Store) || in.slot < 0 || esc[in.slot as usize]) { continue; }
+            let s = in.slot as usize;
+            var v: i32 = -1;
+            for (acc[s].items) |*a| { if (a.off == in.imm) { v = a.vreg; } }
+            if (in.op == .Load) {
+                in.op = .Mov;
+                in.a = ir.R(v);
+            } else {
+                in.op = .Mov;
+                in.dst = v;
+                in.a = in.b;
+                in.b.k = .None;
+            }
+            in.slot = -1;
+            in.imm = 0;
+        }
+    }
+}

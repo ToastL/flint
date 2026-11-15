@@ -1,0 +1,1 @@
+'==' doesn't compare strings (that's a loop over the bytes); use mem.eql(u8, a, b)

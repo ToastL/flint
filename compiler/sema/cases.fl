@@ -1,0 +1,284 @@
+// sema.cases - `switch`: a chain of compares (a range is one unsigned compare), then the case
+// bodies. Exhaustiveness is checked here: a missing enum variant, error or integer is an error.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.stmt;
+import sema.enums;
+
+// Case values compared in one order: a signed value's sign bit is flipped, so every value of the
+// switched type maps to a u64 with the same order (the C compiler used 128-bit integers here).
+struct Interval {
+    lo: u64,
+    hi: u64,
+}
+
+fn key(v: i64, signed: bool) -> u64 { return if (signed) @bitcast(u64, v) ^ 0x8000000000000000 else @bitcast(u64, v); }
+
+fn keyStr(k: u64, signed: bool) -> []const u8 {
+    if (signed) { return text.f("{}", .{@bitcast(i64, k ^ 0x8000000000000000)}); }
+    return text.f("{}", .{k});
+}
+
+pub fn armEndsWithFallthrough(arm: *ast.Node) -> bool {
+    let body = arm.a.?;
+    return body.k == .Block && body.count() > 0 && body.at(body.count() - 1).k == .Fallthrough;
+}
+
+pub fn lowerSwitch(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let is_expr = n.flag != 0;
+    let subj = cv.defaulted(expr.expr(n.a.?, null));
+    let stt = subj.t;
+    let is_enum = stt.k == .Enum;
+    let is_err = stt.k == .ErrSet;
+    if (!is_enum && !is_err && !ty.isInt(stt) && stt != ty.bool_) {
+        diag.at(n.a.?.tok, text.f("can't switch on {s} (switch works on enums, errors, integers and bools)", .{ty.tname(stt)}));
+    }
+    if (is_enum) { ty.layout(stt, n.tok); }
+    let ct = if (is_enum) stt.tagt.? else if (is_err) ty.u16_ else stt; // what the tag compares as
+    let sg = ty.isSigned(ct);
+    var tag = if (is_enum) enums.enumTag(subj) else b.opdOf(subj);
+    if (tag.k == .Imm) { tag = b.R(b.iconst(tag.v)); }
+    let narms = n.count();
+    let body = alloc.make(i32, narms);
+    let covered = alloc.make(bool, (if (is_enum) stt.variants.items.len else if (is_err) stt.errcodes.items.len else 0) + 1);
+    var ivs: alloc.Vec(Interval) = .{};
+    var else_arm: ?usize = null;
+    for (0..narms) |i| { body[i] = b.newBlock(); }
+    for (0..narms) |i| {
+        let arm = n.at(i);
+        for (arm.list.items) |p| {
+            if (p.flag == 3) {
+                if (else_arm != null) { diag.at(p.tok, "a switch can only have one 'else' case"); }
+                if (arm.count() > 1) { diag.at(p.tok, "'else' must be a case of its own"); }
+                else_arm = i;
+                continue;
+            }
+            if (p.count() > 0 && arm.count() > 1) { diag.at(p.tok, "a case that captures a payload must have a single pattern"); }
+            let nt = b.newBlock();
+            if (p.flag == 2 && is_err) { // .NotFound on an error
+                let code = cv.errCode(p.name);
+                if (!cv.setHas(stt, code as i64)) { diag.at(p.tok, text.f("{s} has no error {s}", .{ty.tname(stt), p.name})); }
+                for (0..stt.errcodes.items.len) |k| {
+                    if (stt.errcodes.items[k] == code) {
+                        if (covered[k]) { diag.at(p.tok, text.f("error.{s} is already handled by an earlier case", .{p.name})); }
+                        covered[k] = true;
+                    }
+                }
+                b.br(b.R(b.cmp(.EQ, tag, b.IMM(code as i64))), body[i], nt);
+            } else if (p.flag == 2) { // .Tag
+                if (!is_enum) { diag.at(p.tok, text.f("'.{s}' patterns need an enum, but this switch is on {s}", .{p.name, ty.tname(stt)})); }
+                var k: ?usize = null;
+                for (0..stt.variants.items.len) |j| { if (k == null && text.eq(stt.variants.items[j].name, p.name)) { k = j; } }
+                let ki = k orelse diag.at(p.tok, text.f("enum {s} has no variant '{s}'", .{stt.name, p.name}));
+                let vr = &stt.variants.items[ki];
+                if (covered[ki]) { diag.at(p.tok, text.f("{s}.{s} is already handled by an earlier case", .{stt.name, vr.name})); }
+                covered[ki] = true;
+                b.br(b.R(b.cmp(.EQ, tag, b.IMM(vr.value))), body[i], nt);
+            } else { // value, or lo..=hi
+                var lo = expr.expr(p.a.?, stt);
+                if (!lo.isconst) { diag.at(p.a.?.tok, "case values must be constants"); }
+                lo = cv.coerce(lo, stt, p.a.?.tok, "case value");
+                var hi = lo;
+                if (p.flag == 1) {
+                    if (is_enum || is_err || stt == ty.bool_) { diag.at(p.tok, "ranges only work on integers"); }
+                    hi = expr.expr(p.b.?, stt);
+                    if (!hi.isconst) { diag.at(p.b.?.tok, "case values must be constants"); }
+                    hi = cv.coerce(hi, stt, p.b.?.tok, "case value");
+                }
+                let wl = key(lo.ival, sg);
+                let wh = key(hi.ival, sg);
+                if (wl > wh) { diag.at(p.tok, text.f("empty range: {s} is greater than {s}", .{keyStr(wl, sg), keyStr(wh, sg)})); }
+                if (is_err) {
+                    for (0..stt.errcodes.items.len) |k| {
+                        if (stt.errcodes.items[k] as i64 == lo.ival) {
+                            if (covered[k]) {
+                                diag.at(p.tok, text.f("error.{s} is already handled by an earlier case", .{st.M.errnames.items[lo.ival as usize]}));
+                            }
+                            covered[k] = true;
+                        }
+                    }
+                } else if (is_enum) {
+                    var k: usize = 0;
+                    while (stt.variants.items[k].value != lo.ival) { k += 1; }
+                    if (covered[k]) { diag.at(p.tok, text.f("{s}.{s} is already handled by an earlier case", .{stt.name, stt.variants.items[k].name})); }
+                    covered[k] = true;
+                } else {
+                    for (ivs.items) |*iv| {
+                        if (wl <= iv.hi && iv.lo <= wh) {
+                            diag.at(p.tok, text.f("case {s} is already handled by an earlier case", .{keyStr(if (wl > iv.lo) wl else iv.lo, sg)}));
+                        }
+                    }
+                    ivs.push(Interval { lo: wl, hi: wh });
+                }
+                if (wl == wh) {
+                    b.br(b.R(b.cmp(.EQ, tag, b.IMM(lo.ival))), body[i], nt);
+                } else { // lo <= x <= hi  as one unsigned compare: (x - lo) <= (hi - lo)
+                    let d = b.op2(.Sub, .I, tag, b.IMM(lo.ival));
+                    b.br(b.R(b.cmp(.LS, b.R(d), b.IMM(@bitcast(i64, wh -% wl)))), body[i], nt);
+                }
+            }
+            b.setBlk(nt);
+        }
+    }
+    // nothing matched
+    if (else_arm) |ea| {
+        b.jmp(body[ea]);
+    } else if (is_err) {
+        if (stt.all_errors) { diag.at(n.tok, text.f("a switch on {s} needs an 'else' case: any error can show up", .{ty.tname(stt)})); }
+        var missing: []const u8 = "";
+        for (0..stt.errcodes.items.len) |k| {
+            if (covered[k]) { continue; }
+            let en = st.M.errnames.items[stt.errcodes.items[k] as usize];
+            missing = if (missing.len > 0) text.f("{s}, error.{s}", .{missing, en}) else text.f("error.{s}", .{en});
+        }
+        if (missing.len > 0) { diag.at(n.tok, text.f("switch doesn't handle {s} (add it or an 'else' case)", .{missing})); }
+        b.trap();
+    } else if (is_enum) {
+        var missing: []const u8 = "";
+        var nmissing: i32 = 0;
+        for (0..stt.variants.items.len) |v| {
+            if (covered[v]) { continue; }
+            let vn = stt.variants.items[v].name;
+            missing = if (missing.len > 0) text.f("{s}, {s}.{s}", .{missing, stt.name, vn}) else text.f("{s}.{s}", .{stt.name, vn});
+            nmissing += 1;
+        }
+        if (nmissing > 0) {
+            diag.at(n.tok, text.f("switch doesn't handle {s} (add {s} or an 'else' case)", .{missing, if (nmissing > 1) "them" else "it"}));
+        }
+        let msg = b.strLit("invalid enum value in switch"); // e.g. garbage handed over by C
+        _ = b.callI("_rt_panic", .None, &[_]ir.Opd { b.R(b.load(ty.ptrTo(ty.u8_), msg.a)), b.IMM(28) });
+        b.trap();
+    } else {
+        var tmin: u64 = 0;
+        var tmax: u64 = 1;
+        if (stt != ty.bool_) {
+            let bits = (stt.size * 8) as u64;
+            if (sg) {
+                let half = @bitcast(i64, @bitcast(u64, 1 as i64) << (bits - 1));
+                tmin = key(0 -% half, true);
+                tmax = key(half - 1, true);
+            } else {
+                tmax = if (bits >= 64) 0xffffffffffffffff else (@bitcast(u64, 1 as i64) << bits) - 1;
+            }
+        }
+        // sort the intervals, then look for a gap
+        let iv = ivs.items;
+        for (0..iv.len) |x| {
+            for (x + 1..iv.len) |y| {
+                if (iv[y].lo < iv[x].lo) {
+                    let t = iv[x];
+                    iv[x] = iv[y];
+                    iv[y] = t;
+                }
+            }
+        }
+        var next = tmin;
+        var past = false; // next went beyond the largest u64
+        for (iv) |*x| {
+            if (past || next > tmax) { break; }
+            if (x.lo > next) { break; }
+            if (x.hi == 0xffffffffffffffff) {
+                past = true;
+            } else if (x.hi + 1 > next) {
+                next = x.hi + 1;
+            }
+        }
+        if (!past && next <= tmax) {
+            let shown = if (stt == ty.bool_) (if (next != 0) "true" else "false") else keyStr(next, sg);
+            diag.at(n.tok, text.f("switch on {s} doesn't handle every value ({s} is missing); add an 'else' case", .{ty.tname(stt), shown}));
+        }
+        b.trap();
+    }
+    // case bodies
+    let join = b.newBlock();
+    let vals = alloc.make(b.Val, narms + 1);
+    let ends = alloc.make(i32, narms + 1);
+    for (0..narms) |i| {
+        let arm = n.at(i);
+        b.setBlk(body[i]);
+        names.pushScope(false, -1, -1);
+        if (arm.count() == 1 && arm.at(0).flag == 2 && arm.at(0).count() > 0) {
+            enums.bindCaptures(arm.at(0), enums.findVariant(stt, arm.at(0).name).?, stt, subj);
+        }
+        let ab = arm.a.?;
+        if (is_expr) {
+            let w = if (want) |x| x else if (i > 0 && !ty.isLit(vals[0].t)) vals[0].t else null;
+            vals[i] = expr.expr(ab, w);
+            ends[i] = st.c().blk;
+            names.popScope();
+            continue;
+        }
+        if (armEndsWithFallthrough(arm)) {
+            let ft = ab.at(ab.count() - 1).tok;
+            if (i + 1 >= narms) { diag.at(ft, "fallthrough in the last case has nowhere to go"); }
+            let nx = n.at(i + 1);
+            if (nx.count() == 1 && nx.at(0).count() > 0) { diag.at(ft, "can't fall through into a case that captures a payload"); }
+            for (0..ab.count() - 1) |j| { stmt.stmt(ab.at(j)); }
+            stmt.emitDefers(st.c().cur);
+            names.popScope();
+            b.jmp(body[i + 1]);
+            continue;
+        }
+        if (ab.k == .Block) {
+            stmt.blockBody(ab);
+        } else {
+            stmt.stmt(ab);
+            stmt.emitDefers(st.c().cur);
+        }
+        names.popScope();
+        b.jmp(join);
+    }
+    if (!is_expr) {
+        b.setBlk(join);
+        return b.vVoid();
+    }
+    var t = ty.noreturn_;
+    for (0..narms) |i| {
+        let bt = vals[i].t;
+        if (bt == ty.noreturn_ || bt == t) { continue; }
+        if (t == ty.noreturn_) {
+            t = bt;
+            continue;
+        }
+        if (ty.isNum(t) && ty.isNum(bt)) {
+            t = cv.unify(t, bt, n.at(i).a.?.tok, "switch");
+        } else if (t == ty.null_ && ty.isPtr(bt)) {
+            t = bt;
+        } else if (!(bt == ty.null_ && ty.isPtr(t))) {
+            diag.at(n.at(i).a.?.tok, text.f("every case of a switch expression must have the same type ({s} vs {s})", .{ty.tname(t), ty.tname(bt)}));
+        }
+    }
+    t = if (want) |w| w else ty.defaultT(t);
+    if (t == ty.void_) { diag.at(n.tok, "switch cases must produce values"); }
+    var res: b.Val = undefined;
+    if (ty.isAgg(t)) {
+        let ra = b.temp(t);
+        for (0..narms) |i| {
+            b.setBlk(ends[i]);
+            b.copyAgg(t, ra, cv.coerce(vals[i], t, n.at(i).a.?.tok, "switch case").a);
+            b.jmp(join);
+        }
+        res = b.vAgg(t, ra, true);
+    } else {
+        let r = b.newVreg(ty.clsOf(t));
+        for (0..narms) |i| {
+            b.setBlk(ends[i]);
+            b.mov(r, ty.clsOf(t), b.opdOf(cv.coerce(vals[i], t, n.at(i).a.?.tok, "switch case")));
+            b.jmp(join);
+        }
+        res = b.vReg(t, r);
+    }
+    b.setBlk(join);
+    return res;
+}

@@ -1,0 +1,8 @@
+struct C {
+    n: i64 = 0,
+    fn bump(self: *Self) { self.n += 1; }
+}
+fn main() -> !void {
+    let c = C {};
+    c.bump();
+}

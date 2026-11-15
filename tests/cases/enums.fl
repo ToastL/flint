@@ -1,0 +1,142 @@
+// Enums, tagged unions and switch.
+
+import std.io;
+
+enum Color { Red, Green, Blue }
+enum Http: u16 { Ok = 200, NotFound = 404, Teapot = 418 }
+enum Dir { North = -1, South = 1 }
+
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+    Line(f64, f64, f64, f64),
+    Empty,
+
+    fn area(self: Shape) -> f64 {
+        return switch (self) {
+            .Circle(r) => 3.0 * r * r,
+            .Rect(rc) => rc.w * rc.h,
+            .Line(_, _, _, _) => 0,
+            .Empty => 0,
+        };
+    }
+    fn unit() -> Shape { return .Rect { w: 1, h: 1 }; }
+}
+
+struct Pixel { color: Color, shape: Shape }
+
+fn describe(c: Color) -> str {
+    switch (c) {
+        .Red => return "warm",
+        .Green, .Blue => return "cool",
+    }
+}
+
+fn classify(n: i64) -> str {
+    return switch (n) {
+        0 => "zero",
+        1..=9 => "small",
+        10, 20, 30 => "round",
+        else => "big",
+    };
+}
+
+fn grade(score: u8) -> u8 {
+    var g: u8 = 'F';
+    switch (score) {
+        90..=255 => g = 'A',
+        80..=89 => g = 'B',
+        0..=79 => {},
+    }
+    return g;
+}
+
+fn total(shapes: []const Shape) -> f64 {
+    var sum: f64 = 0;
+    for (shapes) |s| { sum += s.area(); }
+    return sum;
+}
+
+fn main() -> !void {
+    // plain enums are just integers
+    let c = Color.Green;
+    let d: Color = .Blue;
+    try io.print("color {} {} {} {} {} {} {}\n", .{ c, d, c == .Green, c != d, c as u8, Http.Teapot as u16, Dir.North as i8 });
+    try io.print("sizes {} {} {} {} {s}\n", .{ @sizeOf(Color), @sizeOf(Http), @sizeOf(Dir), @sizeOf(Shape), @tagName(Http.NotFound) });
+    try io.print("describe {s} {s} {s}\n", .{ describe(.Red), describe(c), describe(Color.Blue) });
+
+    // integer switches: values, ranges, several patterns per case, else
+    try io.print("classify {s} {s} {s} {s} {s}\n", .{ classify(0), classify(7), classify(20), classify(-3), classify(1000) });
+    try io.print("grade {} {} {}\n", .{ grade(95), grade(85), grade(10) });
+
+    // tagged unions with payloads, constructed both ways
+    var shape_arr = [_]Shape {
+        Shape.Circle(2.0),
+        .Rect { w: 3, h: 4 },
+        Shape.unit(),
+        .Line(0, 0, 1, 1),
+        .Empty,
+    };
+    let shapes: []Shape = &shape_arr;
+    for (shapes) |s, i| { try io.print("{} {} {}\n", .{ i, s, s.area() }); }
+    try io.print("total {}\n", .{total(shapes)});
+
+    // enums inside structs, copied by value
+    var px = Pixel { color: .Red, shape: .Circle(1.5) };
+    var copy = px;
+    copy.shape = .Empty;
+    px.color = .Blue;
+    try io.print("pixel {} {} {} {} {}\n", .{ px.color, px.shape, px.shape.area(), copy.color, copy.shape });
+
+    // switch on bool and bytes; fallthrough; break out of a loop from a case
+    var hits: i64 = 0;
+    for ("a1b2c3!x") |ch| {
+        switch (ch) {
+            '0'..='9' => hits += 10,
+            '!' => break,
+            'a' => {
+                hits += 1;
+                fallthrough;
+            }
+            'b' => hits += 100,
+            else => {},
+        }
+    }
+    let flag = hits > 100;
+    let word = switch (flag) {
+        true => "yes",
+        false => "no",
+    };
+    try io.print("hits {} {s}\n", .{ hits, word });
+
+    // defer inside a case runs when the case ends
+    switch (c) {
+        .Green => {
+            defer io.print("  (deferred in case)\n", .{}) catch {};
+            try io.print("in green case\n", .{});
+        }
+        else => try io.print("other\n", .{}),
+    }
+
+    // an enum value read from memory, then matched
+    var log: [2]Http = .{ .Ok, .Ok };
+    log[1] = .Teapot;
+    for (log) |h| {
+        let msg = switch (h) {
+            .Ok => "fine",
+            .NotFound => "missing",
+            .Teapot => "short and stout",
+        };
+        try io.print("{} {s}\n", .{ h as u16, msg });
+    }
+
+    // integers back to enums: checked, dense or sparse
+    let codes = [_]u16 { 200, 418, 404 };
+    for (codes) |c| { try io.print("{}\n", .{c as Http}); }
+    for (0..3) |i| {
+        let col = i as Color;
+        try io.print("{} {s}\n", .{ col, @tagName(col) });
+    }
+    let lit = 2 as Color;
+    try io.print("{}\n", .{lit});
+}

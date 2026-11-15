@@ -1,0 +1,4 @@
+
+--- stderr
+panic: DebugAllocator: freed 8 bytes of a 16-byte allocation
+--- exit 101

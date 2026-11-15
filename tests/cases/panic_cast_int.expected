@@ -1,0 +1,4 @@
+255
+--- stderr
+panic: value doesn't fit in u8 in 'as'
+--- exit 101

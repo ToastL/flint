@@ -1,0 +1,5 @@
+fn Bad(comptime n: usize) -> type {
+    if (n == 0) { return u8; }
+    return struct { inner: Bad(n) };
+}
+fn main() { var b: Bad(1) = undefined; }

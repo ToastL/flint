@@ -1,0 +1,74 @@
+// std.process - running other programs, and the environment. (Exiting is the builtin exit(code).)
+//
+//   let status = try process.run(alloc, &[_][]const u8 { "cc", "-c", "x.c" });
+//   if (status != 0) { ... }
+
+import std.mem;
+
+extern fn posix_spawnp(pid: *i32, file: cstr, actions: ?*void, attrs: ?*void, argv: [*]?cstr, envp: [*]?cstr) -> i32;
+extern fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+extern fn _NSGetEnviron() -> *[*]?cstr;
+extern fn _NSGetExecutablePath(buf: [*]u8, size: *u32) -> i32;
+extern fn getenv(name: cstr) -> ?cstr;
+extern fn __error() -> *i32;
+
+pub error ProcessError { SpawnFailed, WaitFailed, NameTooLong, NotFound }
+
+// Runs argv[0] (looked up in PATH) with the arguments argv[1..], waits for it, and returns its
+// exit status; a program killed by a signal gives 128 + the signal number. The NUL-terminated
+// copies of the arguments the OS needs come from `a` and are freed before it returns.
+// io.stdout is buffered: call io.flush() first if the child writes to the same output.
+pub fn run(a: mem.Allocator, argv: []const []const u8) -> !u8 {
+    if (argv.len == 0) { return error.SpawnFailed; }
+    var total: usize = 0;
+    for (argv) |s| { total += s.len + 1; }
+    let bytes = try a.alloc(u8, total);
+    defer a.free(bytes);
+    let ptrs = try a.alloc(?cstr, argv.len + 1);
+    defer a.free(ptrs);
+    var at: usize = 0;
+    for (0..argv.len) |i| {
+        let s = argv[i];
+        mem.copy(u8, bytes[at..at + s.len], s);
+        bytes[at + s.len] = 0;
+        unsafe { ptrs[i] = @ptrCast(cstr, &bytes[at]); }
+        at += s.len + 1;
+    }
+    ptrs[argv.len] = null;
+    var pid: i32 = 0;
+    let file = ptrs[0] orelse unreachable;
+    if (posix_spawnp(&pid, file, null, null, ptrs.ptr, _NSGetEnviron().*) != 0) { return error.SpawnFailed; }
+    var st: i32 = 0;
+    while (waitpid(pid, &st, 0) < 0) {
+        if (__error().* != 4) { return error.WaitFailed; } // EINTR: try again
+    }
+    let sig = st & 0x7f;
+    if (sig == 0) { return ((st >> 8) & 0xff) as u8; }
+    return (128 + sig) as u8;
+}
+
+// The value of an environment variable, or null. It points into the environment itself.
+pub fn getEnv(name: []const u8) -> ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    if (name.len >= buf.len) { return null; }
+    mem.copy(u8, buf[0..name.len], name);
+    buf[name.len] = 0;
+    var c: cstr = undefined;
+    unsafe { c = @ptrCast(cstr, &buf[0]); }
+    let v = getenv(c) orelse return null;
+    return mem.span(v);
+}
+
+// The path of the running executable (as it was started: it may contain symbolic links),
+// written into out.
+pub fn exePath(out: []u8) -> ProcessError![]u8 {
+    var buf: [1024]u8 = undefined;
+    var n: u32 = 1024;
+    if (_NSGetExecutablePath(&buf, &n) != 0) { return error.NameTooLong; }
+    var c: cstr = undefined;
+    unsafe { c = @ptrCast(cstr, &buf[0]); }
+    let s = mem.span(c);
+    if (s.len > out.len) { return error.NameTooLong; }
+    mem.copy(u8, out[0..s.len], s);
+    return out[0..s.len];
+}

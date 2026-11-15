@@ -1,0 +1,1 @@
+an error can't be captured by pointer; write |err|

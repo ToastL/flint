@@ -1,0 +1,4 @@
+extern union V { i: i64, f: f64 }
+fn main() -> !void {
+    let v = V { i: 1, f: 2.0 };
+}

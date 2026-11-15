@@ -1,0 +1,6 @@
+import std.io;
+
+fn f() -> !i64 { return 1; }
+fn main() -> !void {
+    let x = f() catch |e| { try io.print("{}\n", .{e}); };
+}

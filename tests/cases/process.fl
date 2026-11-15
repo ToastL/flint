@@ -1,0 +1,20 @@
+import std.io;
+import std.process;
+import std.heap;
+
+fn main() -> !void {
+    let a = heap.c_allocator;
+    try io.print("before\n", .{});
+    try io.flush(); // the child writes to the same stdout
+    let st = try process.run(a, &[_][]const u8 { "sh", "-c", "echo hi from sh; exit 3" });
+    try io.print("status {}\n", .{st});
+    let killed = try process.run(a, &[_][]const u8 { "sh", "-c", "kill -9 $$" });
+    try io.print("killed {}\n", .{killed});
+    try io.print("unset: {}\n", .{process.getEnv("NO_SUCH_VAR_XYZ") == null});
+    try io.print("PATH set: {}\n", .{process.getEnv("PATH") != null});
+    var b: [1024]u8 = undefined;
+    let p = try process.exePath(b[..]);
+    try io.print("exe path: {}\n", .{p.len > 0});
+    let bad = process.run(a, &[_][]const u8 { "no-such-program-xyz" });
+    if (bad) |s| { try io.print("status {}\n", .{s}); } else |e| { try io.print("{s}\n", .{@errorName(e)}); }
+}

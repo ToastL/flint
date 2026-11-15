@@ -1,0 +1,1 @@
+'bump' modifies its receiver, which is immutable here (declare it with 'var')

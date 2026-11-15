@@ -1,0 +1,47 @@
+// std.testing - checks for `test "name" { ... }` blocks (run them with `flint test`).
+//
+//   test "parsing" {
+//       try testing.expect(mem.eql(u8, trimmed, "x"));
+//       try testing.expectEqual(i32, 42, try parse("42"));
+//   }
+//
+// A failed check prints what it expected to stderr and returns an error, which fails the test.
+
+import std.io;
+import std.mem;
+
+pub error TestError { TestUnexpectedResult, TestExpectedEqual, TestExpectedError, TestUnexpectedError }
+
+// ok must be true.
+pub fn expect(ok: bool) -> TestError!void {
+    if (!ok) { return error.TestUnexpectedResult; }
+}
+
+// actual must equal expected (integers, floats, bools, enums, errors and pointers).
+pub fn expectEqual(comptime T: type, expected: T, actual: T) -> TestError!void {
+    if (expected != actual) {
+        io.eprint("expected {any}, found {any}\n", .{ expected, actual }) catch {};
+        return error.TestExpectedEqual;
+    }
+}
+
+// The two strings must hold the same bytes.
+pub fn expectEqualStrings(expected: []const u8, actual: []const u8) -> TestError!void {
+    if (!mem.eql(u8, expected, actual)) {
+        io.eprint("expected \"{s}\", found \"{s}\"\n", .{ expected, actual }) catch {};
+        return error.TestExpectedEqual;
+    }
+}
+
+// actual (an error union) must hold the error `expected`.
+pub fn expectError(expected: anyerror, actual: anytype) -> TestError!void {
+    if (actual) |v| {
+        io.eprint("expected error.{s}, found a value\n", .{@errorName(expected)}) catch {};
+        return error.TestExpectedError;
+    } else |e| {
+        if (e != expected) {
+            io.eprint("expected error.{s}, found error.{s}\n", .{ @errorName(expected), @errorName(e) }) catch {};
+            return error.TestUnexpectedError;
+        }
+    }
+}

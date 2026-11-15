@@ -1,0 +1,213 @@
+// sema.expr - the expression dispatcher: which lowering each kind of node gets, names as values,
+// `a.b` as a value, and conditions (`&&`, `||`, `!` as branches).
+
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.ops;
+import sema.casts;
+import sema.literals;
+import sema.optional;
+import sema.errors;
+import sema.calls;
+import sema.members;
+import sema.builtins;
+import sema.enums;
+import sema.cases;
+import sema.generics;
+import sema.ctexec;
+import sema.globals;
+import sema.stmt;
+import sema.cdecls;
+
+// names in n resolve in the module n was written in
+pub fn expr(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let su = st.CU;
+    let stok = st.CUR_TOK;
+    if (n.unit) |u| { st.CU = u; }
+    st.CUR_TOK = n.tok;
+    let v = exprIn(n, want);
+    st.CU = su;
+    st.CUR_TOK = stok;
+    return v;
+}
+
+fn typeVal(t: *ty.Type) -> b.Val { return b.vInt(ty.type_, ty.typeId(t)); }
+
+fn constVal(v: *st.Var) -> b.Val {
+    return if (ty.isFloat(v.t.?)) b.vFlt(v.t.?, v.cfval) else b.vInt(v.t.?, v.cival);
+}
+
+fn exprIn(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    switch (n.k) {
+        .Int => {
+            if (n.ival > 0x7fffffffffffffff) { return b.vInt(ty.u64_, @bitcast(i64, n.ival)); }
+            return b.vInt(ty.litint, n.ival as i64);
+        }
+        .Float => { return b.vFlt(ty.litfloat, n.fval); }
+        .Bool => { return b.vInt(ty.bool_, n.ival as i64); }
+        .Null => { return b.vInt(ty.null_, 0); }
+        .Str => { return b.strLit(n.str); }
+        .Builtin => { return builtins.exBuiltin(n, want); }
+        .Undefined => { diag.at(n.tok, "'undefined' can only be the initial value of a 'var' or a struct field"); }
+        .TypeExpr => { // a type as a comptime value: let P = *Node;
+            let a = n.a.?;
+            if (a.k == .TPtr && a.flag2 == 0 && a.a.?.k == .TName && ty.primType(a.a.?.name) == null && names.findStruct(a.a.?.name) == null) {
+                diag.at(n.tok, "dereference is written after the pointer in Flint: 'p.*'");
+            }
+            return typeVal(names.resolve(a));
+        }
+        .Struct => {
+            var ok = false;
+            if (st.C) |cx| { if (cx.fn_) |f| { ok = f.ct_fn; } }
+            if (!ok) { diag.at(n.tok, "'struct { ... }' can only be made in a function that returns 'type'"); }
+            return typeVal(generics.ctStructExpr(n));
+        }
+        .Comptime => { return ctexec.ctEval(n.a.?, want, "the comptime value"); }
+        .Name => {
+            if (names.findVar(n.name) == null) {
+                if (names.findFn(n.name)) |f| { return calls.fnValue(f, n.tok); }
+                if (names.isBuiltin(n.name)) { diag.at(n.tok, text.f("'{s}' is a builtin, not a function value; call it with ()", .{n.name})); }
+                var tt = ty.primType(n.name);
+                if (tt == null) {
+                    tt = names.findStruct(n.name);
+                    if (tt != null) { names.checkTypePub(tt, n.tok); }
+                }
+                if (tt) |t| { return typeVal(t); } // a type as a comptime value
+            }
+            let v = names.lookup(n.name, n.tok);
+            if (v.kind == .Type) { return typeVal(v.t.?); }
+            if (v.kind == .Const) { return constVal(v); }
+            if (v.kind == .CStr) { return b.strLit(v.sdata); }
+            return access.lvLoad(access.lval(n));
+        }
+        .FieldAcc => {
+            let base = n.a.?;
+            if (names.unitRef(base)) |mu| { // io.stdout, fmt.format as a value
+                if (members.moduleVar(n)) |gv| {
+                    if (gv.kind == .Type) { return typeVal(gv.t.?); }
+                    if (gv.kind == .Const) { return constVal(gv); }
+                    return access.lvLoad(access.lval(n));
+                }
+                if (members.calleeFn(n)) |mf| { return calls.fnValue(mf, n.tok); }
+                if (names.typeIn(mu, n.name)) |t| {
+                    names.checkTypePub(t, n.tok);
+                    return typeVal(t);
+                }
+                members.noMember(mu, n);
+            }
+            if (names.headerRef(base)) |h| { return cdecls.cValue(h, n); }
+            if (members.isStaticRef(base)) {
+                let stt = members.staticType(base).?;
+                if (globals.staticVar(stt, n.name)) |sv| { // heap.page_allocator
+                    if (sv.kind == .Const) { return constVal(sv); }
+                    return access.lvLoad(access.lval(n));
+                }
+                if (names.findMethod(stt, n.name)) |m| { return calls.fnValue(m, n.tok); } // Vec2.len as a value
+                if (stt.k == .Enum) { return enums.enumValue(stt, n.name, 0, @zeroes([]*ast.Node), n.tok); }
+                if (stt.k == .ErrSet) { // FileError.NotFound
+                    let code = cv.errCode(n.name);
+                    if (!cv.setHas(stt, code as i64)) { diag.at(n.tok, text.f("{s} has no error {s}", .{stt.name, n.name})); }
+                    return b.vInt(stt, code as i64);
+                }
+                if (members.staticType(n)) |inner| { return typeVal(inner); } // Outer.Inner
+            }
+            return access.lvLoad(access.lval(n));
+        }
+        .Deref, .Index => { return access.lvLoad(access.lval(n)); }
+        .Unary => { return ops.exUnary(n, want); }
+        .Binary => { return ops.exBinary(n, want); }
+        .Ternary => { return optional.exTernary(n, want); }
+        .Cast => { return casts.exCast(n); }
+        .Call => { return members.exCall(n, want); }
+        .Slice => { return access.exSlice(n); }
+        .StructLit => { return literals.exStructlit(n); }
+        .Array => {
+            diag.at(n.tok, "'[a, b, ...]' allocated on the heap, so it was removed: write a stack array [_]T { a, b, ... } (or .{ a, b } where the type is known), or build an ArrayList with an allocator");
+        }
+        .ArrayLit => { return literals.exArraylit(n); }
+        .AnonLit => { return literals.exAnon(n, want); }
+        .DotTag => {
+            let et = if (n.name2.len > 0) names.findStruct(n.name2) else want;
+            if (n.name2.len > 0) { names.checkTypePub(et, n.tok); }
+            if (et) |e| {
+                if (e.k == .ErrSet && n.name2.len == 0 && n.flag == 0) { // .NotFound where an error is expected
+                    let code = cv.errCode(n.name);
+                    if (!cv.setHas(e, code as i64)) { diag.at(n.tok, text.f("{s} has no error {s}", .{ty.tname(e), n.name})); }
+                    return b.vInt(e, code as i64);
+                }
+            }
+            if (et == null || et.?.k != .Enum) {
+                diag.at(n.tok, text.f("can't tell which enum '.{s}' belongs to here; write the type: E.{s}", .{n.name, n.name}));
+            }
+            return enums.enumValue(et.?, n.name, n.flag, n.list.items, n.tok);
+        }
+        .Switch => { return cases.lowerSwitch(n, want); }
+        .Unwrap => { return optional.exUnwrap(n); }
+        .Try => { return errors.exTry(n); }
+        .Catch => { return errors.exCatch(n); }
+        .ErrLit => { return b.vInt(ty.errlit, cv.errCode(n.name) as i64); }
+        .Orelse => { return optional.exOrelse(n); }
+        .Unreachable => {
+            let msg = b.strLit("reached unreachable code");
+            _ = b.callI("_rt_panic", .None, &[_]ir.Opd { b.R(b.load(ty.ptrTo(ty.u8_), msg.a)), b.IMM(24) });
+            b.trap();
+            return b.vReg(ty.noreturn_, -1);
+        }
+        .Return, .Break, .Continue => {
+            stmt.stmt(n);
+            return b.vReg(ty.noreturn_, -1);
+        }
+        else => { diag.at(n.tok, "expected an expression"); }
+    }
+}
+
+// branch to t if n is true, else f
+pub fn cond(n: *ast.Node, t: i32, f: i32) {
+    let su = st.CU;
+    if (n.unit) |u| { st.CU = u; }
+    condIn(n, t, f);
+    st.CU = su;
+}
+
+fn condIn(n: *ast.Node, t: i32, f: i32) {
+    if (n.k == .Binary && text.eq(n.name, "&&")) {
+        let m = b.newBlock();
+        cond(n.a.?, m, f);
+        b.setBlk(m);
+        cond(n.b.?, t, f);
+        return;
+    }
+    if (n.k == .Binary && text.eq(n.name, "||")) {
+        let m = b.newBlock();
+        cond(n.a.?, t, m);
+        b.setBlk(m);
+        cond(n.b.?, t, f);
+        return;
+    }
+    if (n.k == .Unary && text.eq(n.name, "!")) {
+        cond(n.a.?, f, t);
+        return;
+    }
+    let v = expr(n, null);
+    if (v.t.k == .Opt) {
+        diag.at(n.tok, text.f("this condition is {s}, not bool; unwrap it with 'if (x) |v| {{ ... }}' or compare it: 'x != null'", .{ty.tname(v.t)}));
+    }
+    if (v.t.k == .ErrUnion) {
+        diag.at(n.tok, text.f("this condition is {s}, not bool; use 'if (x) |v| {{ ... }} else |err| {{ ... }}'", .{ty.tname(v.t)}));
+    }
+    if (v.t != ty.bool_) { diag.at(n.tok, text.f("condition must be bool, found {s}", .{ty.tname(v.t)})); }
+    if (v.isconst) {
+        b.jmp(if (v.ival != 0) t else f);
+        return;
+    }
+    b.br(b.R(v.reg), t, f);
+}

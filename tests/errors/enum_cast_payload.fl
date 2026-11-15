@@ -1,0 +1,5 @@
+enum Shape { Circle(f32), Empty }
+fn main() -> !void {
+    let x: u8 = 1;
+    let s = x as Shape;
+}

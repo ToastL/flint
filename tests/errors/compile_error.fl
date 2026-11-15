@@ -1,0 +1,5 @@
+fn Check(comptime T: type) -> type {
+    if (comptime !@isInt(T)) { @compileError("Check needs an integer type"); }
+    return struct { v: T };
+}
+fn main() { var c: Check(f32) = undefined; }

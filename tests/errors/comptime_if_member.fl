@@ -1,0 +1,6 @@
+import std.target;
+fn main() {
+    if (comptime target.os == .windows) {
+        let v = target.windows_version;
+    }
+}

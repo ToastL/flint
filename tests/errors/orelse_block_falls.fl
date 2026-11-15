@@ -1,0 +1,6 @@
+fn first() -> ?i32 { return null; }
+fn main() {
+    let v = first() orelse {
+        let x = 1;
+    };
+}

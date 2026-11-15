@@ -1,0 +1,16 @@
+// syntax.token - what the lexer produces.
+
+pub enum TokKind { Id, Kw, Int, Float, Str, Op, Eof }
+
+pub struct Token {
+    k: TokKind,
+    s: []const u8,     // text of an identifier / keyword / operator
+    ival: u64,
+    fval: f64,
+    str: []const u8,   // a string literal's bytes
+    line: i32,
+    col: i32,
+    autosemi: bool,    // a ';' inserted at a newline
+    path: []const u8,  // where it came from (empty: the root file), for error messages
+    src: []const u8,   // that file's text
+}

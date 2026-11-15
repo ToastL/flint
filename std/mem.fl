@@ -1,0 +1,358 @@
+// std.mem - allocators, and functions on slices and byte strings.
+//
+// A string is just []const u8. Nothing here allocates unless you hand it an Allocator: if a
+// signature has no allocator, the function doesn't allocate (design section 4.13).
+
+extern fn memcmp(a: [*]const u8, b: [*]const u8, n: usize) -> i32;
+extern fn memcpy(dst: [*]u8, src: [*]const u8, n: usize) -> [*]u8;
+extern fn memmove(dst: [*]u8, src: [*]const u8, n: usize) -> [*]u8;
+extern fn strlen(s: cstr) -> usize;
+
+// Running out of memory is an error, not an abort.
+pub error AllocError { OutOfMemory }
+
+// ===========================================================================
+// Allocators
+// ===========================================================================
+
+// What an allocator implements. `alloc` returns null when it's out of memory. `resize`
+// changes an allocation's size in place if it can (true), and otherwise leaves it alone.
+pub struct AllocatorVTable {
+    alloc: fn(*void, usize, usize) -> ?[*]u8,      // (ctx, len, alignment)
+    resize: fn(*void, [*]u8, usize, usize) -> bool, // (ctx, memory, old len, new len)
+    free: fn(*void, [*]u8, usize, usize),           // (ctx, memory, len, alignment)
+}
+
+// Any allocator, as a value: two pointers, no magic. Every function that allocates takes one.
+//
+//   let xs = try alloc.alloc(i32, 100);
+//   defer alloc.free(xs);
+pub struct Allocator {
+    ctx: *void,
+    vtable: *const AllocatorVTable,
+
+    // n items of type T (their contents are undefined).
+    pub fn alloc(self: Allocator, comptime T: type, n: usize) -> AllocError![]T {
+        if (n == 0) { return Allocator.empty(T); }
+        let (bytes, ovf) = @mulWithOverflow(n, @sizeOf(T));
+        if (ovf) { return error.OutOfMemory; }
+        let p = self.vtable.alloc(self.ctx, bytes, @alignOf(T)) orelse return error.OutOfMemory;
+        unsafe { return @ptrCast([*]T, p)[0..n]; }
+    }
+
+    // One T (its contents are undefined). Give it back with destroy().
+    pub fn create(self: Allocator, comptime T: type) -> AllocError!*T {
+        let p = self.vtable.alloc(self.ctx, @sizeOf(T), @alignOf(T)) orelse return error.OutOfMemory;
+        unsafe { return @ptrCast(*T, p); }
+    }
+
+    // Gives back a slice from alloc(), realloc() or dupe(). An empty slice is ignored.
+    pub fn free(self: Allocator, memory: anytype) {
+        if (memory.len == 0) { return; }
+        unsafe {
+            self.vtable.free(self.ctx, @ptrCast([*]u8, memory.ptr), memory.len * @sizeOf(@TypeOf(memory[0])),
+                             @alignOf(@TypeOf(memory[0])));
+        }
+    }
+
+    // Gives back what create() returned.
+    pub fn destroy(self: Allocator, p: anytype) {
+        unsafe { self.vtable.free(self.ctx, @ptrCast([*]u8, p), @sizeOf(@TypeOf(p.*)), @alignOf(@TypeOf(p.*))); }
+    }
+
+    // `old` resized to n items: in place if the allocator can, otherwise moved (and `old` freed).
+    pub fn realloc(self: Allocator, comptime T: type, old: []T, n: usize) -> AllocError![]T {
+        if (old.len == 0) { return self.alloc(T, n); }
+        if (n == 0) {
+            self.free(old);
+            return Allocator.empty(T);
+        }
+        let (bytes, ovf) = @mulWithOverflow(n, @sizeOf(T));
+        if (ovf) { return error.OutOfMemory; }
+        unsafe {
+            if (self.vtable.resize(self.ctx, @ptrCast([*]u8, old.ptr), old.len * @sizeOf(T), bytes)) { return old.ptr[0..n]; }
+        }
+        let fresh = try self.alloc(T, n);
+        let keep = if (n < old.len) n else old.len;
+        unsafe { _ = memcpy(@ptrCast([*]u8, fresh.ptr), @ptrCast([*]const u8, old.ptr), keep * @sizeOf(T)); }
+        self.free(old);
+        return fresh;
+    }
+
+    // A copy of s, in new memory.
+    pub fn dupe(self: Allocator, comptime T: type, s: []const T) -> AllocError![]T {
+        let d = try self.alloc(T, s.len);
+        for (s) |x, i| { d[i] = x; }
+        return d;
+    }
+
+    // A slice with no items: no memory behind it, but a well-aligned pointer.
+    pub fn empty(comptime T: type) -> []T {
+        unsafe { return @intToPtr([*]T, @alignOf(T))[0..0]; }
+    }
+}
+
+// ===========================================================================
+// Slices of any T
+// ===========================================================================
+
+pub enum Order { lt, eq, gt }
+
+// A C string as a Flint string: O(n), it looks for the NUL. No copy is made.
+pub fn span(c: cstr) -> []const u8 {
+    unsafe { return c[0..strlen(c)]; } // C promised a NUL terminator
+}
+
+// Do a and b hold the same items?
+pub fn eql(comptime T: type, a: []const T, b: []const T) -> bool {
+    if (a.len != b.len) { return false; }
+    for (a) |x, i| {
+        if (x != b[i]) { return false; }
+    }
+    return true;
+}
+
+// a compared with b, item by item (a shorter prefix comes first).
+pub fn order(comptime T: type, a: []const T, b: []const T) -> Order where @isInt(T) || @isFloat(T) {
+    let n = if (a.len < b.len) a.len else b.len;
+    for (0..n) |i| {
+        if (a[i] < b[i]) { return .lt; }
+        if (a[i] > b[i]) { return .gt; }
+    }
+    if (a.len < b.len) { return .lt; }
+    if (a.len > b.len) { return .gt; }
+    return .eq;
+}
+
+// Where x first appears in s.
+pub fn indexOf(comptime T: type, s: []const T, x: T) -> ?usize {
+    for (s) |y, i| {
+        if (y == x) { return i; }
+    }
+    return null;
+}
+
+// Where `sub` first appears in s.
+pub fn indexOfSlice(comptime T: type, s: []const T, sub: []const T) -> ?usize {
+    if (sub.len > s.len) { return null; }
+    for (0..s.len - sub.len + 1) |i| {
+        if (eql(T, s[i..i + sub.len], sub)) { return i; }
+    }
+    return null;
+}
+
+pub fn startsWith(comptime T: type, s: []const T, prefix: []const T) -> bool {
+    return prefix.len <= s.len && eql(T, s[0..prefix.len], prefix);
+}
+
+pub fn endsWith(comptime T: type, s: []const T, suffix: []const T) -> bool {
+    return suffix.len <= s.len && eql(T, s[s.len - suffix.len..], suffix);
+}
+
+// Copies src to the start of dst (dst must be at least as long).
+pub fn copy(comptime T: type, dst: []T, src: []const T) {
+    if (src.len > dst.len) { panic("mem.copy: the destination is shorter than the source"); }
+    unsafe { _ = memmove(@ptrCast([*]u8, dst.ptr), @ptrCast([*]const u8, src.ptr), src.len * @sizeOf(T)); }
+}
+
+// Sets every item of dst to v.
+pub fn set(comptime T: type, dst: []T, v: T) {
+    for (dst) |*x| { x.* = v; }
+}
+
+// The pieces of s between each `delim`, one at a time (nothing is allocated).
+pub fn splitScalar(comptime T: type, s: []const T, delim: T) -> SplitIterator(T) {
+    return .{ rest: s, delim: delim, done: false };
+}
+
+pub fn SplitIterator(comptime T: type) -> type {
+    return struct {
+        rest: []const T,
+        delim: T,
+        done: bool,
+
+        pub fn next(self: *Self) -> ?[]const T {
+            if (self.done) { return null; }
+            for (self.rest) |x, i| {
+                if (x == self.delim) {
+                    let piece = self.rest[0..i];
+                    self.rest = self.rest[i + 1..];
+                    return piece;
+                }
+            }
+            self.done = true;
+            return self.rest;
+        }
+    };
+}
+
+// A NUL-terminated copy of s for C, in memory from `alloc`. Free it with mem.freeZ.
+pub fn dupeZ(alloc: Allocator, s: []const u8) -> AllocError!cstr {
+    let d = try alloc.alloc(u8, s.len + 1);
+    copy(u8, d, s);
+    d[s.len] = 0;
+    unsafe { return @ptrCast(cstr, d.ptr); }
+}
+
+pub fn freeZ(alloc: Allocator, c: cstr) {
+    unsafe { alloc.free(c[0..strlen(c) + 1]); }
+}
+
+// ===========================================================================
+// Byte strings ([]const u8)
+// ===========================================================================
+
+fn isSpace(c: u8) -> bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+// s[i..i + p.len] == p, where the caller has checked that it's in range
+fn memeqAt(s: []const u8, i: usize, p: []const u8) -> bool {
+    unsafe { return memcmp(s.ptr + i, p.ptr, p.len) == 0; }
+}
+
+// Position of the first `sub` in s, or null.
+pub fn find(s: []const u8, sub: []const u8) -> ?usize {
+    if (sub.len == 0) { return 0; }
+    if (sub.len > s.len) { return null; }
+    let last = s.len - sub.len;
+    let first = sub[0];
+    var i: usize = 0;
+    while (i <= last) {
+        if (s[i] == first && memeqAt(s, i, sub)) { return i; }
+        i += 1;
+    }
+    return null;
+}
+
+pub fn contains(s: []const u8, sub: []const u8) -> bool { return find(s, sub) != null; }
+
+// < 0, 0 or > 0, comparing bytes
+pub fn compare(a: []const u8, b: []const u8) -> i64 {
+    let c = memcmp(a.ptr, b.ptr, min(a.len, b.len));
+    if (c != 0) { return c as i64; }
+    return (a.len as i64) - (b.len as i64);
+}
+
+// Whitespace removed from both ends (a view; no allocation).
+pub fn trim(s: []const u8) -> []const u8 {
+    var a: usize = 0;
+    var b = s.len;
+    while (a < b && isSpace(s[a])) { a += 1; }
+    while (b > a && isSpace(s[b - 1])) { b -= 1; }
+    return s[a..b];
+}
+
+pub fn trimStart(s: []const u8) -> []const u8 {
+    var a: usize = 0;
+    while (a < s.len && isSpace(s[a])) { a += 1; }
+    return s[a..];
+}
+
+pub fn trimEnd(s: []const u8) -> []const u8 {
+    var b = s.len;
+    while (b > 0 && isSpace(s[b - 1])) { b -= 1; }
+    return s[0..b];
+}
+
+// The pieces of s between each `sep`, one at a time: views into s, nothing is allocated.
+//
+//   var it = mem.split(line, ",");
+//   while (it.next()) |field| { ... }
+pub fn split(s: []const u8, sep: []const u8) -> Split { return Split { rest: s, sep: sep }; }
+
+pub struct Split {
+    rest: []const u8,
+    sep: []const u8,
+    done: bool = false,
+
+    pub fn next(self: *Self) -> ?[]const u8 {
+        if (self.done) { return null; }
+        if (self.sep.len == 0) { // every byte on its own
+            if (self.rest.len == 0) {
+                self.done = true;
+                return null;
+            }
+            let one = self.rest[0..1];
+            self.rest = self.rest[1..];
+            return one;
+        }
+        var i: usize = 0;
+        while (i + self.sep.len <= self.rest.len) {
+            if (self.rest[i] == self.sep[0] && memeqAt(self.rest, i, self.sep)) {
+                let piece = self.rest[0..i];
+                self.rest = self.rest[i + self.sep.len..];
+                return piece;
+            }
+            i += 1;
+        }
+        self.done = true;
+        return self.rest;
+    }
+}
+
+// The strings joined with `sep` between them, in memory from `alloc`.
+pub fn join(alloc: Allocator, parts: []const []const u8, sep: []const u8) -> AllocError![]u8 {
+    var n: usize = 0;
+    for (parts) |s, i| { n += s.len + (if (i > 0) sep.len else 0); }
+    let out = try alloc.alloc(u8, n);
+    var at: usize = 0;
+    for (parts) |s, i| {
+        if (i > 0) {
+            copy(u8, out[at..], sep);
+            at += sep.len;
+        }
+        copy(u8, out[at..], s);
+        at += s.len;
+    }
+    return out;
+}
+
+// s n times over, in memory from `alloc`.
+pub fn repeat(alloc: Allocator, s: []const u8, n: usize) -> AllocError![]u8 {
+    let out = try alloc.alloc(u8, s.len * n);
+    for (0..n) |i| { copy(u8, out[i * s.len..], s); }
+    return out;
+}
+
+// Every `from` in s replaced by `to`, in memory from `alloc`.
+pub fn replaceAll(alloc: Allocator, s: []const u8, from: []const u8, to: []const u8) -> AllocError![]u8 {
+    if (from.len == 0) { return alloc.dupe(u8, s); }
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + from.len <= s.len) {
+        if (memeqAt(s, i, from)) {
+            count += 1;
+            i += from.len;
+        } else {
+            i += 1;
+        }
+    }
+    let out = try alloc.alloc(u8, s.len - count * from.len + count * to.len);
+    var at: usize = 0;
+    var start: usize = 0;
+    i = 0;
+    while (i + from.len <= s.len) {
+        if (memeqAt(s, i, from)) {
+            copy(u8, out[at..], s[start..i]);
+            at += i - start;
+            copy(u8, out[at..], to);
+            at += to.len;
+            i += from.len;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    copy(u8, out[at..], s[start..]);
+    return out;
+}
+
+// The first `from` in s replaced by `to`, in memory from `alloc`.
+pub fn replace(alloc: Allocator, s: []const u8, from: []const u8, to: []const u8) -> AllocError![]u8 {
+    let i = find(s, from) orelse return alloc.dupe(u8, s);
+    if (from.len == 0) { return alloc.dupe(u8, s); }
+    let out = try alloc.alloc(u8, s.len - from.len + to.len);
+    copy(u8, out, s[0..i]);
+    copy(u8, out[i..], to);
+    copy(u8, out[i + to.len..], s[i + from.len..]);
+    return out;
+}

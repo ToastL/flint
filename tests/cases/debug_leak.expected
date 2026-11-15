@@ -1,0 +1,6 @@
+leaks before deinit: 2
+--- stderr
+error(DebugAllocator): leaked 10 bytes (allocation #1)
+error(DebugAllocator): leaked 8 bytes (allocation #3)
+error(DebugAllocator): 2 allocation(s) (18 bytes) were never freed
+--- exit 3

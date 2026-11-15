@@ -1,0 +1,1 @@
+'try' can't be used in a defer: the function is already leaving (handle the error with 'catch')

@@ -1,0 +1,4 @@
+fn may_fail() -> !i64 { return 1; }
+fn main() {
+    let x = try may_fail();
+}

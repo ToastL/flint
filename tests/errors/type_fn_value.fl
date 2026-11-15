@@ -1,0 +1,5 @@
+fn Box(comptime T: type) -> type { return struct { v: T }; }
+fn main() {
+    let b = Box(i32);
+    let c = b + 1;
+}

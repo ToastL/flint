@@ -1,0 +1,235 @@
+// syntax.lex - source text -> tokens. Statements end with an explicit ';'.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+
+let KEYWORDS = [_][]const u8 {
+    "fn", "let", "var", "const", "if", "else", "while", "for", "return", "break", "continue",
+    "struct", "enum", "switch", "fallthrough", "orelse", "unreachable", "true", "false", "null", "undefined",
+    "error", "try", "catch", "errdefer",
+    "as", "extern", "export",
+    "pub", "defer", "union", "packed", "unsafe", "comptime", "import", "test", "where",
+};
+
+// longest first, so "..=" wins over ".." and "."
+let PUNCT = [_][]const u8 {
+    "...", "..=", "<<=", ">>=", "+%=", "-%=", "*%=", "+|=", "-|=", "*|=",
+    "+%", "-%", "*%", "+|", "-|", "*|", ".*", ".?",
+    "->", "=>", "..", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+    "<<", ">>", "++", "--",
+    "+", "-", "*", "/", "%", "<", ">", "=", "!", "&", "|", "^", "~", ".", ",", ":", ";",
+    "(", ")", "{", "}", "[", "]", "?",
+};
+
+fn isDigit(c: u8) -> bool { return c >= '0' && c <= '9'; }
+fn isAlpha(c: u8) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+fn isAlnum(c: u8) -> bool { return isDigit(c) || isAlpha(c); }
+fn isXDigit(c: u8) -> bool { return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+fn lower(c: u8) -> u8 { return if (c >= 'A' && c <= 'Z') c + 32 else c; }
+fn hexVal(c: u8) -> u8 { return if (isDigit(c)) c - '0' else lower(c) - 'a' + 10; }
+
+struct Lexer {
+    toks: alloc.Vec(token.Token),
+    src: []const u8,
+    path: []const u8,
+}
+
+fn mk(l: *Lexer, k: token.TokKind, line: i32, col: i32) -> token.Token {
+    return token.Token { k: k, s: "", ival: 0, fval: 0.0, str: "", line: line, col: col, autosemi: false, path: l.path, src: l.src };
+}
+
+fn errAt(l: *Lexer, line: i32, col: i32, msg: []const u8) -> noreturn {
+    let t = alloc.new(token.Token);
+    t.* = mk(l, .Op, line, col);
+    diag.at(t, msg);
+}
+
+// the byte at i, or 0 past the end (the C version reads the terminating NUL)
+fn at(s: []const u8, i: usize) -> u8 { return if (i < s.len) s[i] else 0; }
+
+// Decodes the escape at src[j] == '\\'. Returns the byte and the length consumed.
+fn escape(l: *Lexer, j: usize, line: i32, ls: usize) -> (u8, usize) {
+    let src = l.src;
+    let e = at(src, j + 1);
+    switch (e) {
+        'n' => { return .{10, 2}; }
+        't' => { return .{9, 2}; }
+        'r' => { return .{13, 2}; }
+        '0' => { return .{0, 2}; }
+        '\\', '"', '\'', '`', '$' => { return .{e, 2}; }
+        'x' => {
+            if (isXDigit(at(src, j + 2)) && isXDigit(at(src, j + 3))) {
+                return .{hexVal(src[j + 2]) * 16 + hexVal(src[j + 3]), 4};
+            }
+        }
+        else => {}
+    }
+    errAt(l, line, (j - ls + 1) as i32, text.f("unknown escape '\\{c}'", .{e}));
+}
+
+pub fn lex(src: []const u8, path: []const u8) -> []token.Token {
+    var lx = Lexer { toks: .{}, src: src, path: path };
+    let l = &lx;
+    let end = src.len;
+    var line: i32 = 1;
+    var ls: usize = 0; // where the current line starts
+    var i: usize = 0;
+    while (i < end) {
+        let c = src[i];
+        let col = (i - ls + 1) as i32;
+        if (c == '\n') {
+            i += 1;
+            line += 1;
+            ls = i;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r') {
+            i += 1;
+            continue;
+        }
+        if (c == '/' && i + 1 < end && src[i + 1] == '/') {
+            while (i < end && src[i] != '\n') { i += 1; }
+            continue;
+        }
+        if (c == '/' && i + 1 < end && src[i + 1] == '*') {
+            var j = i + 2;
+            while (j + 1 < end && !(src[j] == '*' && src[j + 1] == '/')) {
+                if (src[j] == '\n') {
+                    line += 1;
+                    ls = j + 1;
+                }
+                j += 1;
+            }
+            if (j + 1 >= end) { errAt(l, line, col, "unterminated comment"); }
+            i = j + 2;
+            continue;
+        }
+        if (isDigit(c)) {
+            var buf: [128]u8 = undefined;
+            var bl: usize = 0;
+            var j = i;
+            var base: u64 = 10;
+            var is_float = false;
+            let c1 = at(src, i + 1);
+            if (c == '0' && (c1 == 'x' || c1 == 'X')) { base = 16; }
+            if (c == '0' && (c1 == 'b' || c1 == 'B')) { base = 2; }
+            if (c == '0' && (c1 == 'o' || c1 == 'O')) { base = 8; }
+            if (base != 10) {
+                j += 2;
+                while (j < end && (isAlnum(src[j]) || src[j] == '_')) {
+                    if (src[j] != '_' && bl < 120) { buf[bl] = src[j]; bl += 1; }
+                    j += 1;
+                }
+            } else {
+                while (j < end && (isDigit(src[j]) || src[j] == '_')) {
+                    if (src[j] != '_' && bl < 120) { buf[bl] = src[j]; bl += 1; }
+                    j += 1;
+                }
+                // after a '.', a number is a tuple field (t.0.1), never a float
+                let n = l.toks.items.len;
+                let field = n > 0 && l.toks.items[n - 1].k == .Op && text.eq(l.toks.items[n - 1].s, ".");
+                if (!field && j + 1 < end && src[j] == '.' && isDigit(src[j + 1])) {
+                    is_float = true;
+                    buf[bl] = src[j]; bl += 1; j += 1;
+                    while (j < end && (isDigit(src[j]) || src[j] == '_')) {
+                        if (src[j] != '_' && bl < 120) { buf[bl] = src[j]; bl += 1; }
+                        j += 1;
+                    }
+                }
+                if (!field && j + 1 < end && (src[j] == 'e' || src[j] == 'E') &&
+                    (isDigit(src[j + 1]) || ((src[j + 1] == '+' || src[j + 1] == '-') && j + 2 < end && isDigit(src[j + 2])))) {
+                    is_float = true;
+                    buf[bl] = src[j]; bl += 1; j += 1;
+                    buf[bl] = src[j]; bl += 1; j += 1;
+                    while (j < end && isDigit(src[j])) {
+                        if (bl < 120) { buf[bl] = src[j]; bl += 1; }
+                        j += 1;
+                    }
+                }
+            }
+            var t = mk(l, if (is_float) .Float else .Int, line, col);
+            if (is_float) {
+                t.fval = text.parseFloat(buf[0..bl]);
+            } else {
+                if (bl == 0) { errAt(l, line, col, "bad number literal"); }
+                var v: u64 = 0;
+                for (0..bl) |k| {
+                    let ch = buf[k];
+                    // a letter below 'a' (after lowering) wraps to a huge digit, like the C version's negative one
+                    let d: u64 = if (isDigit(ch)) (ch - '0') as u64 else if (lower(ch) >= 'a') (lower(ch) - 'a' + 10) as u64 else 99;
+                    if (d >= base) { errAt(l, line, col, text.f("bad digit '{c}' in number literal", .{ch})); }
+                    if (v > (0xffffffffffffffff - d) / base) { errAt(l, line, col, "integer literal too large"); }
+                    v = v * base + d;
+                }
+                t.ival = v;
+            }
+            l.toks.push(t);
+            i = j;
+            continue;
+        }
+        if (isAlpha(c) || c == '_' || (c == '@' && isAlpha(at(src, i + 1)))) {
+            var j = i + 1; // identifiers; @name is a builtin
+            while (j < end && (isAlnum(src[j]) || src[j] == '_')) { j += 1; }
+            let w = src[i..j];
+            var t = mk(l, if (text.oneOf(w, KEYWORDS[..])) .Kw else .Id, line, col);
+            t.s = w;
+            l.toks.push(t);
+            i = j;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            let q = c;
+            var j = i + 1;
+            var buf: text.Buf = .{};
+            while (true) {
+                if (j >= end || src[j] == '\n') { errAt(l, line, col, "unterminated literal"); }
+                let ch = src[j];
+                if (ch == q) {
+                    j += 1;
+                    break;
+                }
+                if (ch == '\\') {
+                    let (v, adv) = escape(l, j, line, ls);
+                    buf.byte(v);
+                    j += adv;
+                    continue;
+                }
+                buf.byte(ch);
+                j += 1;
+            }
+            if (q == '"') {
+                var t = mk(l, .Str, line, col);
+                t.str = buf.items;
+                l.toks.push(t);
+            } else {
+                if (buf.items.len != 1) { errAt(l, line, col, "character literal must be exactly one byte"); }
+                var t = mk(l, .Int, line, col);
+                t.ival = buf.items[0] as u64;
+                l.toks.push(t);
+            }
+            i = j;
+            continue;
+        }
+        if (c == '`') {
+            errAt(l, line, col, "template literals were removed because they allocate behind your back; use fmt.allocPrint(alloc, \"...{}...\", .{x}), fmt.bufPrint(&buf, ...) or io.print(...)");
+        }
+        var matched = false;
+        for (PUNCT) |p| {
+            if (i + p.len <= end && text.eq(src[i..i + p.len], p)) {
+                var t = mk(l, .Op, line, col);
+                t.s = p;
+                l.toks.push(t);
+                i += p.len;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) { errAt(l, line, col, text.f("unexpected character '{c}'", .{c})); }
+    }
+    var eof = mk(l, .Eof, line, (i - ls + 1) as i32);
+    eof.s = "";
+    l.toks.push(eof);
+    return l.toks.items;
+}

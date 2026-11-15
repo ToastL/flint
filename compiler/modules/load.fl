@@ -1,0 +1,221 @@
+// modules.load - finding and reading modules: one file is one module (design.md section 4.10)
+//
+//   import std.io;      the standard library, compiled into the flint binary
+//   import geometry;    a dependency's root module (flint.toml [dependencies])
+//   import geometry.x;  a file in that dependency
+//   import net.http;    <package root>/net/http.fl
+//
+// Every file is read once. Imports may form cycles: declaration order doesn't matter anywhere.
+
+import std.fs;
+import std.heap;
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.lex;
+import syntax.parser;
+import syntax.parse_decl;
+import modules.unit;
+import cimport.header;
+import driver.manifest;
+
+extern fn opendir(path: cstr) -> ?*void;
+extern fn readdir(d: *void) -> ?*Dirent;
+extern fn closedir(d: *void) -> i32;
+
+// macOS's struct dirent (64-bit inodes)
+struct Dirent {
+    ino: u64,
+    seekoff: u64,
+    reclen: u16,
+    namlen: u16,
+    kind: u8,
+    name: [1024]u8,
+}
+let DT_DIR: u8 = 4;
+
+struct StdFile { name: []const u8, data: []const u8 }
+
+// The standard library, embedded in the compiler. A new file in std/ must be added here.
+let STD_FILES = [_]StdFile {
+    .{ name: "ascii.fl", data: @embedFile("../../std/ascii.fl") },
+    .{ name: "fmt.fl", data: @embedFile("../../std/fmt.fl") },
+    .{ name: "fs.fl", data: @embedFile("../../std/fs.fl") },
+    .{ name: "hash.fl", data: @embedFile("../../std/hash.fl") },
+    .{ name: "heap.fl", data: @embedFile("../../std/heap.fl") },
+    .{ name: "io.fl", data: @embedFile("../../std/io.fl") },
+    .{ name: "list.fl", data: @embedFile("../../std/list.fl") },
+    .{ name: "map.fl", data: @embedFile("../../std/map.fl") },
+    .{ name: "mem.fl", data: @embedFile("../../std/mem.fl") },
+    .{ name: "process.fl", data: @embedFile("../../std/process.fl") },
+    .{ name: "rt.fl", data: @embedFile("../../std/rt.fl") },
+    .{ name: "target.fl", data: @embedFile("../../std/target.fl") },
+    .{ name: "testing.fl", data: @embedFile("../../std/testing.fl") },
+};
+
+// the C compiler used for C headers and C sources
+pub var cc: []const u8 = "cc";
+
+// is there a std module with this name? (for "did you forget the import" hints)
+pub fn stdHas(name: []const u8) -> bool {
+    let f = text.f("{s}.fl", .{name});
+    for (STD_FILES) |*s| { if (text.eq(s.name, f)) { return true; } }
+    return false;
+}
+
+struct Loader {
+    units: alloc.Vec(*unit.Unit),
+    root_pkg: *unit.Package,
+    names: *parser.Names,
+}
+
+fn findUnit(l: *Loader, file: []const u8) -> ?*unit.Unit {
+    for (l.units.items) |u| { if (text.eq(u.file, file)) { return u; } }
+    return null;
+}
+
+fn prefixOf(path: []const u8) -> []const u8 {
+    let s = alloc.dupe(u8, text.f("{s}__", .{path}));
+    for (0..s.len) |i| { if (s[i] == '.' || s[i] == '-') { s[i] = '_'; } }
+    return s;
+}
+
+// lex a file and read its imports; the rest is parsed once every file is known
+fn newUnit(l: *Loader, path: []const u8, file: []const u8, src: []const u8, pkg: ?*unit.Package, is_std: bool) -> *unit.Unit {
+    let u = alloc.new(unit.Unit);
+    u.path = path;
+    u.file = file;
+    u.pkg = pkg;
+    u.is_std = is_std;
+    u.prefix = prefixOf(path);
+    let last = text.lastIndexOf(path, '.');
+    u.dname = text.f("{s}.", .{if (last) |i| path[i + 1..] else path});
+    for (l.units.items) |o| {
+        if (text.eq(o.prefix, u.prefix)) {
+            diag.at(null, text.f("modules '{s}' and '{s}' would have the same symbol names; rename one of them", .{o.path, path}));
+        }
+    }
+    let slash = text.lastIndexOf(file, '/') orelse 0;
+    u.toks = lex.lex(src, if (is_std) text.f("<std>/{s}", .{file[slash + 1..]}) else file);
+    parse_decl.parseImports(u.toks, l.names, u);
+    l.units.push(u);
+    return u;
+}
+
+fn stdUnit(l: *Loader, name: []const u8, tok: ?*token.Token) -> *unit.Unit {
+    let file = text.f("<std>/{s}.fl", .{name});
+    if (findUnit(l, file)) |u| { return u; }
+    let fname = alloc.dupe(u8, text.f("{s}.fl", .{name}));
+    for (0..fname.len - 3) |i| { if (fname[i] == '.') { fname[i] = '/'; } }
+    for (STD_FILES) |*s| {
+        if (text.eq(s.name, fname)) { return newUnit(l, text.f("std.{s}", .{name}), file, s.data, null, true); }
+    }
+    if (tok) |t| { diag.at(t, text.f("the standard library has no module 'std.{s}'", .{name})); }
+    diag.at(null, text.f("internal error: std.{s} is missing", .{name}));
+}
+
+fn fileUnit(l: *Loader, path: []const u8, file: []const u8, pkg: *unit.Package, tok: ?*token.Token, looked: []const u8) -> *unit.Unit {
+    let rp = manifest.real(file);
+    if (findUnit(l, rp)) |u| { return u; }
+    let src = readSource(file) orelse {
+        if (tok) |t| { diag.at(t, text.f("can't find module '{s}' (looked for {s})", .{path, looked})); }
+        diag.at(null, text.f("can't read {s}", .{file}));
+    };
+    return newUnit(l, path, rp, src, pkg, false);
+}
+
+// a file's text, or null (a directory or a missing file)
+pub fn readSource(path: []const u8) -> ?[]const u8 {
+    if (isDir(path)) { return null; }
+    return fs.readFile(heap.c_allocator, path) catch return null;
+}
+
+fn isDir(path: []const u8) -> bool {
+    let d = opendir(text.z(path)) orelse return false;
+    _ = closedir(d);
+    return true;
+}
+
+fn pathToFile(dotted: []const u8) -> []const u8 {
+    let s = alloc.dupe(u8, text.f("{s}.fl", .{dotted}));
+    for (0..dotted.len) |i| { if (s[i] == '.') { s[i] = '/'; } }
+    return s;
+}
+
+fn resolveImport(l: *Loader, from: *unit.Unit, im: *unit.Import) -> *unit.Unit {
+    let p = im.mpath;
+    if (text.startsWith(p, "std.")) { return stdUnit(l, p[4..], im.tok); }
+    if (text.eq(p, "std")) { diag.at(im.tok, "import a module of the standard library, like 'import std.io;'"); }
+    if (from.is_std) { diag.at(im.tok, text.f("internal error: std imports '{s}'", .{p})); }
+    let pkg = from.pkg.?;
+    let dot = text.indexOf(p, '.');
+    let first = if (dot) |d| p[0..d] else p;
+    for (pkg.deps.items) |*d| {
+        if (!text.eq(d.name, first)) { continue; }
+        if (dot) |di| {
+            let f = text.f("{s}/{s}", .{d.pkg.rootdir, pathToFile(p[di + 1..])});
+            return fileUnit(l, text.f("{s}.{s}", .{d.pkg.name, p[di + 1..]}), f, d.pkg, im.tok, f);
+        }
+        return fileUnit(l, d.pkg.name, d.pkg.root, d.pkg, im.tok, d.pkg.root);
+    }
+    let rel = pathToFile(p);
+    let f = text.f("{s}/{s}", .{pkg.rootdir, rel});
+    // a dependency's own modules are named after it: geometry.shapes
+    return fileUnit(l, if (pkg == l.root_pkg) p else text.f("{s}.{s}", .{pkg.name, p}), f, pkg, im.tok, rel);
+}
+
+fn addDir(l: *Loader, pkg: *unit.Package, dir: []const u8, rel: []const u8) {
+    let d = opendir(text.z(dir)) orelse return;
+    while (readdir(d)) |e| {
+        var name: []const u8 = undefined;
+        unsafe { name = e.name[0..e.namlen as usize]; }
+        if (name[0] == '.') { continue; }
+        let full = text.f("{s}/{s}", .{dir, name});
+        let r = if (rel.len > 0) text.f("{s}/{s}", .{rel, name}) else alloc.dupe(u8, name);
+        if (isDir(full)) {
+            if (!text.eq(name, "out")) { addDir(l, pkg, full, r); }
+            continue;
+        }
+        if (r.len < 4 || !text.endsWith(r, ".fl")) { continue; }
+        let dotted = alloc.dupe(u8, r[0..r.len - 3]);
+        for (0..dotted.len) |i| { if (dotted[i] == '/') { dotted[i] = '.'; } }
+        _ = fileUnit(l, dotted, full, pkg, null, full);
+    }
+    _ = closedir(d);
+}
+
+// Reads the root file and every module it imports (all_files: also every .fl under the root),
+// and parses them all.
+pub fn loadProgram(root_file: []const u8, pkg: *unit.Package, all_files: bool) -> []*unit.Unit {
+    var ld = Loader { units: .{}, root_pkg: pkg, names: alloc.new(parser.Names) };
+    let l = &ld;
+    let src = readSource(root_file) orelse diag.at(null, text.f("can't read {s}", .{root_file}));
+    let slash = text.lastIndexOf(root_file, '/');
+    let base = if (slash) |s| root_file[s + 1..] else root_file;
+    let dot = text.lastIndexOf(base, '.');
+    let stem = if (dot) |d| base[0..d] else base;
+    let root = newUnit(l, stem, manifest.real(root_file), src, pkg, false);
+    root.is_root = true;
+    root.prefix = "";
+    root.dname = "";
+    if (all_files) { addDir(l, pkg, pkg.rootdir, ""); }
+    _ = stdUnit(l, "fmt", null); // @format, @hash and @eql expand into calls to these
+    _ = stdUnit(l, "hash", null);
+    _ = stdUnit(l, "rt", null); // the runtime: program entry, panics, output (every program has it)
+    var i: usize = 0;
+    while (i < l.units.items.len) { // the list grows as imports are found
+        let u = l.units.items[i];
+        for (u.imports.items) |*im| {
+            if (im.header.len > 0) {
+                im.c = header.readHeader(im.header, u, im.tok);
+            } else {
+                im.u = resolveImport(l, u, im);
+            }
+        }
+        i += 1;
+    }
+    for (l.units.items) |u| { parse_decl.prescan(u.toks, l.names); }
+    for (l.units.items) |u| { parse_decl.parse(u.toks, l.names, u); }
+    return l.units.items;
+}

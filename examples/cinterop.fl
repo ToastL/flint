@@ -1,0 +1,13 @@
+// Call C directly: import a header, or declare a function yourself with `extern`.
+import c "stdio.h" as c;   // translated by the compiler: functions, types, constants
+import c "math.h" as math;
+
+extern fn rand() -> i32;   // declared by hand
+extern fn srand(seed: u32);
+
+fn main() -> !void {
+    srand(42);
+    let r = rand() % 100;
+    _ = c.printf("printf from Flint: %d %s\n", r, "ok"); // string literals are NUL-terminated: they pass as cstr
+    _ = c.printf("sqrt(2) = %.4f, pi = %.4f, EOF = %d\n", math.sqrt(2.0), math.M_PI, c.EOF);
+}

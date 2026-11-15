@@ -1,0 +1,87 @@
+// Optionals: ?T, if/while captures, orelse, .?
+
+import std.io;
+
+struct User { id: u64, name: str }
+struct Node { value: i64, next: ?*Node = null }
+
+fn find(users: []User, id: u64) -> ?*User {
+    for (users) |*u| {
+        if (u.id == id) { return u; }
+    }
+    return null;
+}
+
+fn parse_digit(c: u8) -> ?i64 {
+    if (c >= '0' && c <= '9') { return (c - '0') as i64; }
+    return null;
+}
+
+fn sum_list(head: ?*Node) -> i64 {
+    var total: i64 = 0;
+    var cur = head;
+    while (cur) |n| {
+        total += n.value;
+        cur = n.next;
+    }
+    return total;
+}
+
+fn first_even(xs: []const i64) -> ?i64 {
+    for (xs) |x| {
+        if (x % 2 == 0) { return x; }
+    }
+    return null;
+}
+
+fn id_times_ten(users: []User, id: u64) -> u64 {
+    let u = find(users, id) orelse return 0;   // early exit: return is an expression
+    return u.id * 10;
+}
+
+fn main() -> !void {
+    var people = [_]User { User { id: 1, name: "ada" }, User { id: 7, name: "grace" } };
+    let users: []User = &people;
+
+    // capture the value if it's there
+    if (find(users, 7)) |u| { try io.print("found {s}\n", .{u.name}); } else { try io.print("no 7\n", .{}); }
+    if (find(users, 3)) |u| { try io.print("found {s}\n", .{u.name}); } else { try io.print("no 3\n", .{}); }
+
+    // compare with null, if-expression with a capture, write through an unwrapped pointer
+    let maybe = find(users, 1);
+    try io.print("not null: {} is null: {}\n", .{ maybe != null, find(users, 9) == null });
+    let name = if (maybe) |u| u.name else "nobody";
+    try io.print("name {s}\n", .{name});
+    maybe.?.name = "ADA";
+    try io.print("{s}\n", .{users[0].name});
+
+    // optional values, not just pointers
+    let d = parse_digit('7');
+    let bad = parse_digit('x');
+    try io.print("digit {} {} {} {} {} {} {}\n", .{ d, bad, d.? + 1, bad orelse -1, @sizeOf(?i64), @sizeOf(?*User), @sizeOf(?u8) });
+    try io.print("first even {} {}\n", .{ first_even(&[_]i64 { 1, 3, 6, 8 }), first_even(&[_]i64 { 1, 3 }) });
+
+    // linked list with optional next pointers
+    var c = Node { value: 3 };
+    var b = Node { value: 2, next: &c };
+    var a = Node { value: 1, next: &b };
+    try io.print("list sum {} {}\n", .{ sum_list(&a), sum_list(null) });
+
+    // orelse with return / continue, and chained orelse
+    try io.print("lookup {} {}\n", .{ id_times_ten(users, 7), id_times_ten(users, 99) });
+    var total: i64 = 0;
+    for ([_]i64 { 4, 0, 5 }) |x| {
+        let v: ?i64 = if (x > 0) x else null;
+        total += v orelse continue;
+    }
+    let none: ?i64 = null;
+    try io.print("total {} {}\n", .{ total, none orelse bad orelse d orelse 0 });
+
+    // optional structs are copied in and out
+    var slot: ?User = null;
+    try io.print("slot empty {}\n", .{slot == null});
+    slot = users[1];
+    if (slot) |u| { try io.print("slot has {s} {}\n", .{ u.name, u.id }); }
+    let u2 = slot.?;
+    try io.print("unwrapped {s} template: {} {}\n", .{ u2.name, d, bad });
+}

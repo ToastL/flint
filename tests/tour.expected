@@ -1,0 +1,13 @@
+count 10 pi 3.14159 small 44
+sum of 5 items: 15
+  xs[1] = 2 is even
+  xs[3] = 4 is even
+sub-slice sum: 5, max: 5
+len: 5
+scaled: 6 8
+heap vec: 3 0
+raw[3] = d via pointer math: e
+flint has 5 bytes; first is f; equal: true
+built flint-42 (8 bytes) [   flint] [3.14]
+ratio 2.5 0.1 + 0.2 = 0.30000000000000004
+loop ran 3 times (ok)

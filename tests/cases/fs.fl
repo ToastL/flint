@@ -1,0 +1,26 @@
+import std.io;
+import std.fs;
+import std.fmt;
+import std.heap;
+
+fn main() -> !void {
+    var tbuf: [64]u8 = undefined;
+    let dir = try fs.makeTempDir("flinttest-", tbuf[..]);
+    var pbuf: [128]u8 = undefined;
+    let path = try fmt.bufPrint(pbuf[..], "{s}/a.txt", .{dir});
+    var f = try fs.createFile(path);
+    var bw = fs.BufferedWriter.init(f);
+    for (0..3) |i| { try fmt.format(bw.writer(), "line {}\n", .{i}); }
+    try bw.flush();
+    f.close();
+    let a = heap.c_allocator;
+    let text = try fs.readFile(a, path);
+    defer a.free(text);
+    try io.print("{s}", .{text});
+    try io.print("exists: {}\n", .{fs.exists(path)});
+    try fs.remove(path);
+    try io.print("exists: {}\n", .{fs.exists(path)});
+    try fs.removeDir(dir);
+    let r = fs.readFile(a, "/nonexistent/x");
+    if (r) |_| {} else |e| { try io.print("{s}\n", .{@errorName(e)}); }
+}

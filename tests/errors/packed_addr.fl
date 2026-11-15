@@ -1,0 +1,5 @@
+packed struct F { a: u3, b: u5 }
+fn main() -> !void {
+    var f = F { a: 1, b: 2 };
+    let p = &f.a;
+}

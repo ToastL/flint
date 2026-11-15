@@ -1,0 +1,3 @@
+fn main() -> !void {
+    let ok = 1 < 2 < 3;
+}

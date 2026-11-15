@@ -1,0 +1,5 @@
+import mods.priv;
+
+fn main() {
+    _ = priv.nope();
+}

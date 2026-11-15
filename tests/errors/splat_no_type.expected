@@ -1,0 +1,1 @@
+can't tell which array @splat makes here; give it a type: 'let a: [N]T = @splat(v);'

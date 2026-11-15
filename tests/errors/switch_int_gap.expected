@@ -1,0 +1,1 @@
+switch on u8 doesn't handle every value (100 is missing); add an 'else' case

@@ -1,0 +1,4 @@
+struct P { x: i64, y: i64 }
+fn main() -> !void {
+    let p = P { x: 1 };
+}

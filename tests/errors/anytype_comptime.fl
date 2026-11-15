@@ -1,0 +1,2 @@
+fn id(comptime x: anytype) {}
+fn main() {}

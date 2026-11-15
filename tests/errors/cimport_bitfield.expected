@@ -1,0 +1,1 @@
+struct flags can only be used behind a pointer (struct flags has bit fields)

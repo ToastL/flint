@@ -1,0 +1,183 @@
+// sema.cdecls - import c "header.h" as c: C declarations, translated to Flint when they're used
+// (design.md section 4.15). C pointers can be null, so they become optionals; structs keep C's
+// layout; a declaration Flint can't use is an error only where it's used.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import cimport.ctypes;
+import cimport.header;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.access;
+import sema.calls;
+import sema.members;
+
+fn cBad(h: *ctypes.CHeader, name: []const u8, why: []const u8, tok: ?*token.Token) -> noreturn {
+    diag.at(tok, text.f("'{s}' from {s} can't be used from Flint: {s}", .{name, header.name(h), why}));
+}
+
+pub fn cNeed(h: *ctypes.CHeader, name: []const u8, tok: ?*token.Token) -> *ctypes.CDecl {
+    let d = header.lookup(h, name) orelse diag.at(tok, text.f("'{s}' isn't declared in {s}", .{name, header.name(h)}));
+    if (d.k == .Bad) { cBad(h, name, d.why, tok); }
+    return d;
+}
+
+fn asType(p: *void) -> *ty.Type {
+    unsafe { return @ptrCast(*ty.Type, p); }
+}
+
+fn cStructType(h: *ctypes.CHeader, name: []const u8, s: *ctypes.CStruct, tok: ?*token.Token) -> *ty.Type {
+    if (s.flint) |f| { return asType(f); }
+    let t = alloc.new(ty.Type);
+    t.k = .Struct;
+    t.name = s.tag;
+    t.dname = s.display;
+    t.mname = text.f("c_{s}_{s}", .{if (s.is_union) "union" else "struct", s.tag});
+    t.is_pub = true;
+    t.is_union = s.is_union;
+    s.flint = t;
+    if (!s.complete || s.why.len > 0) { // only usable behind a pointer
+        t.opaque = true;
+        t.opaque_why = if (s.why.len > 0) s.why else text.f("C declares {s} without its fields", .{s.display});
+        t.state = 2;
+        t.size = 0;
+        t.align = 1;
+        return t;
+    }
+    for (s.fields.items) |*cf| {
+        var fd = @zeroes(ty.Field);
+        fd.name = cf.name;
+        fd.t = ctype(h, name, cf.t, tok);
+        fd.tok = tok;
+        t.fields.push(fd);
+    }
+    ty.layout(t, tok);
+    return t;
+}
+
+fn cInt(size: i32, sign: bool) -> *ty.Type {
+    switch (size) {
+        1 => { return if (sign) ty.i8_ else ty.u8_; }
+        2 => { return if (sign) ty.i16_ else ty.u16_; }
+        4 => { return if (sign) ty.i32_ else ty.u32_; }
+        else => { return if (sign) ty.i64_ else ty.u64_; }
+    }
+}
+
+// the Flint type for a C type (design.md section 4.15): C pointers can be null, so they're optional
+fn ctype(h: *ctypes.CHeader, name: []const u8, ct: *ctypes.CType, tok: ?*token.Token) -> *ty.Type {
+    switch (ct.k) {
+        .Void => { return ty.void_; }
+        .Int => { return if (ct.is_char) ty.u8_ else cInt(ct.size, ct.sign); }
+        .Enum => { return cInt(ct.size, ct.sign); }
+        .Bool => { return ty.bool_; }
+        .Float => { return if (ct.size == 4) ty.f32_ else ty.f64_; }
+        .Named => {
+            if (text.eq(ct.name, "size_t") || text.eq(ct.name, "uintptr_t")) { return ty.usize_; }
+            if (text.eq(ct.name, "ssize_t") || text.eq(ct.name, "intptr_t") || text.eq(ct.name, "ptrdiff_t")) { return ty.isize_; }
+            return ctype(h, name, ct.elem.?, tok);
+        }
+        .Ptr => {
+            let e = ct.elem.?;
+            var u = e;
+            var is_const = e.is_const;
+            while (u.k == .Named && !text.eq(u.name, "size_t")) {
+                u = u.elem.?;
+                is_const = is_const || u.is_const;
+            }
+            if (u.k == .Int && u.is_char) { return ty.optOf(if (is_const) ty.cstr_ else ty.manyPtrQ(ty.u8_, false)); }
+            if (u.k == .Void) { return ty.optOf(ty.ptrToQ(ty.void_, is_const)); }
+            if (u.k == .Fn) { return ty.optOf(ctype(h, name, u, tok)); }
+            let pt = ctype(h, name, e, tok);
+            return ty.optOf(ty.ptrToQ(pt, is_const));
+        }
+        .Array => { return ty.arrayOf(ctype(h, name, ct.elem.?, tok), if (ct.n < 0) 0 else ct.n); }
+        .Fn => {
+            var pt: alloc.Vec(*ty.Type) = .{};
+            for (ct.params.items) |p| { pt.push(ctype(h, name, p, tok)); }
+            return ty.fnType(pt.items, ctype(h, name, ct.elem.?, tok), ct.variadic);
+        }
+        .Struct => { return cStructType(h, name, ct.st.?, tok); }
+        .Bad => { cBad(h, name, text.f("it uses {s}, which Flint doesn't have", .{ct.why}), tok); }
+    }
+}
+
+// a C function as an extern FnInfo
+fn cFn(h: *ctypes.CHeader, d: *ctypes.CDecl, tok: ?*token.Token) -> *st.FnInfo {
+    if (d.cache) |c| {
+        unsafe { return @ptrCast(*st.FnInfo, c); }
+    }
+    let ft = d.t.?;
+    let f = alloc.new(st.FnInfo);
+    f.name = d.name;
+    let decl = alloc.new(ast.Node);
+    decl.k = .Fn;
+    decl.tok = tok.?;
+    decl.name = d.name;
+    f.decl = decl;
+    f.ext = true;
+    f.is_pub = true;
+    f.variadic = ft.variadic;
+    f.sym = if (d.sval.len > 0) d.sval else text.f("_{s}", .{d.name});
+    for (0..ft.params.items.len) |i| {
+        let pt = ctype(h, d.name, ft.params.items[i], tok);
+        ty.layout(pt, tok);
+        f.pt.push(pt);
+        f.pn.push(text.f("p{}", .{i}));
+        f.ptok.push(tok.?);
+    }
+    let ret = ctype(h, d.name, ft.elem.?, tok);
+    f.ret = ret;
+    var by_value = ty.isAgg(ret);
+    for (f.pt.items) |pt| { by_value = by_value || ty.isAgg(pt); }
+    if (by_value) {
+        cBad(h, d.name, "it passes or returns a struct by value, and Flint's calls to C only handle numbers and pointers so far", tok);
+    }
+    f.state = 2;
+    d.cache = f;
+    return f;
+}
+
+pub fn cVar(h: *ctypes.CHeader, d: *ctypes.CDecl, tok: ?*token.Token) -> access.LV {
+    var r = access.newLV();
+    r.t = ctype(h, d.name, d.t.?, tok);
+    ty.layout(r.t, tok);
+    r.ro = d.t.?.is_const;
+    r.a = b.aReg(b.addrSymQ(if (d.sval.len > 0) d.sval else text.f("_{s}", .{d.name}), true), 0); // C's data: through the GOT
+    return r;
+}
+
+pub fn cTypeNamed(h: *ctypes.CHeader, name: []const u8, tok: ?*token.Token) -> ?*ty.Type {
+    let d = if (tok != null) cNeed(h, name, tok) else header.lookup(h, name);
+    if (d == null || d.?.k != .Type) {
+        if (tok != null) { diag.at(tok, text.f("'{s}' from {s} isn't a type", .{name, header.name(h)})); }
+        return null;
+    }
+    return ctype(h, name, d.?.t.?, tok);
+}
+
+// c.NAME as a value: a constant, a C global, or a function's address
+pub fn cValue(h: *ctypes.CHeader, n: *ast.Node) -> b.Val {
+    let d = cNeed(h, n.name, n.tok);
+    switch (d.k) {
+        .ConstInt => { return b.vInt(ty.litint, d.ival); }
+        .ConstFloat => { return b.vFlt(ty.litfloat, d.fval); }
+        .ConstStr => { return b.strLit(d.sval); }
+        .Fn => { return calls.fnValue(cFn(h, d, n.tok), n.tok); }
+        .Var => { return access.lvLoad(cVar(h, d, n.tok)); }
+        .Type => { diag.at(n.tok, text.f("'{s}' from {s} is a type, not a value", .{n.name, header.name(h)})); }
+        else => {}
+    }
+    cBad(h, n.name, d.why, n.tok);
+}
+
+pub fn cCall(h: *ctypes.CHeader, f: *ast.Node, args: []*ast.Node, tok: ?*token.Token) -> b.Val {
+    let d = cNeed(h, f.name, f.tok);
+    if (d.k == .Fn) { return members.callFn(cFn(h, d, f.tok), args, null, tok); }
+    if (d.k == .Var) { return calls.callValue(cValue(h, f), args, tok); }
+    diag.at(f.tok, text.f("'{s}' from {s} isn't a function", .{f.name, header.name(h)}));
+}

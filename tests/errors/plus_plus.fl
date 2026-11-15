@@ -1,0 +1,4 @@
+fn main() -> !void {
+    var i: i64 = 0;
+    i++;
+}

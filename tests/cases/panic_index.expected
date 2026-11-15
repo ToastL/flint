@@ -1,0 +1,4 @@
+before
+--- stderr
+panic: index 3 out of bounds (len 3)
+--- exit 101

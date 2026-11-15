@@ -1,0 +1,3 @@
+import c "no_such_header.h" as c;
+
+fn main() {}

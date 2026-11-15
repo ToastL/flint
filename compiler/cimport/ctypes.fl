@@ -1,0 +1,90 @@
+// cimport.ctypes - C declarations read from a header. sema turns what's used into Flint types and
+// extern functions (sema.cdecls).
+
+import base.alloc;
+
+pub enum CTKind { Void, Int, Float, Bool, Ptr, Array, Fn, Struct, Enum, Named, Bad }
+
+pub struct CType {
+    k: CTKind,
+    size: i32,         // Int, Float, Enum
+    sign: bool,        // Int, Enum
+    is_char: bool,     // plain `char`
+    is_const: bool,    // const-qualified (matters for what a pointer points at)
+    elem: ?*CType,     // Ptr / Array: the item; Fn: the result; Named: what the typedef names
+    n: i64,            // Array: the length (-1 if unknown)
+    params: alloc.Vec(*CType), // Fn
+    variadic: bool,
+    st: ?*CStruct,     // Struct
+    name: []const u8,  // Named: the typedef's name
+    why: []const u8,   // Bad: why Flint can't use it
+}
+
+pub struct CField {
+    name: []const u8,
+    t: *CType,
+}
+
+pub struct CStruct {
+    tag: []const u8,     // "tm" for struct tm (or a made-up name for an anonymous one)
+    display: []const u8, // "struct tm"
+    is_union: bool,
+    complete: bool,
+    fields: alloc.Vec(CField),
+    why: []const u8,     // set if Flint can't lay it out (bit fields, ...)
+    flint: ?*void,       // the Flint Type made for it
+}
+
+pub enum CDeclKind { Fn, Var, Type, ConstInt, ConstFloat, ConstStr, Bad }
+
+pub struct CDecl {
+    k: CDeclKind,
+    name: []const u8,
+    why: []const u8,  // Bad: why it can't be used from Flint
+    t: ?*CType,       // Fn / Var / Type
+    ival: i64,
+    fval: f64,
+    sval: []const u8, // ConstStr: the string; Fn / Var: the asm label ("" if none)
+    cache: ?*void,    // the Flint declaration made for it
+}
+
+pub struct CHeader {
+    name: []const u8,
+    key: []const u8,  // the header plus the include directories: what makes it the same import
+    decls: alloc.Vec(*CDecl),
+    mnames: alloc.Vec([]const u8),
+    mbodies: alloc.Vec(?[]const u8), // object-like macros (body text), and function-like ones (null)
+}
+
+pub fn newType(k: CTKind) -> *CType {
+    let t = alloc.new(CType);
+    t.k = k;
+    return t;
+}
+
+pub fn intType(size: i32, sign: bool) -> *CType {
+    let t = newType(.Int);
+    t.size = size;
+    t.sign = sign;
+    return t;
+}
+
+pub fn badType(why: []const u8) -> *CType {
+    let t = newType(.Bad);
+    t.why = why;
+    return t;
+}
+
+pub fn ptrType(to: *CType) -> *CType {
+    let t = newType(.Ptr);
+    t.elem = to;
+    return t;
+}
+
+pub fn constType(t: *CType) -> *CType {
+    if (t.is_const) { return t; }
+    let c = alloc.new(CType);
+    c.* = t.*;
+    c.is_const = true;
+    return c;
+}

@@ -1,0 +1,9 @@
+import std.io;
+
+enum E { Pair(i64, i64) }
+fn main() -> !void {
+    let e = E.Pair(1, 2);
+    switch (e) {
+        .Pair(a) => try io.print("{}\n", .{a}),
+    }
+}

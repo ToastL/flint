@@ -1,0 +1,395 @@
+// sema.irbuild - building IR in the function being lowered: blocks, vregs, slots, instructions,
+// and the Val/Addr records expressions produce (a value in a register, a constant, or an
+// aggregate at an address). Also string literals and symbol addresses.
+
+import base.alloc;
+import base.text;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+
+pub fn R(v: i32) -> ir.Opd { return ir.R(v); }
+pub fn IMM(v: i64) -> ir.Opd { return ir.IMM(v); }
+
+pub fn newVreg(cls: ir.Cls) -> i32 { return ir.newVreg(st.c().f, cls); }
+
+fn blocks() -> *alloc.Vec(ir.Block) { return &st.c().f.blocks; }
+
+pub fn newBlock() -> i32 {
+    var b = @zeroes(ir.Block);
+    b.seq = -1;
+    blocks().push(b);
+    return (blocks().items.len - 1) as i32;
+}
+
+pub fn newColdBlock() -> i32 {
+    let b = newBlock();
+    blocks().items[b as usize].cold = true;
+    return b;
+}
+
+pub fn setBlk(b: i32) {
+    let cx = st.c();
+    cx.blk = b;
+    let blk = &cx.f.blocks.items[b as usize];
+    if (blk.seq < 0) {
+        blk.seq = cx.seq;
+        cx.seq += 1;
+    }
+}
+
+pub fn newSlot(t: *ty.Type) -> i32 {
+    let f = st.c().f;
+    f.slots.push(ir.Slot { size: if (t.size != 0) t.size else 1, align: if (t.align != 0) t.align else 1 });
+    return (f.slots.items.len - 1) as i32;
+}
+
+pub fn terminated() -> bool {
+    let b = &st.c().f.blocks.items[st.c().blk as usize];
+    let n = b.insts.items.len;
+    return n > 0 && ir.isTerm(&b.insts.items[n - 1]);
+}
+
+// a new instruction at the end of the current block (unreachable code gets its own block)
+pub fn emit(op: ir.Op) -> *ir.Inst {
+    if (terminated()) { setBlk(newBlock()); }
+    var in = @zeroes(ir.Inst);
+    in.op = op;
+    in.cls = .I;
+    in.tok = st.CUR_TOK;
+    in.dst = -1;
+    in.slot = -1;
+    in.t1 = -1;
+    in.t2 = -1;
+    let b = &st.c().f.blocks.items[st.c().blk as usize];
+    b.insts.push(in);
+    return &b.insts.items[b.insts.items.len - 1];
+}
+
+pub fn jmp(b: i32) {
+    if (terminated()) { return; }
+    emit(.Jmp).t1 = b;
+}
+
+pub fn br(c: ir.Opd, t: i32, f: i32) {
+    let i = emit(.Br);
+    i.a = c;
+    i.t1 = t;
+    i.t2 = f;
+}
+
+pub fn op1(op: ir.Op, cls: ir.Cls, a: ir.Opd) -> i32 {
+    let r = newVreg(cls);
+    let i = emit(op);
+    i.dst = r;
+    i.cls = cls;
+    i.a = a;
+    return r;
+}
+
+pub fn op2(op: ir.Op, cls: ir.Cls, a: ir.Opd, b: ir.Opd) -> i32 {
+    let r = newVreg(cls);
+    let i = emit(op);
+    i.dst = r;
+    i.cls = cls;
+    i.a = a;
+    i.b = b;
+    return r;
+}
+
+pub fn iconst(v: i64) -> i32 {
+    let r = newVreg(.I);
+    let i = emit(.IConst);
+    i.dst = r;
+    i.imm = v;
+    return r;
+}
+
+pub fn fconst(cls: ir.Cls, v: f64) -> i32 {
+    let r = newVreg(cls);
+    let i = emit(.FConst);
+    i.dst = r;
+    i.cls = cls;
+    i.fimm = v;
+    return r;
+}
+
+pub fn mov(dst: i32, cls: ir.Cls, a: ir.Opd) {
+    let i = emit(.Mov);
+    i.dst = dst;
+    i.cls = cls;
+    i.a = a;
+}
+
+let MIRROR = [_]ir.CC { .EQ, .NE, .GT, .GE, .LT, .LE, .HI, .HS, .LO, .LS, .MI, .PL };
+
+pub fn cmp(cc0: ir.CC, a0: ir.Opd, b0: ir.Opd) -> i32 {
+    var cc = cc0;
+    var a = a0;
+    var b = b0;
+    if (a.k == .Imm) {
+        if (b.k == .Imm) {
+            a = R(iconst(a.v));
+        } else {
+            let t = a;
+            a = b;
+            b = t;
+            cc = MIRROR[cc as usize];
+        }
+    }
+    let r = newVreg(.I);
+    let i = emit(.Cmp);
+    i.dst = r;
+    i.a = a;
+    i.b = b;
+    i.mem = cc as i32;
+    return r;
+}
+
+pub fn fcmp(cc: ir.CC, a: i32, b: i32) -> i32 {
+    let r = newVreg(.I);
+    let i = emit(.FCmp);
+    i.dst = r;
+    i.a = R(a);
+    i.b = R(b);
+    i.mem = cc as i32;
+    return r;
+}
+
+pub fn emitCall(sym: []const u8, args: []ir.Opd, cls: []ir.Cls, nfixed: i32, retcls: ir.Cls) -> i32 {
+    let r = if (retcls != .None) newVreg(retcls) else -1;
+    let i = emit(.Call);
+    i.sym = sym;
+    i.args = args;
+    i.argcls = cls;
+    i.nfixed = nfixed;
+    i.dst = r;
+    i.cls = if (retcls == .None) .I else retcls;
+    return r;
+}
+
+// a call with these arguments and argument classes
+pub fn callv(sym: []const u8, retcls: ir.Cls, args: []const ir.Opd, cls: []const ir.Cls) -> i32 {
+    return emitCall(sym, alloc.dupe(ir.Opd, args), alloc.dupe(ir.Cls, cls), args.len as i32, retcls);
+}
+
+// a call whose arguments are all integers
+pub fn callI(sym: []const u8, retcls: ir.Cls, args: []const ir.Opd) -> i32 {
+    let cls = alloc.make(ir.Cls, args.len);
+    for (0..args.len) |i| { cls[i] = .I; }
+    return emitCall(sym, alloc.dupe(ir.Opd, args), cls, args.len as i32, retcls);
+}
+
+pub fn trap() { _ = emit(.Trap); }
+
+// ---------- addresses and values ----------
+
+pub struct Addr {
+    slot: i32,
+    reg: i32,
+    off: i64,
+}
+
+pub struct Val {
+    t: *ty.Type,
+    reg: i32,
+    isconst: bool,
+    ival: i64,
+    fval: f64,
+    a: Addr,     // aggregates: where the value lives
+    fresh: bool, // aggregates: a is a private temporary slot
+    strlit: i32, // a string literal: its index + 1 (it can become a cstr)
+}
+
+pub fn aSlot(s: i32, off: i64) -> Addr { return Addr { slot: s, reg: -1, off: off }; }
+pub fn aReg(r: i32, off: i64) -> Addr { return Addr { slot: -1, reg: r, off: off }; }
+pub fn aAdd(a: Addr, off: i64) -> Addr { return Addr { slot: a.slot, reg: a.reg, off: a.off + off }; }
+
+pub fn vReg(t: *ty.Type, r: i32) -> Val {
+    return Val { t: t, reg: r, isconst: false, ival: 0, fval: 0.0, a: aReg(-1, 0), fresh: false, strlit: 0 };
+}
+
+pub fn vInt(t: *ty.Type, x: i64) -> Val {
+    var v = vReg(t, -1);
+    v.isconst = true;
+    v.ival = x;
+    return v;
+}
+
+pub fn vFlt(t: *ty.Type, x: f64) -> Val {
+    var v = vReg(t, -1);
+    v.isconst = true;
+    v.fval = x;
+    return v;
+}
+
+pub fn vAgg(t: *ty.Type, a: Addr, fresh: bool) -> Val {
+    var v = vReg(t, -1);
+    v.a = a;
+    v.fresh = fresh;
+    return v;
+}
+
+pub fn vVoid() -> Val { return vReg(ty.void_, -1); }
+
+pub fn regOf(v: Val) -> i32 {
+    if (!v.isconst) { return v.reg; }
+    if (ty.isFloat(v.t)) { return fconst(ty.clsOf(v.t), v.fval); }
+    return iconst(v.ival);
+}
+
+pub fn opdOf(v: Val) -> ir.Opd {
+    if (v.isconst && !ty.isFloat(v.t)) { return IMM(v.ival); }
+    return R(regOf(v));
+}
+
+pub fn addrReg(a: Addr) -> i32 {
+    var r: i32 = 0;
+    if (a.slot >= 0) {
+        r = newVreg(.I);
+        let i = emit(.AddrSlot);
+        i.dst = r;
+        i.slot = a.slot;
+    } else {
+        r = a.reg;
+    }
+    if (a.off != 0) { r = op2(.Add, .I, R(r), IMM(a.off)); }
+    return r;
+}
+
+pub fn load(t: *ty.Type, a: Addr) -> i32 {
+    let r = newVreg(ty.clsOf(t));
+    let i = emit(.Load);
+    i.dst = r;
+    i.cls = ty.clsOf(t);
+    i.mem = ty.memcode(t);
+    i.slot = a.slot;
+    if (a.slot < 0) { i.a = R(a.reg); }
+    i.imm = a.off;
+    return r;
+}
+
+pub fn store(t: *ty.Type, a: Addr, v: ir.Opd) {
+    let i = emit(.Store);
+    i.cls = ty.clsOf(t);
+    i.mem = ty.memcode(t);
+    i.slot = a.slot;
+    if (a.slot < 0) { i.a = R(a.reg); }
+    i.imm = a.off;
+    i.b = v;
+}
+
+pub fn temp(t: *ty.Type) -> Addr { return aSlot(newSlot(t), 0); }
+
+pub fn copyAgg(t: *ty.Type, dst: Addr, src: Addr) {
+    var L: alloc.Vec(ty.Leaf) = .{};
+    if (ty.leaves(t, 0, &L, 8)) {
+        var regs: [8]i32 = undefined;
+        for (0..L.items.len) |i| { regs[i] = load(L.items[i].t, aAdd(src, L.items[i].off as i64)); }
+        for (0..L.items.len) |i| { store(L.items[i].t, aAdd(dst, L.items[i].off as i64), R(regs[i])); }
+        return;
+    }
+    let d = addrReg(dst);
+    let s = addrReg(src);
+    if (t.size <= 64) {
+        let i = emit(.Memcpy);
+        i.a = R(d);
+        i.b = R(s);
+        i.imm = t.size as i64;
+    } else {
+        _ = callI("_memcpy", .None, &[_]ir.Opd { R(d), R(s), IMM(t.size as i64) });
+    }
+}
+
+pub fn zeroAt(t: *ty.Type, dst: Addr) {
+    if (!ty.isAgg(t)) {
+        if (ty.isFloat(t)) { store(t, dst, R(fconst(ty.clsOf(t), 0.0))); } else { store(t, dst, IMM(0)); }
+        return;
+    }
+    var L: alloc.Vec(ty.Leaf) = .{};
+    if (ty.leaves(t, 0, &L, 8)) {
+        for (L.items) |l| { zeroAt(l.t, aAdd(dst, l.off as i64)); }
+        return;
+    }
+    let d = addrReg(dst);
+    if (t.size <= 64) {
+        let i = emit(.Memzero);
+        i.a = R(d);
+        i.imm = t.size as i64;
+    } else {
+        _ = callI("_bzero", .None, &[_]ir.Opd { R(d), IMM(t.size as i64) });
+    }
+}
+
+// The memory of an `undefined` value. Reading it must give an unspecified but *stable* value
+// (section 4.1), never UB. Debug fills it with 0xAA so such reads stand out. Release modes zero
+// scalars and small aggregates (a few stores, which the optimizer turns into register values),
+// and keep large ones in memory, whose bytes are stable without a memset: the optimizer would
+// otherwise promote never-written fields to registers that hold anything at all.
+pub fn undefinedAt(t: *ty.Type, dst: Addr) {
+    if (st.MODE != .Debug) {
+        if (!ty.isAgg(t) || t.size <= 64) { zeroAt(t, dst); } else { _ = addrReg(dst); } // taking the address pins a slot in memory
+        return;
+    }
+    let pat: i64 = @bitcast(i64, 0xAAAAAAAAAAAAAAAA as u64);
+    if (t.size > 256) {
+        _ = callI("_memset", .None, &[_]ir.Opd { R(addrReg(dst)), IMM(0xAA), IMM(t.size as i64) });
+        return;
+    }
+    var off: i32 = 0;
+    while (off + 8 <= t.size) {
+        store(ty.u64_, aAdd(dst, off as i64), IMM(pat));
+        off += 8;
+    }
+    var k: i32 = 4;
+    while (k >= 1) {
+        if (t.size - off >= k) {
+            store(if (k == 4) ty.u32_ else if (k == 2) ty.u16_ else ty.u8_, aAdd(dst, off as i64), IMM(pat));
+            off += k;
+        }
+        k /= 2;
+    }
+}
+
+pub fn loadVal(t: *ty.Type, a: Addr) -> Val {
+    if (ty.isAgg(t)) { return vAgg(t, a, false); }
+    return vReg(t, load(t, a));
+}
+
+pub fn storeVal(t: *ty.Type, a: Addr, v: Val) {
+    if (ty.isAgg(t)) { copyAgg(t, a, v.a); } else { store(t, a, opdOf(v)); }
+}
+
+// the index of a string literal's bytes in the module (the same bytes are stored once)
+pub fn addStr(data: []const u8) -> i32 {
+    let m = st.M;
+    for (0..m.strs.items.len) |i| { if (text.eq(m.strs.items[i].data, data)) { return i as i32; } }
+    m.strs.push(ir.StrLit { label: text.f("l_fl_str_{}", .{m.strs.items.len}), data: alloc.dupe(u8, data) });
+    return (m.strs.items.len - 1) as i32;
+}
+
+// the address of a symbol; `got`: it's defined in another image (C), so go through the GOT
+pub fn addrSymQ(sym: []const u8, got: bool) -> i32 {
+    let r = newVreg(.I);
+    let i = emit(.AddrSym);
+    i.dst = r;
+    i.sym = sym;
+    i.mem = if (got) 1 else 0;
+    return r;
+}
+
+pub fn addrSym(sym: []const u8) -> i32 { return addrSymQ(sym, false); }
+
+// string literal -> fresh str value
+pub fn strLit(data: []const u8) -> Val {
+    let k = addStr(data);
+    let t = temp(ty.str_);
+    store(ty.ptrTo(ty.u8_), t, R(addrSym(st.M.strs.items[k as usize].label)));
+    store(ty.i64_, aAdd(t, 8), IMM(data.len as i64));
+    var v = vAgg(ty.str_, t, true);
+    v.strlit = k + 1;
+    return v;
+}
+
+// a string literal's bytes, by its Val.strlit
+pub fn strData(strlit: i32) -> []const u8 { return st.M.strs.items[(strlit - 1) as usize].data; }

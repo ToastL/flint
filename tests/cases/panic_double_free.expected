@@ -1,0 +1,4 @@
+freed once
+--- stderr
+panic: DebugAllocator: double free
+--- exit 101

@@ -1,0 +1,12 @@
+import std.heap;
+import std.io;
+
+fn main() -> !void {
+    var gpa = heap.DebugAllocator.init();
+    let alloc = gpa.allocator();
+    let xs = try alloc.alloc(i64, 4);
+    xs[2] = 42;
+    try io.print("before: {}\n", .{xs[2]});
+    alloc.free(xs);
+    try io.print("after: {}\n", .{xs[2]});
+}

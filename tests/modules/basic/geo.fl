@@ -1,0 +1,49 @@
+// geo: a module with pub types, functions, globals and constants
+import util.strs;
+
+pub struct Point {
+    x: i64,
+    y: i64,
+
+    pub fn len2(self: Point) -> i64 { return self.x * self.x + self.y * self.y; }
+}
+
+pub enum Shape { Rect { w: i64, h: i64 }, Square(i64) }
+
+pub error GeoError { Negative }
+
+pub var counter: i64 = 0;
+pub let LIMIT: i64 = 100;
+
+pub fn scale(p: Point, k: i64) -> Point { return Point { x: p.x * k, y: p.y * k }; }
+
+pub fn area(s: Shape) -> i64 {
+    return switch (s) {
+        .Rect(r) => r.w * r.h,
+        .Square(n) => n * n,
+    };
+}
+
+pub fn Stack(comptime T: type) -> type {
+    return struct {
+        items: [4]T,
+        n: usize,
+        pub fn push(self: *Self, x: T) {
+            self.items[self.n] = x;
+            self.n += 1;
+        }
+    };
+}
+
+pub fn bump() { counter += 1; }
+
+fn helper() -> i64 { return 2; }
+
+pub fn usesHelper() -> i64 { return helper() + strs.countWords("x y") as i64; }
+
+pub fn check(n: i64) -> GeoError!i64 {
+    if (n < 0) { return error.Negative; }
+    return n * 10;
+}
+
+pub fn double(n: i64) -> i64 { return n * 2; }

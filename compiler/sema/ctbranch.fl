@@ -1,0 +1,131 @@
+// sema.ctbranch - `if (comptime c)`: the condition, known now, and the untaken branch. That branch
+// isn't type-checked (so it can call what only exists on another target), but a typo in it is
+// still an error everywhere: it may refer only to names that exist. Names bound inside the branch
+// are collected first.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import modules.unit;
+import cimport.header;
+import sema.state as st;
+import sema.types as ty;
+import sema.names;
+import sema.ctexec;
+
+struct NameSet {
+    names: alloc.Vec([]const u8),
+}
+
+fn collectBound(m: ?*ast.Node, s: *NameSet) {
+    let n = m orelse return;
+    switch (n.k) {
+        .Let, .If, .While, .ForRange, .ForEach, .Ternary, .Catch, .Defer, .Orelse => {
+            if (n.name.len > 0) { s.names.push(n.name); }
+            if (n.name2.len > 0) { s.names.push(n.name2); }
+        }
+        else => {}
+    }
+    let binds = n.k == .Let || (n.k == .Pattern && n.flag == 2);
+    if (binds) {
+        for (n.list.items) |c| { if (c.name.len > 0) { s.names.push(c.name); } }
+    }
+    collectBound(n.a, s);
+    collectBound(n.b, s);
+    collectBound(n.c, s);
+    if (!binds) {
+        for (n.list.items) |c| { collectBound(c, s); }
+    }
+}
+
+fn nameBound(s: *NameSet, name: []const u8) -> bool { return text.oneOf(name, s.names.items); }
+
+let PRIMS = [_][]const u8 {
+    "void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "str",
+    "anyerror", "usize", "isize", "cstr", "type", "anytype", "noreturn",
+};
+
+fn unitHas(u: *unit.Unit, name: []const u8) -> bool {
+    if (names.fnIn(u, name) != null || names.typeIn(u, name) != null) { return true; }
+    for (st.gvars.items) |g| { if (g.unit == u && text.eq(g.name, name)) { return true; } }
+    return false;
+}
+
+// `a.b.c` written as one name (types: heap.Arena, Outer.Inner)
+fn checkDotted(name: []const u8, tok: ?*token.Token, mtok: ?*token.Token, s: *NameSet) {
+    let dot = text.indexOf(name, '.');
+    let first = if (dot) |d| name[0..d] else name;
+    if (nameBound(s, first) || text.oneOf(first, PRIMS[..]) || names.findStruct(first) != null || names.envFind(first) != null ||
+        names.findVar(first) != null || names.findFn(first) != null || names.isBuiltin(first) || text.eq(first, "_") ||
+        text.eq(first, "Self")) {
+        return;
+    }
+    if (names.aliasUnit(first)) |u| {
+        if (dot) |d| {
+            let rest = name[d + 1..];
+            let member = if (text.indexOf(rest, '.')) |d2| rest[0..d2] else rest;
+            if (!unitHas(u, member)) {
+                diag.at(mtok, text.f("{s} has no '{s}' (in the branch this target doesn't take)", .{names.unitName(u), member}));
+            }
+        }
+        return;
+    }
+    if (names.aliasHeader(first)) |h| {
+        if (dot) |d| {
+            if (header.lookup(h, name[d + 1..]) == null) {
+                diag.at(mtok, text.f("{s} doesn't declare '{s}' (in the branch this target doesn't take)", .{header.name(h), name[d + 1..]}));
+            }
+        }
+        return;
+    }
+    diag.at(tok, text.f("'{s}' is not defined (in the branch this target doesn't take)", .{first}));
+}
+
+fn checkNamesIn(m: ?*ast.Node, s: *NameSet) {
+    let n = m orelse return;
+    let su = st.CU;
+    if (n.unit) |u| { st.CU = u; }
+    switch (n.k) {
+        .Name, .TName, .TGeneric => { checkDotted(n.name, n.tok, n.tok, s); }
+        .StructLit => {
+            if (n.a == null && n.name.len > 0) { checkDotted(n.name, n.tok, n.tok, s); }
+        }
+        .FieldAcc => {
+            let base = n.a.?;
+            if (base.k == .Name && !nameBound(s, base.name) && !names.isLocal(base.name)) {
+                checkDotted(text.f("{s}.{s}", .{base.name, n.name}), base.tok, n.tok, s);
+                st.CU = su;
+                return;
+            }
+        }
+        .Pattern => {
+            if (n.flag == 2) { // .Tag(captures)
+                st.CU = su;
+                return;
+            }
+        }
+        else => {}
+    }
+    checkNamesIn(n.a, s);
+    checkNamesIn(n.b, s);
+    checkNamesIn(n.c, s);
+    if (n.k != .Let) {
+        for (n.list.items) |c| { checkNamesIn(c, s); }
+    }
+    st.CU = su;
+}
+
+pub fn checkNames(n: *ast.Node) {
+    var s = NameSet { names: .{} };
+    collectBound(n, &s);
+    checkNamesIn(n, &s);
+}
+
+// if (comptime c): the condition, known now
+pub fn comptimeCond(c: *ast.Node) -> bool {
+    let v = ctexec.ctEval(c.a.?, ty.bool_, "the comptime condition");
+    if (v.t != ty.bool_ || !v.isconst) { diag.at(c.tok, "a comptime condition must be a bool"); }
+    return v.ival != 0;
+}

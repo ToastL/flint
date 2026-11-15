@@ -1,0 +1,3 @@
+import c "stdio.h";
+
+fn main() {}

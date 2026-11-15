@@ -1,0 +1,47 @@
+// Declarations that belong to a type: constants, variables and types inside a struct,
+// and global data made of constant structs, function pointers and addresses.
+
+import std.io;
+
+struct Ops {
+    add: fn(i64, i64) -> i64,
+    name: str,
+    next: ?*const Ops = null,
+}
+
+fn plus(a: i64, b: i64) -> i64 { return a + b; }
+fn times(a: i64, b: i64) -> i64 { return a * b; }
+
+let TIMES: Ops = .{ add: times, name: "times" };
+let PLUS = Ops { add: plus, name: "plus", next: &TIMES };
+
+struct Config {
+    let default_port: u16 = 8080;
+    let origin: Config.Point = .{ x: 0, y: 0 };
+    var instances: u32 = 0;
+
+    struct Point { x: i32, y: i32 }
+
+    enum Mode { Fast, Safe }
+
+    port: u16,
+    mode: Config.Mode = .Safe,
+
+    fn make() -> Config {
+        Config.instances += 1;
+        return .{ port: Config.default_port };
+    }
+}
+
+fn main() -> !void {
+    var op: ?*const Ops = &PLUS;
+    while (op) |o| {
+        try io.print("{s}: {}\n", .{ o.name, o.add(6, 7) });
+        op = o.next;
+    }
+    let a = Config.make();
+    let b = Config.make();
+    let p = Config.Point { x: 1, y: 2 };
+    let mode: Config.Mode = .Fast;
+    try io.print("{} {} {} {} {any} {} {}\n", .{ a.port, b.mode, Config.instances, Config.default_port, Config.origin, p.y, mode });
+}

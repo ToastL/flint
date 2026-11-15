@@ -1,0 +1,9 @@
+import std.io;
+
+pub fn show(argv: []const []const u8) -> !void {
+    try io.print("{} argument(s):", .{argv.len - 1});
+    for (argv[1..]) |a| { try io.print(" {s}", .{a}); }
+    try io.print("\n", .{});
+}
+
+test "report has a test too" {}

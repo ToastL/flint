@@ -1,0 +1,179 @@
+// ir.ir - the intermediate representation.
+//
+// Functions are lists of basic blocks. Values live in an unlimited supply of virtual registers
+// (vregs), each with a register class. Memory locals live in stack "slots"; the optimizer
+// promotes slots whose address never escapes into vregs, and the backend maps vregs onto real
+// ARM64 registers.
+
+import base.alloc;
+import syntax.token;
+
+// register classes: 64-bit integer, single, double (None: no value, like C's -1)
+pub enum Cls { I, F32, F64, None }
+
+pub enum OpdKind { None, Reg, Imm }
+
+pub struct Opd {
+    k: OpdKind,
+    v: i64, // vreg number or immediate
+}
+
+pub fn R(r: i32) -> Opd { return Opd { k: .Reg, v: r as i64 }; }
+pub fn IMM(v: i64) -> Opd { return Opd { k: .Imm, v: v }; }
+pub let NONE: Opd = .{ k: .None, v: 0 };
+
+pub enum Op {
+    Nop, GetArg, IConst, FConst, Mov,
+    Add, Sub, Mul, SDiv, UDiv, SRem, URem, And, Or, Xor,
+    Shl, Asr, Lsr, Neg, Not,
+    FAdd, FSub, FMul, FDiv, FNeg, FSqrt, FAbs,
+    Cmp, FCmp, Sel, Ext, Scvtf, Ucvtf, Fcvtzs, Fcvtzu, Fcvt,
+    Load, Store, AddrSlot, AddrSym, Call, Memcpy, Memzero,
+    Jmp, Br, Ret, Trap,
+    SMulH, UMulH, // high 64 bits of a 128-bit product (overflow checks)
+    Vec,     // SIMD on memory: [a] = [b] op [c] (a, b, c hold addresses); mem = a Vop, imm = vlanes()
+    VReduce, // dst = the sum of the lanes at [a]; imm = vlanes()
+}
+
+// Vec operations. Splat: every lane of [a] = b (a scalar of class cls); Neg: [a] = -[b]
+pub enum Vop { Add, Sub, Mul, Div, And, Or, Xor, Neg, Splat }
+
+// lane layout of a vector op: element size in bytes, float lanes, signed lanes (for the reduce
+// result), total bytes
+pub fn vlanes(esize: i64, isfloat: bool, issigned: bool, total: i64) -> i64 {
+    return esize | (if (isfloat) 0x10 else 0) | (if (issigned) 0x20 else 0) | (total << 8);
+}
+pub fn vlEsize(imm: i64) -> i64 { return imm & 0xf; }
+pub fn vlFloat(imm: i64) -> bool { return (imm & 0x10) != 0; }
+pub fn vlSigned(imm: i64) -> bool { return (imm & 0x20) != 0; }
+pub fn vlTotal(imm: i64) -> i64 { return imm >> 8; }
+
+// condition codes (ARM64 names); float compares use MI/LS/GT/GE/EQ/NE
+pub enum CC { EQ, NE, LT, LE, GT, GE, LO, LS, HI, HS, MI, PL }
+
+pub struct Inst {
+    op: Op,
+    cls: Cls,      // register class of the result (or of the value for Store/Ret)
+    mem: i32,      // Load/Store/Ext: byte size | 0x80 if signed. Cmp: a CC. Vec: a Vop. AddrSym: 1 = through the GOT
+    dst: i32,      // defined vreg or -1
+    a: Opd,
+    b: Opd,
+    c: Opd,
+    slot: i32,     // Load/Store: base slot (-1 = base address is vreg a). AddrSlot: slot
+    imm: i64,      // Load/Store offset, IConst value, GetArg index, Memcpy size
+    fimm: f64,     // FConst value
+    t1: i32,       // Jmp/Br targets
+    t2: i32,
+    sym: []const u8, // Call target ("" = through a pointer: the last argument), AddrSym symbol
+    args: []Opd,
+    argcls: []Cls,
+    nfixed: i32,   // args past nfixed are C varargs
+    tok: ?*token.Token, // the source it came from (for errors found when it runs at compile time)
+}
+
+pub struct Block {
+    insts: alloc.Vec(Inst),
+    seq: i32,   // layout order: the order in which blocks were started
+    cold: bool, // unlikely path (panics): laid out at the end
+    dead: bool,
+}
+
+pub struct Slot {
+    size: i32,
+    align: i32,
+}
+
+pub struct IRFunc {
+    sym: []const u8,
+    name: []const u8,   // for messages: "fib", "List(i32).push"
+    ct_only: bool,      // lowered for comptime code: emitted only if run-time code reaches it too
+    is_main: bool,
+    exported: bool,
+    blocks: alloc.Vec(Block),
+    vcls: alloc.Vec(Cls), // class of each vreg
+    slots: alloc.Vec(Slot),
+    retcls: Cls,        // None: returns nothing in a register
+}
+
+pub struct StrLit {
+    label: []const u8,
+    data: []const u8,
+}
+
+pub enum GV { Zero, Int, Str, Fill, Data } // Fill: 0xAA bytes (undefined, Debug)
+
+// Data: a constant aggregate, as pieces at byte offsets (the gaps are zero)
+pub struct DataItem {
+    off: i32,
+    size: i32,
+    val: i64,        // raw bits
+    sym: []const u8, // or the address of this symbol (+ val)
+}
+
+pub struct GlobalVar {
+    sym: []const u8,
+    size: i32,
+    align: i32,
+    kind: GV,
+    ival: i64,     // raw bits for Int
+    sidx: i32,     // string index for Str
+    exported: bool, // visible to the linker (.globl)
+    is_const: bool, // a `let`: comptime code may read it
+    name: []const u8, // for messages
+    items: alloc.Vec(DataItem), // Data
+}
+
+pub struct Module {
+    funcs: alloc.Vec(*IRFunc),
+    errnames: alloc.Vec([]const u8), // error code -> name (code 0 = success)
+    main_errors: bool,               // main returns !void
+    strs: alloc.Vec(StrLit),
+    globals: alloc.Vec(GlobalVar),
+}
+
+// build modes (design.md section 6.2)
+pub enum Mode { Debug, Safe, Fast }
+
+// vregs read by an instruction, into out; returns how many
+pub fn instUses(in: *const Inst, out: *alloc.Vec(i32)) {
+    out.truncate(0);
+    if (in.op == .Call) {
+        for (in.args) |a| { if (a.k == .Reg) { out.push(a.v as i32); } }
+        return;
+    }
+    if (in.a.k == .Reg) { out.push(in.a.v as i32); }
+    if (in.b.k == .Reg) { out.push(in.b.v as i32); }
+    if (in.c.k == .Reg) { out.push(in.c.v as i32); }
+}
+
+pub fn isTerm(in: *const Inst) -> bool { return in.op == .Jmp || in.op == .Br || in.op == .Ret || in.op == .Trap; }
+
+pub fn hasEffects(in: *const Inst) -> bool {
+    switch (in.op) {
+        .Store, .Call, .Memcpy, .Memzero, .Vec, .Jmp, .Br, .Ret, .Trap => { return true; }
+        else => { return false; }
+    }
+}
+
+// a block's successors (0, 1 or 2 of them)
+pub fn succs(b: *const Block) -> ([2]i32, usize) {
+    var out: [2]i32 = .{ -1, -1 };
+    let n = b.insts.items.len;
+    if (n == 0) { return .{out, 0}; }
+    let t = &b.insts.items[n - 1];
+    if (t.op == .Jmp) {
+        out[0] = t.t1;
+        return .{out, 1};
+    }
+    if (t.op == .Br) {
+        out[0] = t.t1;
+        out[1] = t.t2;
+        return .{out, 2};
+    }
+    return .{out, 0};
+}
+
+pub fn newVreg(f: *IRFunc, cls: Cls) -> i32 {
+    f.vcls.push(cls);
+    return (f.vcls.items.len - 1) as i32;
+}

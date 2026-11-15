@@ -1,0 +1,5 @@
+import std.io;
+
+fn io() {}
+
+fn main() {}

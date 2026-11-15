@@ -1,0 +1,36 @@
+// Modules: one file is one module. Names are private unless marked pub.
+import std.io;
+import geo;
+import util.strs as text;
+import ring;
+
+// declaration order doesn't matter: `origin` uses a type and a constant declared below it
+let origin: Pair = .{ a: OFFSET, b: 20 };
+struct Pair { a: i64, b: i64 }
+let OFFSET = 10;
+
+fn helper() -> i64 { return 1; } // geo has a private helper() too; they don't clash
+
+fn main() -> !void {
+    let p = geo.Point { x: 3, y: 4 };
+    try io.print("len2 {} scaled {any}\n", .{ p.len2(), geo.scale(p, 2) });
+    let s = geo.Shape.Rect { w: 2, h: 5 };
+    try io.print("area {} {}\n", .{ geo.area(s), geo.area(.Square(3)) });
+    var stack = geo.Stack(i64) { items: undefined, n: 0 };
+    stack.push(7);
+    stack.push(8);
+    try io.print("stack {} {}\n", .{ stack.n, stack.items[1] });
+    geo.counter += 5;
+    geo.bump();
+    try io.print("counter {} limit {}\n", .{ geo.counter, geo.LIMIT });
+    try io.print("helper {} {}\n", .{ helper(), geo.usesHelper() });
+    try io.print("origin {} {}\n", .{ origin.a, origin.b });
+    try io.print("shout {s} words {}\n", .{ text.shout(), text.countWords("a bb ccc") });
+    let r = geo.check(-1) catch |e| switch (e) {
+        error.Negative => -1,
+    };
+    try io.print("check {} {}\n", .{ r, try geo.check(4) });
+    try io.print("ring {} {}\n", .{ ring.ping(3), ring.depth });
+    let f: fn(i64) -> i64 = geo.double;
+    try io.print("fn value {}\n", .{f(21)});
+}

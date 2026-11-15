@@ -1,0 +1,3 @@
+fn main() -> !void {
+    var a: [_]i32 = undefined;
+}

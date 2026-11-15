@@ -1,0 +1,690 @@
+// cimport.cparse - a small parser for the declarations in preprocessed C: function prototypes,
+// typedefs, structs, unions, enums and extern variables, plus integer constant expressions (enum
+// values, array lengths, macros). Anything it doesn't understand fails with error.Fail, and the
+// declaration is skipped (and only an error if the program uses it).
+
+import base.alloc;
+import base.text;
+import cimport.ctypes;
+import cimport.clex;
+
+extern fn strtoull(s: cstr, end: *[*]u8, base: i32) -> u64;
+
+pub error CFail { Fail }
+
+// one struct/union/enum tag table for every header: C has one `struct tm` per program
+pub var tags: alloc.Vec(*ctypes.CStruct) = @zeroes(alloc.Vec(*ctypes.CStruct));
+
+var macro_depth: i32 = 0;
+
+// where a nested declarator's type goes: int (*fp)(int)
+var HOLE: ctypes.CType = @zeroes(ctypes.CType);
+
+// ---------------------------------------------------------------- the declaration table
+
+pub fn findDecl(h: *ctypes.CHeader, name: []const u8) -> ?*ctypes.CDecl {
+    for (h.decls.items) |d| { if (text.eq(d.name, name)) { return d; } }
+    return null;
+}
+
+// a new declaration; the first one of a name wins (a bad one can be replaced by a good one)
+pub fn addDecl(h: *ctypes.CHeader, k: ctypes.CDeclKind, name: []const u8) -> ?*ctypes.CDecl {
+    if (findDecl(h, name)) |old| {
+        if (old.k == .Bad && k != .Bad) {
+            old.k = k;
+            return old;
+        }
+        return null;
+    }
+    let d = alloc.new(ctypes.CDecl);
+    d.k = k;
+    d.name = name;
+    h.decls.push(d);
+    return d;
+}
+
+fn addBad(h: *ctypes.CHeader, name: []const u8, why: []const u8) {
+    if (addDecl(h, .Bad, name)) |d| { d.why = why; }
+}
+
+pub fn tagNamed(kind: []const u8, tag: []const u8) -> *ctypes.CStruct {
+    let display = text.f("{s} {s}", .{kind, tag});
+    for (tags.items) |t| { if (text.eq(t.display, display)) { return t; } }
+    let s = alloc.new(ctypes.CStruct);
+    s.tag = tag;
+    s.display = display;
+    s.is_union = text.eq(kind, "union");
+    tags.push(s);
+    return s;
+}
+
+// ---------------------------------------------------------------- the parser
+
+pub struct CP {
+    t: []clex.CTok,
+    p: usize,
+    h: *ctypes.CHeader,
+    anon: i32,
+    asm_label: []const u8, // __asm("_fopen$UNIX2003"): the symbol a declaration really links to
+
+    fn cur(self: *Self) -> *clex.CTok { return &self.t[self.p]; }
+    fn tokAt(self: *Self, i: usize) -> *clex.CTok { return &self.t[if (i < self.t.len) i else self.t.len - 1]; }
+    fn isP(self: *Self, s: []const u8) -> bool { return self.cur().k == .P && text.eq(self.cur().s, s); }
+    fn isId(self: *Self, s: []const u8) -> bool { return self.cur().k == .Id && text.eq(self.cur().s, s); }
+
+    fn acceptP(self: *Self, s: []const u8) -> bool {
+        if (!self.isP(s)) { return false; }
+        self.p += 1;
+        return true;
+    }
+
+    fn expectP(self: *Self, s: []const u8) -> CFail!void {
+        if (!self.acceptP(s)) { return error.Fail; }
+    }
+}
+
+pub fn newCP(t: []clex.CTok, h: *ctypes.CHeader) -> CP {
+    return CP { t: t, p: 0, h: h, anon: 0, asm_label: "" };
+}
+
+// skip from an opening bracket to its match
+fn skipGroup(c: *CP) -> CFail!void {
+    var depth: i32 = 0;
+    while (true) {
+        if (c.cur().k == .Eof) { return error.Fail; }
+        if (c.isP("(") || c.isP("[") || c.isP("{")) {
+            depth += 1;
+        } else if (c.isP(")") || c.isP("]") || c.isP("}")) {
+            depth -= 1;
+        }
+        c.p += 1;
+        if (depth <= 0) { break; }
+    }
+}
+
+let WITH_PARENS = [_][]const u8 {
+    "__attribute__", "__attribute", "__asm", "__asm__", "asm", "__declspec", "_Alignas", "__typeof__", "__availability",
+};
+let NOISE_WORDS = [_][]const u8 {
+    "__extension__", "__inline", "__inline__", "inline", "_Noreturn", "__restrict", "__restrict__",
+    "restrict", "volatile", "__volatile__", "_Nullable", "_Nonnull", "_Null_unspecified",
+    "__nullable", "__nonnull", "__null_unspecified", "register", "auto", "_Thread_local",
+    "__thread", "__kindof",
+};
+
+// __attribute__((...)), __asm("..."), __declspec(...), _Alignas(...): nothing Flint needs
+fn skipNoise(c: *CP) -> CFail!bool {
+    if ((c.isId("__asm") || c.isId("__asm__") || c.isId("asm")) && c.tokAt(c.p + 1).k == .P &&
+        text.eq(c.tokAt(c.p + 1).s, "(") && c.tokAt(c.p + 2).k == .Str) {
+        c.asm_label = c.tokAt(c.p + 2).str;
+        c.p += 1;
+        try skipGroup(c);
+        return true;
+    }
+    if (c.cur().k != .Id) { return false; }
+    if (text.oneOf(c.cur().s, WITH_PARENS[..])) {
+        c.p += 1;
+        if (c.isP("(")) { try skipGroup(c); }
+        return true;
+    }
+    if (text.oneOf(c.cur().s, NOISE_WORDS[..])) {
+        c.p += 1;
+        return true;
+    }
+    return false;
+}
+
+fn skipAllNoise(c: *CP) -> CFail!void {
+    while (try skipNoise(c)) {}
+}
+
+let ST_TYPEDEF: i32 = 1;
+let ST_EXTERN: i32 = 2;
+let ST_STATIC: i32 = 4;
+
+fn isTypedefName(c: *CP, s: []const u8) -> bool {
+    let d = findDecl(c.h, s) orelse return false;
+    return d.k == .Type;
+}
+
+let TYPE_WORDS = [_][]const u8 {
+    "void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "_Bool",
+    "struct", "union", "enum", "const", "__const", "volatile", "__int128", "__uint128_t",
+    "__int128_t", "_Complex", "__builtin_va_list", "_Atomic", "_Float16",
+};
+
+// does a type start at token i?
+fn startsTypeAt(c: *CP, i: usize) -> bool {
+    let t = c.tokAt(i);
+    if (t.k != .Id) { return false; }
+    if (text.oneOf(t.s, TYPE_WORDS[..])) { return true; }
+    return isTypedefName(c, t.s);
+}
+
+fn startsType(c: *CP) -> bool { return startsTypeAt(c, c.p); }
+
+// struct tag { fields }  /  union ...  /  struct tag
+fn structSpec(c: *CP, is_union: bool) -> CFail!*ctypes.CType {
+    let kind = if (is_union) "union" else "struct";
+    try skipAllNoise(c);
+    var tag: []const u8 = "";
+    if (c.cur().k == .Id) {
+        tag = c.cur().s;
+        c.p += 1;
+    }
+    try skipAllNoise(c);
+    var s: ?*ctypes.CStruct = if (tag.len > 0) tagNamed(kind, tag) else null;
+    if (c.acceptP("{")) {
+        if (s == null) {
+            c.anon += 1;
+            let a = tagNamed(kind, text.f("anon{}", .{c.anon}));
+            a.display = text.f("an anonymous {s}", .{kind});
+            s = a;
+        }
+        let st = s.?;
+        if (st.complete) { // defined again (another header included it): read past it
+            c.p -= 1;
+            try skipGroup(c);
+        } else {
+            while (!c.acceptP("}")) {
+                if (c.acceptP(";")) { continue; }
+                var storage: i32 = 0;
+                let base = try specifiers(c, &storage);
+                if (c.isP(";")) { // an anonymous struct/union member
+                    st.why = text.f("{s} has an anonymous member", .{st.display});
+                    c.p += 1;
+                    continue;
+                }
+                while (true) {
+                    var fname: []const u8 = "";
+                    let ft = try declarator(c, base, &fname);
+                    if (c.acceptP(":")) {
+                        _ = try constExpr(c);
+                        st.why = text.f("{s} has bit fields", .{st.display});
+                    }
+                    try skipAllNoise(c);
+                    st.fields.push(ctypes.CField { name: fname, t: ft });
+                    if (!c.acceptP(",")) { break; }
+                }
+                try c.expectP(";");
+            }
+            st.complete = true;
+        }
+    }
+    let found = s orelse return error.Fail;
+    let t = ctypes.newType(.Struct);
+    t.st = found;
+    return t;
+}
+
+// enum tag : type { A = 1, B, ... }: the constants become declarations; the type is its integer
+fn enumSpec(c: *CP) -> CFail!*ctypes.CType {
+    try skipAllNoise(c);
+    if (c.cur().k == .Id) { c.p += 1; }
+    let t = ctypes.newType(.Enum);
+    t.size = 4;
+    t.sign = true;
+    if (c.acceptP(":")) {
+        var storage: i32 = 0;
+        var u = try specifiers(c, &storage);
+        while (u.k == .Named) { u = u.elem.?; }
+        if (u.k == .Int) {
+            t.size = u.size;
+            t.sign = u.sign;
+        }
+    }
+    if (c.acceptP("{")) {
+        var next: i64 = 0;
+        while (!c.acceptP("}")) {
+            if (c.cur().k != .Id) { return error.Fail; }
+            let name = c.cur().s;
+            c.p += 1;
+            try skipAllNoise(c);
+            if (c.acceptP("=")) { next = try constExpr(c); }
+            if (addDecl(c.h, .ConstInt, name)) |d| { d.ival = next; }
+            next +%= 1;
+            if (!c.acceptP(",")) {
+                try c.expectP("}");
+                break;
+            }
+        }
+    }
+    return t;
+}
+
+// the type part of a declaration (`static const unsigned long`), and its storage class
+fn specifiers(c: *CP, storage: *i32) -> CFail!*ctypes.CType {
+    var nlong: i32 = 0;
+    var nshort: i32 = 0;
+    var nsigned: i32 = 0;
+    var nunsigned: i32 = 0;
+    var nint: i32 = 0;
+    var is_const = false;
+    var base: ?*ctypes.CType = null;
+    var bad: []const u8 = "";
+    while (true) {
+        if (try skipNoise(c)) { continue; }
+        let t = c.cur();
+        if (t.k != .Id) { break; }
+        let s = t.s;
+        let none = base == null;
+        if (text.eq(s, "typedef")) {
+            storage.* |= ST_TYPEDEF;
+        } else if (text.eq(s, "extern")) {
+            storage.* |= ST_EXTERN;
+        } else if (text.eq(s, "static")) {
+            storage.* |= ST_STATIC;
+        } else if (text.eq(s, "const") || text.eq(s, "__const")) {
+            is_const = true;
+        } else if (text.eq(s, "long")) {
+            nlong += 1;
+        } else if (text.eq(s, "short")) {
+            nshort += 1;
+        } else if (text.eq(s, "signed") || text.eq(s, "__signed") || text.eq(s, "__signed__")) {
+            nsigned += 1;
+        } else if (text.eq(s, "unsigned")) {
+            nunsigned += 1;
+        } else if (text.eq(s, "int")) {
+            nint += 1;
+        } else if (none && text.eq(s, "void")) {
+            base = ctypes.newType(.Void);
+        } else if (none && text.eq(s, "char")) {
+            let b = ctypes.intType(1, true);
+            b.is_char = true;
+            base = b;
+        } else if (none && text.eq(s, "_Bool")) {
+            let b = ctypes.newType(.Bool);
+            b.size = 1;
+            base = b;
+        } else if (none && text.eq(s, "float")) {
+            let b = ctypes.newType(.Float);
+            b.size = 4;
+            base = b;
+        } else if (none && text.eq(s, "double")) {
+            let b = ctypes.newType(.Float);
+            b.size = 8;
+            base = b;
+        } else if (none && (text.eq(s, "__int128") || text.eq(s, "__int128_t") || text.eq(s, "__uint128_t"))) {
+            bad = "128-bit integers";
+        } else if (none && text.eq(s, "_Float16")) {
+            bad = "_Float16";
+        } else if (text.eq(s, "_Complex")) {
+            bad = "complex numbers";
+        } else if (none && text.eq(s, "__builtin_va_list")) {
+            bad = "va_list";
+        } else if (text.eq(s, "_Atomic")) {
+            c.p += 1;
+            if (c.isP("(")) { try skipGroup(c); }
+            bad = "atomics";
+            continue;
+        } else if (none && (text.eq(s, "struct") || text.eq(s, "union"))) {
+            c.p += 1;
+            base = try structSpec(c, text.eq(s, "union"));
+            continue;
+        } else if (none && text.eq(s, "enum")) {
+            c.p += 1;
+            base = try enumSpec(c);
+            continue;
+        } else if (none && nlong == 0 && nshort == 0 && nsigned == 0 && nunsigned == 0 && nint == 0 && isTypedefName(c, s)) {
+            let d = findDecl(c.h, s).?;
+            let b = ctypes.newType(.Named);
+            b.name = s;
+            b.elem = if (d.k == .Type) d.t else ctypes.badType(d.why);
+            base = b;
+        } else {
+            break;
+        }
+        c.p += 1;
+    }
+    var result: *ctypes.CType = undefined;
+    if (bad.len > 0) {
+        result = ctypes.badType(bad);
+    } else if (base) |b| {
+        if (b.k == .Float && b.size == 8 && nlong != 0) {
+            result = ctypes.badType("long double");
+        } else if (b.is_char && (nsigned != 0 || nunsigned != 0)) {
+            result = ctypes.intType(1, nunsigned == 0);
+        } else {
+            result = b;
+        }
+    } else {
+        if (nlong == 0 && nshort == 0 && nsigned == 0 && nunsigned == 0 && nint == 0) { return error.Fail; } // no type at all
+        let size: i32 = if (nshort != 0) 2 else if (nlong != 0) 8 else 4;
+        result = ctypes.intType(size, nunsigned == 0);
+    }
+    return if (is_const) ctypes.constType(result) else result;
+}
+
+fn params(c: *CP, ret: *ctypes.CType) -> CFail!*ctypes.CType {
+    let f = ctypes.newType(.Fn);
+    f.elem = ret;
+    if (c.isId("void") && c.tokAt(c.p + 1).k == .P && text.eq(c.tokAt(c.p + 1).s, ")")) { c.p += 1; }
+    while (!c.acceptP(")")) {
+        if (c.acceptP("...")) {
+            f.variadic = true;
+            try c.expectP(")");
+            break;
+        }
+        var storage: i32 = 0;
+        let base = try specifiers(c, &storage);
+        var pname: []const u8 = "";
+        var pt = try declarator(c, base, &pname);
+        if (pt.k == .Array) { pt = ctypes.ptrType(pt.elem.?); } // int a[] as a parameter is int *a
+        if (pt.k == .Fn) { pt = ctypes.ptrType(pt); }
+        f.params.push(pt);
+        if (!c.acceptP(",")) {
+            try c.expectP(")");
+            break;
+        }
+    }
+    return f;
+}
+
+// after the name: [N] and (params), applied innermost first
+fn suffixes(c: *CP, base: *ctypes.CType) -> CFail!*ctypes.CType {
+    if (c.acceptP("[")) {
+        var n: i64 = -1;
+        while (c.isId("static") || c.isId("const") || c.isId("restrict") || c.isId("__restrict")) { c.p += 1; }
+        if (!c.isP("]")) { n = try constExpr(c); }
+        try c.expectP("]");
+        let inner = try suffixes(c, base);
+        let a = ctypes.newType(.Array);
+        a.elem = inner;
+        a.n = n;
+        return a;
+    }
+    if (c.acceptP("(")) { return params(c, base); }
+    return base;
+}
+
+fn fillHole(t: *ctypes.CType, with: *ctypes.CType) -> *ctypes.CType {
+    if (t == &HOLE) { return with; }
+    if (t.k == .Ptr || t.k == .Array || t.k == .Fn) { t.elem = fillHole(t.elem.?, with); }
+    return t;
+}
+
+pub fn declarator(c: *CP, base0: *ctypes.CType, name: *[]const u8) -> CFail!*ctypes.CType {
+    var base = base0;
+    try skipAllNoise(c);
+    while (c.acceptP("*") || c.acceptP("^")) {
+        if (c.t[c.p - 1].s[0] == '^') { base = ctypes.badType("Objective-C blocks"); } else { base = ctypes.ptrType(base); }
+        while (true) {
+            if (try skipNoise(c)) { continue; }
+            if (c.isId("const") || c.isId("__const")) {
+                c.p += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    if (c.isP("(")) {
+        let nx = c.tokAt(c.p + 1);
+        var nested = nx.k == .P && (text.eq(nx.s, "*") || text.eq(nx.s, "^") || text.eq(nx.s, "("));
+        if (nx.k == .Id && !startsTypeAt(c, c.p + 1) && !text.startsWith(nx.s, "__attribute")) { nested = true; }
+        if (nested) {
+            c.p += 1;
+            let inner = try declarator(c, &HOLE, name);
+            try c.expectP(")");
+            base = try suffixes(c, base);
+            return fillHole(inner, base);
+        }
+    }
+    if (c.cur().k == .Id && !startsType(c)) {
+        name.* = c.cur().s;
+        c.p += 1;
+    }
+    let t = try suffixes(c, base);
+    try skipAllNoise(c);
+    return t;
+}
+
+// ---------------------------------------------------------------- constant expressions
+
+// a C integer (0x.., 0.. octal, decimal) with its U/L suffixes; null if it isn't one
+fn parseIntText(s: []const u8) -> ?i64 {
+    var end: [*]u8 = undefined;
+    let z = text.z(s);
+    var v: u64 = 0;
+    var rest: usize = 0;
+    unsafe {
+        v = strtoull(z, &end, 0);
+        rest = @ptrToInt(end) - @ptrToInt(z);
+    }
+    while (rest < s.len && (s[rest] == 'u' || s[rest] == 'U' || s[rest] == 'l' || s[rest] == 'L')) { rest += 1; }
+    if (rest != s.len) { return null; }
+    return @bitcast(i64, v);
+}
+
+fn cxPrimary(c: *CP) -> CFail!i64 {
+    let t = c.cur();
+    if (t.k == .Num) {
+        let v = parseIntText(t.s) orelse return error.Fail;
+        c.p += 1;
+        return v;
+    }
+    if (t.k == .Char) {
+        c.p += 1;
+        return t.cval;
+    }
+    if (t.k == .Id) {
+        if (text.eq(t.s, "sizeof") || text.eq(t.s, "__builtin_offsetof")) { return error.Fail; }
+        let d = findDecl(c.h, t.s);
+        c.p += 1;
+        if (d) |dd| {
+            if (dd.k == .ConstInt) { return dd.ival; }
+            return error.Fail;
+        }
+        if (macroValue(c.h, t.s)) |v| { return v; }
+        return error.Fail;
+    }
+    if (c.acceptP("(")) {
+        if (startsType(c)) { // a cast: (int)x
+            var storage: i32 = 0;
+            let base = try specifiers(c, &storage);
+            var nm: []const u8 = "";
+            _ = try declarator(c, base, &nm);
+            try c.expectP(")");
+            return cxPrimary(c);
+        }
+        let v = try cxCond(c);
+        try c.expectP(")");
+        return v;
+    }
+    if (c.acceptP("-")) { return 0 -% try cxPrimary(c); }
+    if (c.acceptP("+")) { return cxPrimary(c); }
+    if (c.acceptP("~")) { return ~try cxPrimary(c); }
+    if (c.acceptP("!")) { return if (try cxPrimary(c) == 0) 1 else 0; }
+    return error.Fail;
+}
+
+struct COp { op: []const u8, prec: i32 }
+
+let COPS = [_]COp {
+    .{ op: "*", prec: 10 }, .{ op: "/", prec: 10 }, .{ op: "%", prec: 10 }, .{ op: "+", prec: 9 }, .{ op: "-", prec: 9 },
+    .{ op: "<<", prec: 8 }, .{ op: ">>", prec: 8 }, .{ op: "<", prec: 7 }, .{ op: ">", prec: 7 }, .{ op: "<=", prec: 7 },
+    .{ op: ">=", prec: 7 }, .{ op: "==", prec: 6 }, .{ op: "!=", prec: 6 }, .{ op: "&", prec: 5 }, .{ op: "^", prec: 4 },
+    .{ op: "|", prec: 3 }, .{ op: "&&", prec: 2 }, .{ op: "||", prec: 1 },
+};
+
+fn precOf(op: []const u8) -> i32 {
+    for (COPS) |*o| { if (text.eq(o.op, op)) { return o.prec; } }
+    return 0;
+}
+
+fn b2i(b: bool) -> i64 { return if (b) 1 else 0; }
+
+// the shift amount, as C would use it (out of range: whatever the hardware does, modulo 64)
+fn amt(r: i64) -> u64 { return @bitcast(u64, r) & 63; }
+
+fn cxBinary(c: *CP, min: i32) -> CFail!i64 {
+    var l = try cxPrimary(c);
+    while (true) {
+        let t = c.cur();
+        let pr = if (t.k == .P) precOf(t.s) else 0;
+        if (pr == 0 || pr < min) { return l; }
+        let op = t.s;
+        c.p += 1;
+        let r = try cxBinary(c, pr + 1);
+        let two = if (op.len > 1) op[1] else 0;
+        switch (op[0]) {
+            '*' => { l = l *% r; }
+            '/' => {
+                if (r == 0) { return error.Fail; }
+                l = if (r == -1) 0 -% l else l / r;
+            }
+            '%' => {
+                if (r == 0) { return error.Fail; }
+                l = if (r == -1) 0 else l % r;
+            }
+            '+' => { l = l +% r; }
+            '-' => { l = l -% r; }
+            '<' => { l = if (two == '<') @bitcast(i64, @bitcast(u64, l) << amt(r)) else if (two == '=') b2i(l <= r) else b2i(l < r); }
+            '>' => { l = if (two == '>') l >> amt(r) else if (two == '=') b2i(l >= r) else b2i(l > r); }
+            '=' => { l = b2i(l == r); }
+            '!' => { l = b2i(l != r); }
+            '&' => { l = if (two == '&') b2i(l != 0 && r != 0) else l & r; }
+            '^' => { l = l ^ r; }
+            '|' => { l = if (two == '|') b2i(l != 0 || r != 0) else l | r; }
+            else => {}
+        }
+    }
+}
+
+fn cxCond(c: *CP) -> CFail!i64 {
+    let v = try cxBinary(c, 1);
+    if (c.acceptP("?")) {
+        let a = try cxCond(c);
+        try c.expectP(":");
+        let b = try cxCond(c);
+        return if (v != 0) a else b;
+    }
+    return v;
+}
+
+pub fn constExpr(c: *CP) -> CFail!i64 { return cxCond(c); }
+
+// ---------------------------------------------------------------- macros
+
+// the body of an object-like macro (null: none, or a function-like one, which sets fnlike)
+pub fn findMacro(h: *ctypes.CHeader, name: []const u8, fnlike: *bool) -> ?[]const u8 {
+    for (0..h.mnames.items.len) |i| {
+        if (text.eq(h.mnames.items[i], name)) {
+            let b = h.mbodies.items[i];
+            fnlike.* = b == null;
+            return b;
+        }
+    }
+    return null;
+}
+
+// an object-like macro whose body is an integer constant expression
+pub fn macroValue(h: *ctypes.CHeader, name: []const u8) -> ?i64 {
+    var fnlike = false;
+    let body = findMacro(h, name, &fnlike) orelse return null;
+    if (fnlike || macro_depth > 16) { return null; }
+    let (toks, nt) = clex.lex(body);
+    if (nt == 0) { return null; }
+    var cp = newCP(toks, h);
+    macro_depth += 1;
+    var out: ?i64 = null;
+    if (constExpr(&cp)) |v| {
+        if (cp.cur().k == .Eof) { out = v; }
+    } else |_| {}
+    macro_depth -= 1;
+    return out;
+}
+
+pub fn depthIn() -> bool {
+    if (macro_depth >= 16) { return false; }
+    macro_depth += 1;
+    return true;
+}
+
+pub fn depthOut() { macro_depth -= 1; }
+
+// ---------------------------------------------------------------- declarations
+
+// skip a declaration this parser doesn't understand, from token `start`
+fn skipDecl(c: *CP, start: usize) {
+    c.p = start;
+    var depth: i32 = 0;
+    while (c.cur().k != .Eof) {
+        if (c.isP("(") || c.isP("[") || c.isP("{")) {
+            depth += 1;
+        } else if (c.isP(")") || c.isP("]")) {
+            depth -= 1;
+        } else if (c.isP("}")) {
+            depth -= 1;
+            if (depth <= 0) {
+                c.p += 1;
+                if (c.isP(";")) { c.p += 1; }
+                break;
+            }
+        } else if (c.isP(";") && depth <= 0) {
+            c.p += 1;
+            break;
+        }
+        c.p += 1;
+    }
+}
+
+// one declaration (it may declare several names); `last_name` is the latest name seen
+fn oneDecl(c: *CP, last_name: *[]const u8) -> CFail!void {
+    let h = c.h;
+    if (c.acceptP(";")) { return; }
+    var st: i32 = 0;
+    let base = try specifiers(c, &st);
+    if (c.acceptP(";")) { return; } // just a struct/enum definition
+    while (true) {
+        var name: []const u8 = "";
+        c.asm_label = "";
+        let t = try declarator(c, base, &name);
+        last_name.* = name;
+        if (name.len == 0) { return error.Fail; }
+        if (c.isP("{")) { // a function body (static inline in a header)
+            try skipGroup(c);
+            addBad(h, name, "it's a static inline function in the header: there's no symbol to link to");
+            break;
+        }
+        if (c.acceptP("=")) { // an initializer: skip it
+            var depth: i32 = 0;
+            while (c.cur().k != .Eof && !(depth == 0 && (c.isP(",") || c.isP(";")))) {
+                if (c.isP("(") || c.isP("{") || c.isP("[")) { depth += 1; }
+                if (c.isP(")") || c.isP("}") || c.isP("]")) { depth -= 1; }
+                c.p += 1;
+            }
+        }
+        if (st & ST_TYPEDEF != 0) {
+            if (addDecl(h, .Type, name)) |d| { d.t = t; }
+        } else if (t.k == .Fn) {
+            if (st & ST_STATIC != 0) {
+                addBad(h, name, "it's a static function in the header: there's no symbol to link to");
+            } else if (addDecl(h, .Fn, name)) |d| {
+                d.t = t;
+                d.sval = c.asm_label;
+            }
+        } else if (st & ST_STATIC == 0) {
+            if (addDecl(h, .Var, name)) |d| {
+                d.t = t;
+                d.sval = c.asm_label;
+            }
+        }
+        if (!c.acceptP(",")) { break; }
+    }
+    if (!c.isP(";") && c.t[c.p - 1].k == .P && text.eq(c.t[c.p - 1].s, "}")) { return; } // after a body
+    try c.expectP(";");
+}
+
+pub fn parseDecls(h: *ctypes.CHeader, toks: []clex.CTok) {
+    var cp = newCP(toks, h);
+    let c = &cp;
+    while (c.cur().k != .Eof) {
+        let start = c.p;
+        var last_name: []const u8 = "";
+        oneDecl(c, &last_name) catch {
+            // something this parser doesn't understand: skip the declaration
+            skipDecl(c, start);
+            if (last_name.len > 0) { addBad(h, last_name, "Flint couldn't read its declaration"); }
+        };
+    }
+}

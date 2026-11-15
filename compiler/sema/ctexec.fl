@@ -1,0 +1,221 @@
+// sema.ctexec - code that runs while compiling (design section 4.11). A comptime expression is
+// lowered into a scratch function, which the interpreter (interp/) runs right away; its value
+// becomes a constant or data (sema.ctdata). Also: comptime { } blocks, failures reported with the
+// chain of calls, and dropping functions that only comptime code used.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import interp.memory as imem;
+import interp.run as interp;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.stmt;
+import sema.ctdata;
+
+pub var CT_DEPTH: i32 = 0; // > 0 while lowering code for the comptime interpreter
+
+// locals ctCompute declares first (a `where` clause's run-time parameters)
+pub var CT_PRE_NAMES: alloc.Vec([]const u8) = @zeroes(alloc.Vec([]const u8));
+pub var CT_PRE_TYPES: alloc.Vec(*ty.Type) = @zeroes(alloc.Vec(*ty.Type));
+
+// the IR of a function comptime code calls, or null (why: the reason)
+pub fn ctLookup(sym: []const u8, why: *[]const u8) -> ?*ir.IRFunc {
+    let fs = st.M.funcs.items;
+    var i = fs.len;
+    while (i > 0) {
+        i -= 1;
+        if (text.eq(fs[i].sym, sym)) { return fs[i]; }
+    }
+    for (st.fns.items) |f| {
+        if (f.sym.len == 0 || !text.eq(f.sym, sym)) { continue; }
+        if (f.ext) {
+            why.* = "it's a C function, and there's no I/O or C at compile time";
+        } else if (f.state == 1) {
+            why.* = text.f("'{s}' is still being compiled (a function can't run itself at compile time)", .{f.name});
+        }
+        return null;
+    }
+    return null;
+}
+
+// a comptime evaluation failed: point at what failed, then at the calls that led there
+pub fn reportFail(e: *imem.CtError, site: ?*token.Token) -> noreturn {
+    var nt: alloc.Vec(?*token.Token) = .{};
+    var nm: alloc.Vec([]const u8) = .{};
+    var i: usize = 0;
+    while (i < e.ncalls as usize && nt.items.len < 4) { // recursion: each call site once
+        let c = e.calls[i];
+        let fname = e.fns[i];
+        i += 1;
+        if (c == null || c == e.tok) { continue; }
+        var dup = false;
+        for (nt.items) |x| { if (x == c) { dup = true; } }
+        if (dup) { continue; }
+        nt.push(c);
+        nm.push(text.f("'{s}' was called here", .{fname}));
+    }
+    let at = if (e.tok != null) e.tok else site;
+    if (at != site) {
+        nt.push(site);
+        nm.push("while running this at compile time");
+    }
+    diag.notes(at, nt.items, nm.items, e.msg);
+}
+
+// Lowers `e` (or, with blk, the block e) into a scratch function, runs it, and collects its value.
+pub fn ctCompute(e: *ast.Node, blk: bool, want: ?*ty.Type, what: []const u8, out: *ctdata.CtOut) -> *ty.Type {
+    let dummy = alloc.new(st.FnInfo);
+    dummy.name = "comptime code";
+    dummy.ret = ty.void_;
+    dummy.decl = e;
+    let f = alloc.new(ir.IRFunc);
+    f.sym = "_fl_comptime";
+    f.name = "comptime code";
+    f.retcls = .None;
+    let ctx = alloc.new(st.Ctx);
+    ctx.f = f;
+    ctx.fn_ = dummy;
+    ctx.retptr = -1;
+    ctx.ct_scratch = true;
+    ctx.outer = st.C;
+    ctx.unsafe_depth = if (st.C) |c| c.unsafe_depth else 0;
+    let saved = st.C;
+    st.C = ctx;
+    CT_DEPTH += 1;
+    b.setBlk(b.newBlock());
+    names.pushScope(false, -1, -1);
+    for (0..CT_PRE_NAMES.items.len) |i| { _ = stmt.newLocal(CT_PRE_NAMES.items[i], CT_PRE_TYPES.items[i], e.tok, true); }
+    CT_PRE_NAMES.truncate(0);
+    CT_PRE_TYPES.truncate(0);
+    var t = ty.void_;
+    if (blk) {
+        stmt.blockBody(e);
+        if (!b.terminated()) { _ = b.emit(.Ret); }
+    } else {
+        var v = expr.expr(e, want);
+        if (want) |w| { v = cv.coerce(v, w, e.tok, what); }
+        v = cv.defaulted(v);
+        t = v.t;
+        if (t == ty.noreturn_) { diag.at(e.tok, "this comptime expression never produces a value"); }
+        if (t == ty.null_) { diag.at(e.tok, "can't tell the type of a comptime null; give the declaration a type"); }
+        if (t == ty.void_) { diag.at(e.tok, "this comptime expression doesn't produce a value"); }
+        if (v.isconst && !ty.isAgg(t)) { // already known: nothing to run
+            CT_DEPTH -= 1;
+            st.C = saved;
+            out.* = @zeroes(ctdata.CtOut);
+            out.isconst = true;
+            out.ival = v.ival;
+            out.fval = v.fval;
+            return t;
+        }
+        if (ty.isAgg(t)) {
+            let a = b.addrReg(v.a);
+            let r = b.emit(.Ret);
+            r.a = b.R(a);
+            r.cls = .I;
+        } else {
+            let o = b.opdOf(v);
+            let r = b.emit(.Ret);
+            r.a = o;
+            r.cls = ty.clsOf(t);
+        }
+    }
+    CT_DEPTH -= 1;
+    st.C = saved;
+    var bits: u64 = 0;
+    let err = alloc.new(imem.CtError);
+    if (!interp.run(f, &bits, err)) { reportFail(err, e.tok); }
+    if (!blk) { ctdata.ctResult(t, bits, e.tok, out); }
+    interp.release();
+    return t;
+}
+
+// a comptime expression inside a function: its value, as a constant or a read of its data
+pub fn ctEval(e: *ast.Node, want: ?*ty.Type, what: []const u8) -> b.Val {
+    var o = @zeroes(ctdata.CtOut);
+    let t = ctCompute(e, false, want, what, &o);
+    if (o.isconst) { return if (ty.isFloat(t)) b.vFlt(t, o.fval) else b.vInt(t, o.ival); }
+    let p = b.addrSym(st.M.globals.items[o.g].sym);
+    if (ty.isAgg(t)) { return b.vAgg(t, b.aReg(p, 0), false); }
+    return b.vReg(t, b.load(t, b.aReg(p, 0)));
+}
+
+// comptime { ... }: run it for its effects (asserts, @compileError)
+pub fn ctBlock(blk: *ast.Node) {
+    var o = @zeroes(ctdata.CtOut);
+    _ = ctCompute(blk, true, null, "", &o);
+}
+
+fn fnv(s: []const u8) -> u64 {
+    var h: u64 = 1469598103934665603;
+    for (s) |c| { h = (h ^ c as u64) *% 1099511628211; }
+    return h;
+}
+
+// functions lowered only for comptime code are dropped unless run-time code reaches them too
+pub fn pruneCtOnly() {
+    let fs = st.M.funcs.items;
+    let n = fs.len;
+    var any = false;
+    for (fs) |f| { any = any || f.ct_only; }
+    if (!any) { return; }
+    var cap: usize = 16;
+    while (cap < 2 * n) { cap *= 2; }
+    let tab = alloc.make(usize, cap); // symbol -> function index + 1
+    for (0..n) |i| {
+        var k = (fnv(fs[i].sym) & (cap as u64 - 1)) as usize;
+        while (tab[k] != 0) { k = (k + 1) & (cap - 1); }
+        tab[k] = i + 1;
+    }
+    let live = alloc.make(bool, n + 1);
+    var work: alloc.Vec(usize) = .{};
+    for (0..n) |i| {
+        if (!fs[i].ct_only) {
+            live[i] = true;
+            work.push(i);
+        }
+    }
+    for (st.M.globals.items) |*g| {
+        for (g.items.items) |*di| { if (di.sym.len > 0) { mark(di.sym, tab, cap, live, &work); } }
+    }
+    while (work.items.len > 0) {
+        let f = fs[work.pop()];
+        for (f.blocks.items) |*blk| {
+            for (blk.insts.items) |*in| {
+                if ((in.op == .Call || in.op == .AddrSym) && in.sym.len > 0) { mark(in.sym, tab, cap, live, &work); }
+            }
+        }
+    }
+    var m: usize = 0;
+    for (0..n) |i| {
+        if (live[i]) {
+            fs[m] = fs[i];
+            m += 1;
+        }
+    }
+    st.M.funcs.truncate(m);
+}
+
+fn mark(sym: []const u8, tab: []usize, cap: usize, live: []bool, work: *alloc.Vec(usize)) {
+    let fs = st.M.funcs.items;
+    var k = (fnv(sym) & (cap as u64 - 1)) as usize;
+    while (tab[k] != 0) {
+        let i = tab[k] - 1;
+        if (text.eq(fs[i].sym, sym)) {
+            if (!live[i]) {
+                live[i] = true;
+                work.push(i);
+            }
+            return;
+        }
+        k = (k + 1) & (cap - 1);
+    }
+}

@@ -1,0 +1,200 @@
+// opt.ebb - extended-basic-block optimizations. Walks chains of blocks where every block after the
+// first has exactly one predecessor. Facts established earlier in the chain stay valid, so it can:
+//   - propagate copies (t = mov v) across block boundaries
+//   - reuse identical pure computations (common subexpression elimination)
+//   - resolve branches whose condition is already known (repeated bounds checks)
+
+import base.alloc;
+import ir.ir;
+
+struct VN {
+    op: ir.Op,
+    cls: ir.Cls,
+    mem: i32,
+    slot: i32,
+    a: ir.Opd,
+    b: ir.Opd,
+    c: ir.Opd,
+    imm: i64,
+    sym: []const u8,
+    res: i32,
+}
+
+struct Env {
+    vn: alloc.Vec(VN),
+    cpt: alloc.Vec(i32), // copy pairs: cpt[i] is a copy of cps[i]
+    cps: alloc.Vec(i32),
+    kc: alloc.Vec(i32),  // known condition values: kc[i] holds kv[i]
+    kv: alloc.Vec(bool),
+}
+
+fn cloneVec(comptime T: type, v: *const alloc.Vec(T)) -> alloc.Vec(T) {
+    var n: alloc.Vec(T) = .{};
+    for (v.items) |x| { n.push(x); }
+    return n;
+}
+
+fn envClone(e: *Env) -> Env {
+    return Env {
+        vn: cloneVec(VN, &e.vn), cpt: cloneVec(i32, &e.cpt), cps: cloneVec(i32, &e.cps),
+        kc: cloneVec(i32, &e.kc), kv: cloneVec(bool, &e.kv),
+    };
+}
+
+fn cseOk(in: *const ir.Inst) -> bool {
+    switch (in.op) {
+        .Add, .Sub, .Mul, .And, .Or, .Xor, .SMulH, .UMulH, .Shl, .Asr, .Lsr, .Neg, .Not,
+        .FAdd, .FSub, .FMul, .FDiv, .FNeg, .FSqrt, .FAbs,
+        .Cmp, .FCmp, .Ext, .Scvtf, .Ucvtf, .Fcvtzs, .Fcvtzu, .Fcvt,
+        .AddrSym, .AddrSlot, .IConst => { return in.dst >= 0; }
+        else => { return false; }
+    }
+}
+
+fn opdEq(x: ir.Opd, y: ir.Opd) -> bool { return x.k == y.k && (x.k == .None || x.v == y.v); }
+fn opdIs(x: ir.Opd, v: i32) -> bool { return x.k == .Reg && x.v == v as i64; }
+
+// the same symbol string (by identity, like the C compiler's pointer comparison)
+fn sameSym(x: []const u8, y: []const u8) -> bool { return x.len == y.len && (x.len == 0 || x.ptr == y.ptr); }
+
+fn substOne(o: *ir.Opd, e: *Env, ch: *bool) {
+    if (o.k != .Reg) { return; }
+    var i = e.cpt.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (e.cpt.items[i] as i64 == o.v) {
+            o.v = e.cps.items[i] as i64;
+            ch.* = true;
+            return;
+        }
+    }
+}
+
+fn substCopies(in: *ir.Inst, e: *Env, ch: *bool) {
+    if (in.op == .Call) {
+        for (in.args) |*a| { substOne(a, e, ch); }
+        return;
+    }
+    substOne(&in.a, e, ch);
+    substOne(&in.b, e, ch);
+    substOne(&in.c, e, ch);
+}
+
+fn invalidate(e: *Env, v: i32) {
+    var i: usize = 0;
+    while (i < e.vn.items.len) {
+        let x = &e.vn.items[i];
+        if (x.res == v || opdIs(x.a, v) || opdIs(x.b, v) || opdIs(x.c, v)) {
+            e.vn.items[i] = e.vn.last();
+            _ = e.vn.pop();
+        } else {
+            i += 1;
+        }
+    }
+    i = 0;
+    while (i < e.cpt.items.len) {
+        if (e.cpt.items[i] == v || e.cps.items[i] == v) {
+            e.cpt.items[i] = e.cpt.last();
+            e.cps.items[i] = e.cps.last();
+            _ = e.cpt.pop();
+            _ = e.cps.pop();
+        } else {
+            i += 1;
+        }
+    }
+    i = 0;
+    while (i < e.kc.items.len) {
+        if (e.kc.items[i] == v) {
+            e.kc.items[i] = e.kc.last();
+            e.kv.items[i] = e.kv.last();
+            _ = e.kc.pop();
+            _ = e.kv.pop();
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn walk(f: *ir.IRFunc, b: i32, e: *Env, preds: []i32, ch: *bool, depth: i32) {
+    let blk = &f.blocks.items[b as usize];
+    for (blk.insts.items) |*in| {
+        substCopies(in, e, ch);
+        if (in.op == .Br && in.a.k == .Reg) {
+            for (0..e.kc.items.len) |k| {
+                if (e.kc.items[k] as i64 == in.a.v) {
+                    let t = if (e.kv.items[k]) in.t1 else in.t2;
+                    in.op = .Jmp;
+                    in.t1 = t;
+                    in.a.k = .None;
+                    ch.* = true;
+                    break;
+                }
+            }
+        }
+        var matched = false;
+        if (cseOk(in)) {
+            for (e.vn.items) |*x| {
+                if (x.op == in.op && x.cls == in.cls && x.mem == in.mem && x.slot == in.slot && x.imm == in.imm &&
+                    sameSym(x.sym, in.sym) && opdEq(x.a, in.a) && opdEq(x.b, in.b) && opdEq(x.c, in.c) && x.res != in.dst) {
+                    let res = x.res;
+                    let dst = in.dst;
+                    let cls = f.vcls.items[dst as usize];
+                    in.* = @zeroes(ir.Inst);
+                    in.op = .Mov;
+                    in.dst = dst;
+                    in.cls = cls;
+                    in.a = ir.R(res);
+                    in.slot = -1;
+                    in.t1 = -1;
+                    in.t2 = -1;
+                    matched = true;
+                    ch.* = true;
+                    break;
+                }
+            }
+        }
+        if (in.dst >= 0) {
+            invalidate(e, in.dst);
+            if (in.op == .Mov && in.a.k == .Reg && in.a.v != in.dst as i64) {
+                e.cpt.push(in.dst);
+                e.cps.push(in.a.v as i32);
+            } else if (!matched && cseOk(in) && !opdIs(in.a, in.dst) && !opdIs(in.b, in.dst) && !opdIs(in.c, in.dst)) {
+                e.vn.push(VN { op: in.op, cls: in.cls, mem: in.mem, slot: in.slot, a: in.a, b: in.b, c: in.c, imm: in.imm, sym: in.sym, res: in.dst });
+            }
+        }
+    }
+    if (depth > 200) { return; }
+    let (s, ns) = ir.succs(blk);
+    let n = blk.insts.items.len;
+    for (0..ns) |k| {
+        if (preds[s[k] as usize] != 1 || s[k] == b || (k == 1 && s[1] == s[0])) { continue; }
+        var child = envClone(e);
+        if (n > 0) {
+            let t = &f.blocks.items[b as usize].insts.items[n - 1];
+            if (t.op == .Br && t.a.k == .Reg && t.t1 != t.t2) {
+                child.kc.push(t.a.v as i32);
+                child.kv.push(s[k] == t.t1);
+            }
+        }
+        walk(f, s[k], &child, preds, ch, depth + 1);
+    }
+}
+
+pub fn run(f: *ir.IRFunc) -> bool {
+    var ch = false;
+    let nb = f.blocks.items.len;
+    let preds = alloc.make(i32, nb + 1);
+    for (f.blocks.items) |*blk| {
+        if (blk.dead) { continue; }
+        let (s, ns) = ir.succs(blk);
+        for (0..ns) |k| {
+            if (!(k == 1 && s[1] == s[0])) { preds[s[k] as usize] += 1; }
+        }
+    }
+    for (0..nb) |b| {
+        if (f.blocks.items[b].dead || (b != 0 && preds[b] == 1)) { continue; }
+        var e = Env { vn: .{}, cpt: .{}, cps: .{}, kc: .{}, kv: .{} };
+        walk(f, b as i32, &e, preds, &ch, 0);
+    }
+    return ch;
+}

@@ -1,0 +1,355 @@
+// sema.builtins - the built-in functions (exit, panic, assert, now, args, min, max, abs, math) and
+// the @builtins (@sizeOf, @truncate, @bitcast, @ptrCast, @embedFile, @typeName, ...).
+
+import std.fs;
+import std.heap;
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.expr;
+import sema.ops;
+import sema.literals;
+import sema.errors;
+import sema.enums;
+import sema.format;
+
+fn argn(n: *ast.Node, k: usize) {
+    if (n.count() != k) { diag.at(n.tok, text.f("'{s}' takes {} argument(s), got {}", .{n.a.?.name, k, n.count()})); }
+}
+
+fn emitSel(cls: ir.Cls, c: i32, x: i32, y: i32) -> i32 {
+    let r = b.newVreg(cls);
+    let i = b.emit(.Sel);
+    i.dst = r;
+    i.cls = cls;
+    i.a = b.R(c);
+    i.b = b.R(x);
+    i.c = b.R(y);
+    return r;
+}
+
+pub fn builtin(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let name = n.a.?.name;
+    if (text.eq(name, "exit")) {
+        argn(n, 1);
+        let v = cv.coerce(expr.expr(n.at(0), ty.i32_), ty.i32_, n.at(0).tok, "exit code");
+        _ = b.callI("_rt_exit", .None, &[_]ir.Opd { b.opdOf(v) });
+        b.trap();
+        return b.vReg(ty.noreturn_, -1);
+    }
+    if (text.eq(name, "panic")) {
+        argn(n, 1);
+        let v = expr.expr(n.at(0), null);
+        if (!ty.isBytes(v.t)) { diag.at(n.at(0).tok, text.f("panic takes a string, found {s}", .{ty.tname(v.t)})); }
+        let p = b.load(ty.ptrTo(ty.u8_), v.a);
+        let l = b.load(ty.i64_, b.aAdd(v.a, 8));
+        _ = b.callI("_rt_panic", .None, &[_]ir.Opd { b.R(p), b.R(l) });
+        b.trap();
+        return b.vReg(ty.noreturn_, -1);
+    }
+    if (text.eq(name, "assert")) {
+        argn(n, 1);
+        let ok = b.newBlock();
+        let fail = b.newColdBlock();
+        expr.cond(n.at(0), ok, fail);
+        b.setBlk(fail);
+        _ = b.callI("_rt_assert_fail", .None, &[_]ir.Opd { b.IMM(n.tok.line as i64) });
+        b.trap();
+        b.setBlk(ok);
+        return b.vVoid();
+    }
+    if (text.eq(name, "now")) {
+        argn(n, 0);
+        return b.vReg(ty.f64_, b.callv("_rt_now", .F64, &[_]ir.Opd {}, &[_]ir.Cls {}));
+    }
+    if (text.eq(name, "args")) {
+        argn(n, 0);
+        let sl = ty.sliceOfQ(ty.str_, true); // the runtime's array, made once at startup: read-only
+        let t = b.temp(sl);
+        _ = b.callI("_rt_args", .None, &[_]ir.Opd { b.R(b.addrReg(t)) });
+        return b.vAgg(sl, t, true);
+    }
+    if (text.eq(name, "min") || text.eq(name, "max")) {
+        argn(n, 2);
+        var a = expr.expr(n.at(0), want);
+        var c = expr.expr(n.at(1), if (ty.isLit(a.t)) want else a.t);
+        if (!ty.isNum(a.t) || !ty.isNum(c.t)) { diag.at(n.tok, text.f("{s} needs numbers", .{name})); }
+        let mn = text.eq(name, "min");
+        if (ty.isLit(a.t) && ty.isLit(c.t)) {
+            let lt = ops.fold("<", a, c, n.tok);
+            return if ((lt.ival != 0) == mn) a else c;
+        }
+        let t = ty.defaultT(cv.unify(a.t, c.t, n.tok, name));
+        a = cv.coerce(a, t, n.tok, "argument");
+        c = cv.coerce(c, t, n.tok, "argument");
+        var cc: i32 = 0;
+        if (ty.isFloat(t)) {
+            cc = b.fcmp(if (mn) .MI else .GT, b.regOf(a), b.regOf(c));
+        } else {
+            let sg = ty.isSigned(t);
+            let code: ir.CC = if (mn) (if (sg) .LT else .LO) else (if (sg) .GT else .HI);
+            cc = b.cmp(code, b.R(b.regOf(a)), b.opdOf(c));
+        }
+        return b.vReg(t, emitSel(ty.clsOf(t), cc, b.regOf(a), b.regOf(c)));
+    }
+    if (text.eq(name, "abs")) {
+        argn(n, 1);
+        let a = cv.defaulted(expr.expr(n.at(0), want));
+        if (!ty.isNum(a.t)) { diag.at(n.tok, "abs needs a number"); }
+        if (a.isconst) {
+            if (ty.isFloat(a.t)) { return b.vFlt(a.t, if (a.fval < 0.0) -a.fval else a.fval); }
+            return b.vInt(a.t, if (a.ival < 0) 0 -% a.ival else a.ival);
+        }
+        if (ty.isFloat(a.t)) { return b.vReg(a.t, b.op1(.FAbs, ty.clsOf(a.t), b.R(a.reg))); }
+        if (!ty.isSigned(a.t)) { return a; }
+        let c = b.cmp(.LT, b.R(a.reg), b.IMM(0));
+        let ng = cv.norm(b.op1(.Neg, .I, b.R(a.reg)), a.t);
+        return b.vReg(a.t, emitSel(.I, c, ng, a.reg));
+    }
+    // math on f64
+    let nargs: usize = if (text.eq(name, "pow") || text.eq(name, "atan2")) 2 else 1;
+    argn(n, nargs);
+    var regs: [2]i32 = .{ 0, 0 };
+    for (0..nargs) |i| { regs[i] = b.regOf(cv.coerce(expr.expr(n.at(i), ty.f64_), ty.f64_, n.at(i).tok, "argument")); }
+    if (text.eq(name, "sqrt")) { return b.vReg(ty.f64_, b.op1(.FSqrt, .F64, b.R(regs[0]))); }
+    let sym = text.f("_{s}", .{name});
+    if (nargs == 1) { return b.vReg(ty.f64_, b.callv(sym, .F64, &[_]ir.Opd { b.R(regs[0]) }, &[_]ir.Cls { .F64 })); }
+    return b.vReg(ty.f64_, b.callv(sym, .F64, &[_]ir.Opd { b.R(regs[0]), b.R(regs[1]) }, &[_]ir.Cls { .F64, .F64 }));
+}
+
+// @embedFile("path"): a file's bytes, read while compiling. The path is relative to the directory
+// of the file that uses it. Used for a value, a global and a field of a global.
+pub fn isEmbed(e: ?*ast.Node) -> bool {
+    let n = e orelse return false;
+    return n.k == .Builtin && text.eq(n.name, "@embedFile");
+}
+
+pub fn embedFile(n: *ast.Node) -> []const u8 {
+    if (n.count() != 1 || n.at(0).k != .Str) { diag.at(n.tok, "@embedFile takes one path, a string literal"); }
+    let p = n.at(0);
+    if (p.str.len == 0 || text.indexOf(p.str, 0) != null) { diag.at(p.tok, "@embedFile: invalid path"); }
+    let from = if (n.tok.path.len > 0) n.tok.path else diag.path;
+    let slash = text.lastIndexOf(from, '/');
+    let full = if (p.str[0] == '/' || slash == null) p.str else text.f("{s}/{s}", .{from[0..slash.?], p.str});
+    let data = fs.readFile(heap.c_allocator, full) catch diag.at(p.tok, text.f("@embedFile: can't read '{s}' (relative to this file's directory)", .{p.str}));
+    if (data.len > 0x7fffffff) { diag.at(p.tok, text.f("@embedFile: '{s}' is too large", .{p.str})); }
+    return data;
+}
+
+fn sameSize(n: *ast.Node, a: *ty.Type, t: *ty.Type) {
+    if (t.size != a.size) {
+        diag.at(n.tok, text.f("@bitcast needs types of the same size ({s} is {} bytes, {s} is {})", .{ty.tname(a), a.size, ty.tname(t), t.size}));
+    }
+}
+
+pub fn exBuiltin(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let nm = n.name;
+    if (text.eq(nm, "@format")) { return format.exFormat(n); }
+    if (text.eq(nm, "@hash")) { return format.exHash(n); }
+    if (text.eq(nm, "@eql")) { return format.exEql(n); }
+    if (text.eq(nm, "@splat")) {
+        if (n.count() != 1) { diag.at(n.tok, "@splat takes one value"); }
+        return literals.exSplat(n, want);
+    }
+    if (text.eq(nm, "@errorName")) {
+        let v = cv.defaulted(expr.expr(n.at(0), null));
+        if (v.t.k != .ErrSet) { diag.at(n.at(0).tok, text.f("@errorName needs an error, found {s}", .{ty.tname(v.t)})); }
+        return errors.errNameStr(b.opdOf(v));
+    }
+    if (text.eq(nm, "@addWithOverflow") || text.eq(nm, "@subWithOverflow") || text.eq(nm, "@mulWithOverflow")) {
+        // (wrapped result, overflowed)
+        if (n.count() != 2) { diag.at(n.tok, text.f("{s} takes two integers", .{nm})); }
+        var wa: ?*ty.Type = null;
+        if (want) |w| { if (w.tuple) { wa = w.fields.items[0].t; } }
+        var a = expr.expr(n.at(0), wa);
+        var c = expr.expr(n.at(1), if (ty.isLit(a.t)) null else a.t);
+        if (!ty.isInt(a.t) || !ty.isInt(c.t)) { diag.at(n.tok, text.f("{s} needs integers", .{nm})); }
+        if (ty.isSigned(a.t) != ty.isSigned(c.t) && !ty.isLit(a.t) && !ty.isLit(c.t)) {
+            diag.at(n.tok, text.f("{s} can't mix {s} and {s}", .{nm, ty.tname(a.t), ty.tname(c.t)}));
+        }
+        let t = ty.defaultT(cv.unify(a.t, c.t, n.tok, nm));
+        a = cv.coerce(a, t, n.tok, "operand");
+        c = cv.coerce(c, t, n.tok, "operand");
+        var oa = b.opdOf(a);
+        if (oa.k == .Imm) { oa = b.R(b.iconst(oa.v)); }
+        let o: ir.Op = if (nm[1] == 'a') .Add else if (nm[1] == 's') .Sub else .Mul;
+        let (r, ovf) = ops.ovfOp(o, t, oa, b.opdOf(c));
+        let tt = ty.tupleOf(&[_]*ty.Type { t, ty.bool_ });
+        ty.layout(tt, n.tok);
+        let ta = b.temp(tt);
+        b.store(t, b.aAdd(ta, tt.fields.items[0].off as i64), b.R(cv.norm(r, t)));
+        b.store(ty.bool_, b.aAdd(ta, tt.fields.items[1].off as i64), b.R(ovf));
+        return b.vAgg(tt, ta, true);
+    }
+    if (text.eq(nm, "@ptrToInt")) {
+        if (n.count() != 1) { diag.at(n.tok, "@ptrToInt takes one pointer"); }
+        let v = expr.expr(n.at(0), null);
+        if (!ty.isPtr(v.t) && !ty.isOptPtr(v.t)) { diag.at(n.at(0).tok, text.f("@ptrToInt needs a pointer, found {s}", .{ty.tname(v.t)})); }
+        return b.vReg(ty.usize_, b.regOf(v));
+    }
+    if (text.eq(nm, "@assume")) { // an optimizer hint: checked in Debug, trusted otherwise
+        names.requireUnsafe(n.tok, "@assume");
+        if (n.count() != 1) { diag.at(n.tok, "@assume takes one condition"); }
+        if (st.MODE == .Debug) {
+            let c = expr.expr(n.at(0), ty.bool_);
+            if (c.t != ty.bool_) { diag.at(n.at(0).tok, text.f("@assume needs a bool, found {s}", .{ty.tname(c.t)})); }
+            if (!c.isconst || c.ival == 0) {
+                let o = if (b.opdOf(c).k == .Imm) b.R(b.iconst(c.ival)) else b.opdOf(c);
+                ops.panicIf(b.cmp(.EQ, o, b.IMM(0)), "@assume'd condition is false");
+            }
+        }
+        return b.vVoid();
+    }
+    if (text.eq(nm, "@tagName")) {
+        let v = expr.expr(n.at(0), null);
+        if (v.t.k != .Enum) { diag.at(n.at(0).tok, text.f("@tagName needs an enum value, found {s}", .{ty.tname(v.t)})); }
+        return enums.tagName(v);
+    }
+    if (text.eq(nm, "@reduceAdd")) { // the sum of a vector's elements
+        if (n.count() != 1) { diag.at(n.tok, "@reduceAdd takes one vector"); }
+        let v = expr.expr(n.at(0), null);
+        if (!ty.isVector(v.t)) { diag.at(n.at(0).tok, text.f("@reduceAdd needs a vector, found {s}", .{ty.tname(v.t)})); }
+        let et = v.t.E();
+        let pa = b.addrReg(v.a);
+        let r = b.newVreg(ty.clsOf(et));
+        let in = b.emit(.VReduce);
+        in.dst = r;
+        in.cls = ty.clsOf(et);
+        in.a = b.R(pa);
+        in.imm = ops.vlanes(v.t);
+        return b.vReg(et, r);
+    }
+    if (text.eq(nm, "@compileError")) { // an error now, if this code is compiled at all
+        if (n.count() != 1) { diag.at(n.tok, "@compileError takes one string"); }
+        let m = expr.expr(n.at(0), null);
+        if (m.strlit == 0) { diag.at(n.at(0).tok, "@compileError needs a string known at compile time"); }
+        diag.at(n.tok, b.strData(m.strlit));
+    }
+    if (text.eq(nm, "@embedFile")) { return b.strLit(embedFile(n)); }
+    if (text.eq(nm, "@typeName") || text.eq(nm, "@isInt") || text.eq(nm, "@isFloat") ||
+        text.eq(nm, "@isSigned") || text.eq(nm, "@hasField") || text.eq(nm, "@hasMethod")) {
+        // questions about a type, answered at compile time (comptime code and `where` clauses use them)
+        let qt = names.resolve(n.b.?);
+        let named = nm[1] == 'h';
+        if (n.count() != (if (named) 1 else 0)) {
+            diag.at(n.tok, if (named) text.f("{s} takes a type and a name", .{nm}) else text.f("{s} takes just a type", .{nm}));
+        }
+        if (text.eq(nm, "@typeName")) { return b.strLit(ty.tname(qt)); }
+        if (text.eq(nm, "@isInt")) { return b.vInt(ty.bool_, if (ty.isInt(qt) && !ty.isLit(qt)) 1 else 0); }
+        if (text.eq(nm, "@isFloat")) { return b.vInt(ty.bool_, if (ty.isFloat(qt) && !ty.isLit(qt)) 1 else 0); }
+        if (text.eq(nm, "@isSigned")) { return b.vInt(ty.bool_, if (ty.isSigned(qt) && !ty.isLit(qt)) 1 else 0); }
+        let nv = expr.expr(n.at(0), null);
+        if (nv.strlit == 0) { diag.at(n.at(0).tok, text.f("{s} needs a name known at compile time (a string)", .{nm})); }
+        let want_name = b.strData(nv.strlit);
+        var has = false;
+        if (text.eq(nm, "@hasField")) {
+            if (qt.k == .Struct) {
+                for (qt.fields.items) |*f| { has = has || text.eq(f.name, want_name); }
+            }
+            if (ty.isSlice(qt)) { has = text.eq(want_name, "ptr") || text.eq(want_name, "len"); }
+        } else {
+            let rt = if (ty.isPtr(qt) && !qt.many) qt.E() else qt;
+            has = names.findMethod(rt, want_name) != null;
+        }
+        return b.vInt(ty.bool_, if (has) 1 else 0);
+    }
+    let t = names.resolve(n.b.?);
+    ty.layout(t, n.tok);
+    let needs_value = text.eq(nm, "@truncate") || text.eq(nm, "@bitcast") || text.eq(nm, "@ptrCast") || text.eq(nm, "@intToPtr");
+    if (n.count() != (if (needs_value) 1 else 0)) {
+        diag.at(n.tok, if (needs_value) text.f("{s} takes a type and a value", .{nm}) else text.f("{s} takes just a type", .{nm}));
+    }
+    if (text.eq(nm, "@sizeOf")) { return b.vInt(ty.litint, t.size as i64); }
+    if (text.eq(nm, "@minInt") || text.eq(nm, "@maxInt")) {
+        if (!ty.isInt(t)) { diag.at(n.b.?.tok, text.f("{s} needs an integer type, not {s}", .{nm, ty.tname(t)})); }
+        return b.vInt(t, if (nm[2] == 'i') ops.intMin(t) else ops.intMax(t));
+    }
+    if (text.eq(nm, "@alignOf")) { return b.vInt(ty.litint, t.align as i64); }
+    if (text.eq(nm, "@zeroes")) {
+        if (t == ty.void_) { diag.at(n.tok, "void has no value"); }
+        if (ty.isAgg(t)) {
+            let a = b.temp(t);
+            b.zeroAt(t, a);
+            return b.vAgg(t, a, true);
+        }
+        return if (ty.isFloat(t)) b.vFlt(t, 0.0) else b.vInt(t, 0);
+    }
+    if (text.eq(nm, "@ptrCast") || text.eq(nm, "@intToPtr")) {
+        names.requireUnsafe(n.tok, nm);
+        if (!ty.isPtr(t) && !ty.isOptPtr(t)) { diag.at(n.b.?.tok, text.f("{s} makes a pointer, not {s}", .{nm, ty.tname(t)})); }
+        var v = expr.expr(n.at(0), null);
+        if (nm[1] == 'p') {
+            if (!ty.isPtr(v.t) && !ty.isOptPtr(v.t)) { diag.at(n.at(0).tok, text.f("@ptrCast needs a pointer, found {s}", .{ty.tname(v.t)})); }
+            if (v.t.k == .Opt && t.k != .Opt) {
+                diag.at(n.at(0).tok, text.f("{s} might be null; unwrap it first ('p.?') or cast to ?{s}", .{ty.tname(v.t), ty.tname(t)}));
+            }
+        } else {
+            if (!ty.isInt(v.t)) { diag.at(n.at(0).tok, text.f("@intToPtr needs an integer, found {s}", .{ty.tname(v.t)})); }
+            if (v.isconst && (ty.isLit(v.t) || !ty.isSigned(v.t))) {
+                v = b.vInt(ty.usize_, v.ival); // a constant address
+            } else {
+                v = cv.coerce(v, ty.usize_, n.at(0).tok, "@intToPtr's address");
+            }
+            if (t.k != .Opt && v.isconst && v.ival == 0) { diag.at(n.at(0).tok, text.f("{s} can't be null; use ?{s}", .{ty.tname(t), ty.tname(t)})); }
+        }
+        return b.vReg(t, b.regOf(v));
+    }
+    var v = expr.expr(n.at(0), null);
+    let pk_to = t.k == .Struct && t.is_packed;
+    let pk_from = v.t.k == .Struct && v.t.is_packed;
+    let is_bc = text.eq(nm, "@bitcast");
+    if (is_bc && (pk_to || pk_from)) { // a packed struct <-> its integer
+        if (pk_from && ty.isInt(t)) {
+            sameSize(n, v.t, t);
+            return b.vReg(t, cv.norm(b.load(v.t.tagt.?, v.a), t));
+        }
+        if (pk_to && ty.isInt(v.t)) {
+            let w = if (v.t.k == .LitInt) cv.coerce(v, t.tagt.?, n.at(0).tok, "@bitcast value") else v;
+            sameSize(n, w.t, t);
+            let a = b.temp(t);
+            b.store(t.tagt.?, a, b.opdOf(w));
+            return b.vAgg(t, a, true);
+        }
+        diag.at(n.tok, "@bitcast converts a packed struct to or from an integer of the same size");
+    }
+    if (is_bc && (ty.isPtr(t) || ty.isOptPtr(t) || ty.isPtr(v.t) || ty.isOptPtr(v.t))) {
+        diag.at(n.tok, "@bitcast doesn't convert pointers; use @ptrCast, @intToPtr or @ptrToInt");
+    }
+    if (is_bc && ((ty.isFloat(t) && !ty.isLit(t) && ty.isInt(v.t)) || (ty.isFloat(v.t) && ty.isInt(t) && !ty.isLit(t)))) {
+        // a float's bits as an integer of the same size, or the other way
+        if (v.t.k == .LitFloat) { v = cv.coerce(v, if (t.size == 4) ty.f32_ else ty.f64_, n.at(0).tok, "@bitcast value"); }
+        if (v.t.k == .LitInt) { v = cv.coerce(v, if (t.size == 4) ty.u32_ else ty.u64_, n.at(0).tok, "@bitcast value"); }
+        sameSize(n, v.t, t);
+        if (v.isconst) {
+            if (ty.isFloat(v.t)) { // float -> int
+                let bits: i64 = if (v.t.size == 4) @bitcast(u32, v.fval as f32) as i64 else @bitcast(i64, v.fval);
+                return b.vInt(t, cv.truncExt(bits, t));
+            }
+            if (t.size == 4) { return b.vFlt(t, @bitcast(f32, @truncate(u32, v.ival)) as f64); } // int -> float
+            return b.vFlt(t, @bitcast(f64, v.ival));
+        }
+        let a = b.temp(v.t); // through memory: store one way, load the other
+        b.store(v.t, a, b.opdOf(v));
+        return b.vReg(t, b.load(t, a));
+    }
+    if (!ty.isInt(t) || !ty.isInt(v.t)) {
+        diag.at(n.tok, text.f("{s} works on integers and floats of the same size (found {s} -> {s})", .{nm, ty.tname(v.t), ty.tname(t)}));
+    }
+    let from = ty.defaultT(v.t);
+    if (text.eq(nm, "@truncate") && t.size > from.size) {
+        diag.at(n.tok, text.f("@truncate can't widen {s} to {s}; use 'as'", .{ty.tname(from), ty.tname(t)}));
+    }
+    if (is_bc && t.size != from.size) {
+        diag.at(n.tok, text.f("@bitcast needs types of the same size ({s} is {} bytes, {s} is {})", .{ty.tname(from), from.size, ty.tname(t), t.size}));
+    }
+    if (v.isconst) { return b.vInt(t, cv.truncExt(v.ival, t)); }
+    return b.vReg(t, cv.norm(v.reg, t)); // keep the low bits, re-extended for the new type
+}

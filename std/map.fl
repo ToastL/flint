@@ -1,0 +1,143 @@
+// std.map - HashMap: a hash table. It allocates through the Allocator it is given.
+
+import std.mem;
+
+// A hash table from K to V. Keys are integers, bools, plain enums, pointers or strings
+// (hashed with @hash, compared with @eql). A string key isn't copied: it must outlive the map.
+//
+//   var ages = map.HashMap([]const u8, u32).init(alloc);
+//   defer ages.deinit();
+//   try ages.put("ada", 36);
+//   if (ages.get("ada")) |age| { ... }
+pub fn HashMap(comptime K: type, comptime V: type) -> type {
+    return struct {
+        keys: []K,
+        values: []V,
+        states: []u8, // per slot: 0 empty, 1 full, 2 removed
+        count: usize, // full slots
+        used: usize,  // full + removed slots
+        alloc: mem.Allocator,
+
+        pub fn init(alloc: mem.Allocator) -> Self {
+            return .{ keys: mem.Allocator.empty(K), values: mem.Allocator.empty(V), states: mem.Allocator.empty(u8), count: 0, used: 0, alloc: alloc };
+        }
+
+        pub fn deinit(self: *Self) {
+            self.alloc.free(self.keys);
+            self.alloc.free(self.values);
+            self.alloc.free(self.states);
+            self.* = Self.init(self.alloc);
+        }
+
+        // Where k is, or null.
+        fn index(self: *Self, k: K) -> ?usize {
+            if (self.count == 0) { return null; }
+            let mask = self.states.len - 1;
+            var i = (@hash(k) as usize) & mask;
+            while (true) {
+                let s = self.states[i];
+                if (s == 0) { return null; }
+                if (s == 1 && @eql(self.keys[i], k)) { return i; }
+                i = (i + 1) & mask;
+            }
+        }
+
+        pub fn get(self: *Self, k: K) -> ?V {
+            if (self.index(k)) |i| { return self.values[i]; }
+            return null;
+        }
+
+        // A pointer to k's value, to change it in place.
+        pub fn getPtr(self: *Self, k: K) -> ?*V {
+            if (self.index(k)) |i| { return &self.values[i]; }
+            return null;
+        }
+
+        pub fn contains(self: *Self, k: K) -> bool { return self.index(k) != null; }
+
+        // Sets k's value (adding k if it's new).
+        pub fn put(self: *Self, k: K, v: V) -> mem.AllocError!void {
+            if ((self.used + 1) * 4 > self.states.len * 3) {
+                try self.rehash(if (self.states.len == 0) 8 else if (self.count * 2 < self.states.len) self.states.len else self.states.len * 2);
+            }
+            let mask = self.states.len - 1;
+            var i = (@hash(k) as usize) & mask;
+            var removed: ?usize = null; // reuse the first removed slot on the way
+            while (true) {
+                let s = self.states[i];
+                if (s == 0) { break; }
+                if (s == 2) {
+                    if (removed == null) { removed = i; }
+                } else if (@eql(self.keys[i], k)) {
+                    self.values[i] = v;
+                    return;
+                }
+                i = (i + 1) & mask;
+            }
+            if (removed) |r| { i = r; } else { self.used += 1; }
+            self.states[i] = 1;
+            self.keys[i] = k;
+            self.values[i] = v;
+            self.count += 1;
+        }
+
+        // Removes k; false if it wasn't there.
+        pub fn remove(self: *Self, k: K) -> bool {
+            let i = self.index(k) orelse return false;
+            self.states[i] = 2;
+            self.count -= 1;
+            return true;
+        }
+
+        fn rehash(self: *Self, n: usize) -> mem.AllocError!void {
+            let keys = try self.alloc.alloc(K, n);
+            errdefer self.alloc.free(keys);
+            let values = try self.alloc.alloc(V, n);
+            errdefer self.alloc.free(values);
+            let states = try self.alloc.alloc(u8, n);
+            mem.set(u8, states, 0);
+            let mask = n - 1;
+            for (self.states) |s, j| {
+                if (s != 1) { continue; }
+                var i = (@hash(self.keys[j]) as usize) & mask;
+                while (states[i] != 0) { i = (i + 1) & mask; }
+                states[i] = 1;
+                keys[i] = self.keys[j];
+                values[i] = self.values[j];
+            }
+            self.alloc.free(self.keys);
+            self.alloc.free(self.values);
+            self.alloc.free(self.states);
+            self.keys = keys;
+            self.values = values;
+            self.states = states;
+            self.used = self.count;
+        }
+
+        // Every (key, value) pair, in no particular order.
+        //
+        //   var it = map.iterator();
+        //   while (it.next()) |kv| { ... kv.0 ... kv.1 ... }
+        pub fn iterator(self: *Self) -> MapIterator(K, V) {
+            return .{ keys: self.keys, values: self.values, states: self.states, i: 0 };
+        }
+    };
+}
+
+pub fn MapIterator(comptime K: type, comptime V: type) -> type {
+    return struct {
+        keys: []K,
+        values: []V,
+        states: []u8,
+        i: usize,
+
+        pub fn next(self: *Self) -> ?(K, V) {
+            while (self.i < self.states.len) {
+                let j = self.i;
+                self.i += 1;
+                if (self.states[j] == 1) { return .{ self.keys[j], self.values[j] }; }
+            }
+            return null;
+        }
+    };
+}

@@ -1,0 +1,123 @@
+// syntax.parser - the parser's state and its token helpers. The grammar itself is in
+// parse_decl (top level), parse_stmt, parse_expr and parse_type. Recursive descent, with
+// precedence climbing for binary operators; the grammar is in docs/design.md, section 2.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import modules.unit;
+
+// Type names from every file (found by prescan before any file is parsed), so `Name {` can
+// be told apart from a name followed by a block.
+pub struct Names {
+    structs: alloc.Vec([]const u8),  // so `Name {` starts a struct literal
+    enums: alloc.Vec([]const u8),    // so `Shape.Rect {` starts a variant literal
+    type_fns: alloc.Vec([]const u8), // functions returning `type`, so `List(i32) {` starts a struct literal
+}
+
+pub struct Parser {
+    toks: []token.Token,
+    pos: usize,
+    names: *Names,
+    cur_struct: []const u8, // struct whose body we're in: `Self` means this type ("" outside)
+    in_receiver: bool,      // parsing `fn []T.name`: the '.' ends the type
+    cur_unit: ?*unit.Unit,  // the file being parsed
+    no_lit: i32,            // parsing a `where` clause: `Name {` starts the body, not a literal
+
+    pub fn mk(self: *Self, k: ast.NodeKind, t: *token.Token) -> *ast.Node { return ast.new(k, t, self.cur_unit); }
+
+    // the current token
+    pub fn cur(self: *Self) -> *token.Token { return &self.toks[self.pos]; }
+
+    pub fn peek(self: *Self, o: usize) -> *token.Token {
+        var i = self.pos;
+        var n = o;
+        while (n > 0 && self.toks[i].k != .Eof) {
+            i += 1;
+            n -= 1;
+        }
+        return &self.toks[i];
+    }
+
+    pub fn at(self: *Self, v: []const u8) -> bool { return isOp(self.cur(), v); }
+    pub fn atN(self: *Self, o: usize, v: []const u8) -> bool { return isOp(self.peek(o), v); }
+
+    pub fn next(self: *Self) -> *token.Token {
+        let t = &self.toks[self.pos];
+        if (t.k != .Eof) { self.pos += 1; }
+        return t;
+    }
+
+    pub fn accept(self: *Self, v: []const u8) -> ?*token.Token {
+        if (self.at(v)) { return self.next(); }
+        return null;
+    }
+
+    pub fn expect(self: *Self, v: []const u8, what: []const u8) -> *token.Token {
+        if (self.at(v)) { return self.next(); }
+        if (what.len > 0) { diag.at(self.cur(), text.f("expected {s}, found {s}", .{what, desc(self.cur())})); }
+        diag.at(self.cur(), text.f("expected '{s}', found {s}", .{v, desc(self.cur())}));
+    }
+
+    pub fn ident(self: *Self, what: []const u8) -> *token.Token {
+        let t = self.cur();
+        if (t.k != .Id || t.s[0] == '@') { diag.at(t, text.f("expected {s}, found {s}", .{what, desc(t)})); }
+        return self.next();
+    }
+
+    // Requires ';'. On failure, points just past the previous token: that's where it's missing.
+    pub fn semi(self: *Self, after: []const u8) {
+        if (self.accept(";") != null) { return; }
+        let prev = if (self.pos > 0) &self.toks[self.pos - 1] else self.cur();
+        let at_end = alloc.new(token.Token);
+        at_end.* = prev.*;
+        if (prev.k == .Id || prev.k == .Kw || prev.k == .Op) { at_end.col += prev.s.len as i32; }
+        diag.at(at_end, text.f("expected ';' after {s}", .{after}));
+    }
+
+    pub fn isEnumName(self: *Self, s: []const u8) -> bool { return text.oneOf(s, self.names.enums.items); }
+
+    pub fn isTypeFnName(self: *Self, s: []const u8) -> bool { return text.oneOf(s, self.names.type_fns.items); }
+
+    // `io` in `import std.io;`: so `geo.Point { ... }` starts a struct literal
+    pub fn isImportAlias(self: *Self, s: []const u8) -> bool {
+        let u = self.cur_unit orelse return false;
+        for (u.imports.items) |*im| { if (text.eq(im.alias, s)) { return true; } }
+        return false;
+    }
+
+    pub fn isAliasNode(self: *Self, e: *ast.Node) -> bool { return e.k == .Name && self.isImportAlias(e.name); }
+
+    // `c` in `import c "stdio.h" as c;`: its types aren't known until the header is read, so
+    // c.Name { ... } is always a struct literal
+    pub fn isCAlias(self: *Self, s: []const u8) -> bool {
+        let u = self.cur_unit orelse return false;
+        for (u.imports.items) |*im| { if (im.header.len > 0 && text.eq(im.alias, s)) { return true; } }
+        return false;
+    }
+
+    pub fn isStructName(self: *Self, s: []const u8) -> bool {
+        if (self.cur_struct.len > 0 && text.eq(s, "Self")) { return true; }
+        return text.oneOf(s, self.names.structs.items);
+    }
+
+    pub fn selfName(self: *Self, t: *token.Token) -> []const u8 {
+        if (self.cur_struct.len == 0) { diag.at(t, "'Self' can only be used inside a struct"); }
+        return self.cur_struct;
+    }
+}
+
+pub fn isOp(t: *const token.Token, v: []const u8) -> bool { return (t.k == .Op || t.k == .Kw) && text.eq(t.s, v); }
+
+// a token, the way error messages show it
+pub fn desc(t: *const token.Token) -> []const u8 {
+    switch (t.k) {
+        .Eof => { return "end of file"; }
+        .Int => { return text.f("'{}'", .{t.ival}); }
+        .Float => { return "a number"; }
+        .Str => { return "a string"; }
+        else => { return text.f("'{s}'", .{t.s}); }
+    }
+}

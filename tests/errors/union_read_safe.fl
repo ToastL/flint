@@ -1,0 +1,8 @@
+import std.io;
+
+extern union U { i: i64, f: f64 }
+fn main() -> !void {
+    var u = U { i: 1 };
+    u.f = 2.0;
+    try io.print("{}\n", .{u.i});
+}

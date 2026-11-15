@@ -1,0 +1,7 @@
+packed struct Big {
+    a: u60,
+    b: u5,
+}
+fn main() -> !void {
+    let b = Big { a: 0, b: 0 };
+}

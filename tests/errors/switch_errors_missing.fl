@@ -1,0 +1,7 @@
+error IoError { NotFound, Denied }
+fn f(e: IoError) -> i64 {
+    return switch (e) {
+        .NotFound => 1,
+    };
+}
+fn main() -> !void {}

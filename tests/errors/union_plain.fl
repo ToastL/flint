@@ -1,0 +1,3 @@
+union V { i: i64, f: f64 }
+fn main() -> !void {
+}

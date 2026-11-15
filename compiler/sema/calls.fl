@@ -1,0 +1,146 @@
+// sema.calls - calling functions: coercing arguments, passing aggregates (as scalar pieces, or by
+// address when they're big), C varargs, aggregate results through a hidden pointer, function
+// values and calls through them.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.expr;
+import sema.program;
+
+let MAXARGS: usize = 40;
+
+// vals: already-evaluated arguments (including self); toks: where each came from.
+// f.sym == "" is a call through a function value: `callee` holds its address.
+pub fn callCoreTo(f: *st.FnInfo, vals: []const b.Val, toks: []const ?*token.Token, tok: ?*token.Token, callee: ir.Opd) -> b.Val {
+    if (f.state == 0 && !f.ext) { program.lowerFn(f); }
+    let fret = f.ret orelse diag.at(tok, text.f("'{s}' calls itself before its return type is known; add '-> type' to it", .{f.name}));
+    var A: alloc.Vec(ir.Opd) = .{};
+    var K: alloc.Vec(ir.Cls) = .{};
+    var nfixed: usize = 0;
+    var ic: i32 = 0;
+    var fc: i32 = 0;
+    let aggret = ty.isAgg(fret);
+    var ret = b.aSlot(-1, 0);
+    if (aggret) {
+        ret = b.temp(fret);
+        A.push(b.R(b.addrReg(ret)));
+        K.push(.I);
+        ic += 1;
+        nfixed = A.items.len; // the hidden result pointer is a fixed argument, even with no parameters
+    }
+    for (0..vals.len) |i| {
+        if (A.items.len >= MAXARGS) { diag.at(tok, "too many arguments"); }
+        var v = vals[i];
+        let at = toks[i];
+        if (i < f.np()) {
+            let pt = f.pt.items[i];
+            let what = if (i < f.pn.items.len) text.f("argument '{s}'", .{f.pn.items[i]}) else text.f("argument {}", .{i + 1});
+            v = cv.coerce(v, pt, at, what);
+            if (ty.isAgg(pt)) {
+                if (f.ext) { diag.at(at, text.f("can't pass {s} to an extern C function (pass .ptr and .len instead)", .{ty.tname(pt)})); }
+                var L: alloc.Vec(ty.Leaf) = .{};
+                if (ty.leaves(pt, 0, &L, 4)) {
+                    for (L.items) |l| {
+                        A.push(b.R(b.load(l.t, b.aAdd(v.a, l.off as i64))));
+                        let k = ty.clsOf(l.t);
+                        K.push(k);
+                        if (k == .I) { ic += 1; } else { fc += 1; }
+                    }
+                } else {
+                    var t = v.a;
+                    if (!v.fresh) {
+                        t = b.temp(pt);
+                        b.copyAgg(pt, t, v.a);
+                    }
+                    A.push(b.R(b.addrReg(t)));
+                    K.push(.I);
+                    ic += 1;
+                }
+            } else {
+                A.push(b.opdOf(v));
+                let k = ty.clsOf(pt);
+                K.push(k);
+                if (k == .I) { ic += 1; } else { fc += 1; }
+            }
+            nfixed = A.items.len;
+        } else {
+            v = cv.defaulted(v);
+            if (v.strlit != 0) { v = cv.coerce(v, ty.cstr_, at, "argument"); }
+            if (ty.isAgg(v.t)) { diag.at(at, text.f("pass {s} to C varargs as .ptr (and make sure it's NUL-terminated)", .{ty.tname(v.t)})); }
+            if (v.t == ty.void_) { diag.at(at, "this expression has no value"); }
+            if (v.t.k == .F32) { v = cv.convert(v, ty.f64_); }
+            A.push(b.opdOf(v));
+            K.push(ty.clsOf(v.t));
+        }
+    }
+    if ((ic > 8 || fc > 8) && f.ext) {
+        diag.at(tok, "too many arguments for a C function (up to 8 integer and 8 float registers are supported)");
+    }
+    if (f.sym.len == 0) { // the callee goes last; it's not an argument
+        A.push(callee);
+        K.push(.I);
+    }
+    let retcls: ir.Cls = if (fret == ty.void_ || fret == ty.noreturn_ || aggret) .None else ty.clsOf(fret);
+    var r = b.emitCall(f.sym, A.items, K.items, nfixed as i32, retcls);
+    if (fret == ty.noreturn_) { // it never comes back, like exit()
+        b.trap();
+        return b.vReg(ty.noreturn_, -1);
+    }
+    if (aggret) { return b.vAgg(fret, ret, true); }
+    if (fret == ty.void_) { return b.vVoid(); }
+    if (f.ext || f.sym.len == 0) { r = cv.norm(r, fret); } // C leaves the upper bits of narrow results unspecified
+    return b.vReg(fret, r);
+}
+
+pub fn callCore(f: *st.FnInfo, vals: []const b.Val, toks: []const ?*token.Token, tok: ?*token.Token) -> b.Val {
+    return callCoreTo(f, vals, toks, tok, b.IMM(0));
+}
+
+// the function's address, as a value of its fn(...) type
+pub fn fnValue(f: *st.FnInfo, tok: ?*token.Token) -> b.Val {
+    if (f.recv) |rv| { names.checkPub(f.unit, f.is_pub, text.f("{s}.{s}", .{ty.tname(rv), f.name}), tok); }
+    if (f.type_fn) { diag.at(tok, text.f("'{s}' returns a type; call it with its arguments to name the type", .{f.name})); }
+    if (f.generic) { diag.at(tok, text.f("'{s}' is generic (it has comptime or anytype parameters), so it has no single address", .{f.name})); }
+    if (f.decl.?.is_unsafe) { names.requireUnsafe(tok, text.f("using the unsafe fn '{s}' as a value", .{f.name})); }
+    if (f.state == 0 && !f.ext) { program.lowerFn(f); }
+    let fret = f.ret orelse diag.at(tok, text.f("'{s}' is used before its return type is known; add '-> type' to it", .{f.name}));
+    let r = b.addrSymQ(f.sym, f.ext); // C functions live in another image: through the GOT
+    return b.vReg(ty.fnType(f.pt.items, fret, f.variadic), r);
+}
+
+// call through a value of type fn(...)
+pub fn callValue(fv: b.Val, args: []*ast.Node, tok: ?*token.Token) -> b.Val {
+    let ft = fv.t;
+    if (ft.k == .Opt && ty.isFn(ft.E())) { access.optMisuse(tok, ft); }
+    if (!ty.isFn(ft)) { diag.at(tok, text.f("can't call {s}: it isn't a function", .{ty.tname(ft)})); }
+    let callee = b.regOf(fv);
+    let f = alloc.new(st.FnInfo);
+    f.name = "this function";
+    f.pt = alloc.Vec(*ty.Type) { items: alloc.dupe(*ty.Type, ft.params), cap: ft.params.len };
+    f.ret = ft.E();
+    f.variadic = ft.variadic;
+    f.state = 2;
+    let np = ft.params.len;
+    let nargs = args.len;
+    if (nargs < np || (nargs > np && !f.variadic)) {
+        diag.at(tok, text.f("this function takes {} argument(s), got {}", .{np, nargs}));
+    }
+    if (nargs > MAXARGS) { diag.at(tok, "too many arguments"); }
+    var vals: alloc.Vec(b.Val) = .{};
+    var toks: alloc.Vec(?*token.Token) = .{};
+    for (0..nargs) |i| {
+        vals.push(expr.expr(args[i], if (i < np) ft.params[i] else null));
+        toks.push(args[i].tok);
+    }
+    return callCoreTo(f, vals.items, toks.items, tok, b.R(callee));
+}

@@ -1,0 +1,242 @@
+// sema.members - what `a.b` and `a.b(...)` mean when `a` names a type, a module or a C header,
+// and calls: by name, through modules, methods (self by value or by pointer, with the automatic
+// `&`), enum variants with payloads, function-valued fields.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.token;
+import syntax.ast;
+import modules.unit;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.expr;
+import sema.calls;
+import sema.generics;
+import sema.builtins;
+import sema.enums;
+import sema.cdecls;
+
+// the type a node names when it's used as `Type.member`: a type name, List(i32), or a type expression
+pub fn staticType(n: *ast.Node) -> ?*ty.Type {
+    let su = st.CU;
+    if (n.unit) |u| { st.CU = u; }
+    let t = staticTypeIn(n);
+    st.CU = su;
+    return t;
+}
+
+fn staticTypeIn(n: *ast.Node) -> ?*ty.Type {
+    if (n.k == .Name) {
+        if (names.findVar(n.name)) |v| { return if (v.kind == .Type) v.t else null; }
+        let t = names.findStruct(n.name);
+        names.checkTypePub(t, n.tok);
+        return t;
+    }
+    if (n.k == .FieldAcc) {
+        let base = n.a.?;
+        if (names.unitRef(base)) |u| { // geo.Point, or geo.Points (let Points = List(Point);)
+            if (names.typeIn(u, n.name)) |t| {
+                names.checkTypePub(t, n.tok);
+                return t;
+            }
+            let su = st.CU;
+            st.CU = u;
+            let t = names.globalType(u, n.name);
+            st.CU = su;
+            if (t != null) {
+                for (st.gvars.items) |g| {
+                    if (g.unit == u && text.eq(g.name, n.name)) { names.checkPub(u, g.is_pub, n.name, n.tok); }
+                }
+            }
+            return t;
+        }
+        if (names.headerRef(base)) |h| { return cdecls.cTypeNamed(h, n.name, n.tok); } // c.FILE
+        let o = staticType(base) orelse return null; // Outer.Inner
+        if (o.unit == null) { return null; }
+        return names.typeIn(o.unit, text.f("{s}.{s}", .{o.name, n.name}));
+    }
+    if (n.k == .TypeExpr) { return names.resolve(n.a.?); }
+    if (n.k == .Call) {
+        if (calleeFn(n.a.?)) |f| {
+            if (f.type_fn) { return generics.instantiateType(f, n.list.items, n.tok); }
+        }
+    }
+    return null;
+}
+
+pub fn isStaticRef(n: *ast.Node) -> bool { return staticType(n) != null; }
+
+// the function a callee expression names without a value: f, or mod.f (null otherwise)
+pub fn calleeFn(f: *ast.Node) -> ?*st.FnInfo {
+    if (f.k == .Name && names.findVar(f.name) == null) { return names.findFn(f.name); }
+    if (f.k == .FieldAcc) {
+        let u = names.unitRef(f.a.?) orelse return null;
+        let fi = names.fnIn(u, f.name);
+        if (fi) |x| { names.checkPub(u, x.is_pub, f.name, f.tok); }
+        return fi;
+    }
+    return null;
+}
+
+// mod.name used as a value or a place: the global (or constant) `name` of that module
+pub fn moduleVar(n: *ast.Node) -> ?*st.Var {
+    if (n.k != .FieldAcc) { return null; }
+    let u = names.unitRef(n.a.?) orelse return null;
+    let v = names.globalIn(u, n.name);
+    if (v) |x| { names.checkPub(u, x.is_pub, n.name, n.tok); }
+    return v;
+}
+
+// a module member that isn't a function, global or type: say so
+pub fn noMember(u: *unit.Unit, n: *ast.Node) -> noreturn {
+    diag.at(n.tok, text.f("{s} has no '{s}'", .{names.unitName(u), n.name}));
+}
+
+pub fn callFn(f: *st.FnInfo, args: []*ast.Node, self_: ?*b.Val, tok: ?*token.Token) -> b.Val {
+    if (f.recv) |rv| { names.checkPub(f.unit, f.is_pub, text.f("{s}.{s}", .{ty.tname(rv), f.name}), tok); }
+    if (f.decl.?.is_unsafe) { names.requireUnsafe(tok, text.f("calling the unsafe fn '{s}'", .{f.name})); }
+    if (f.generic) { return generics.callGeneric(f, args, self_, tok); }
+    let first: usize = if (self_ != null) 1 else 0;
+    let given = args.len + first;
+    let np = f.np();
+    if (given < np || (given > np && !f.variadic)) {
+        diag.at(tok, text.f("'{s}' takes {} argument(s), got {}", .{f.name, np as i64 - first as i64, args.len}));
+    }
+    if (given > 40) { diag.at(tok, "too many arguments"); }
+    var vals = alloc_vals(given);
+    var toks = alloc_toks(given);
+    for (0..given) |i| {
+        if (i < first) {
+            vals[i] = self_.?.*;
+            toks[i] = tok;
+        } else {
+            let an = args[i - first];
+            vals[i] = expr.expr(an, if (i < np) f.pt.items[i] else null);
+            toks[i] = an.tok;
+        }
+    }
+    return calls.callCore(f, vals, toks, tok);
+}
+
+fn alloc_vals(n: usize) -> []b.Val { return alloc.make(b.Val, n); }
+fn alloc_toks(n: usize) -> []?*token.Token { return alloc.make(?*token.Token, n); }
+
+// a method of the standard library, called by the compiler with these arguments
+pub fn libCall(recv: *ty.Type, name: []const u8, args: []const b.Val, tok: ?*token.Token) -> b.Val {
+    let m = names.findMethod(recv, name) orelse diag.at(tok, text.f("internal error: prelude method {s}.{s} is missing", .{ty.tname(recv), name}));
+    let toks = alloc_toks(args.len);
+    for (0..args.len) |i| { toks[i] = tok; }
+    return calls.callCore(m, args, toks, tok);
+}
+
+pub fn exCall(n: *ast.Node, want: ?*ty.Type) -> b.Val {
+    let f = n.a.?;
+    if (f.k == .Name && names.findVar(f.name) == null) {
+        if (names.findFn(f.name)) |fi| { return callFn(fi, n.list.items, null, n.tok); }
+        if (names.isBuiltin(f.name)) { return builtins.builtin(n, want); }
+        if (text.eq(f.name, "alloc") || text.eq(f.name, "free")) {
+            diag.at(f.tok, text.f("there's no global {s}(): memory comes from an Allocator you pass around, like 'let xs = try alloc.alloc(T, n); defer alloc.free(xs);' (see heap.c_allocator, heap.DebugAllocator)", .{f.name}));
+        }
+        if (text.eq(f.name, "print")) {
+            diag.at(f.tok, "print(...) was replaced by formatted output: try io.print(\"x = {}\\n\", .{x}); (the format string is checked at compile time)");
+        }
+        if (names.findStruct(f.name)) |t| {
+            if (t.k == .Struct) { diag.at(n.tok, text.f("to create a {s}, write {s} {{ field: value, ... }}", .{f.name, f.name})); }
+        }
+        diag.at(f.tok, text.f("function '{s}' is not defined", .{f.name}));
+    }
+    if (f.k != .FieldAcc) { return calls.callValue(expr.expr(f, null), n.list.items, n.tok); }
+    let base = f.a.?;
+    if (names.unitRef(base)) |mu| { // io.print(...)
+        if (calleeFn(f)) |fi| { return callFn(fi, n.list.items, null, n.tok); }
+        if (moduleVar(f) != null) { return calls.callValue(expr.expr(f, null), n.list.items, n.tok); }
+        if (names.typeIn(mu, f.name)) |t| {
+            if (t.k == .Struct) { diag.at(n.tok, text.f("to create a {s}, write {s}.{s} {{ field: value, ... }}", .{ty.tname(t), base.name, f.name})); }
+        }
+        noMember(mu, f);
+    }
+    if (names.headerRef(base)) |h| { return cdecls.cCall(h, f, n.list.items, n.tok); }
+    if (isStaticRef(base)) {
+        let stt = staticType(base).?;
+        if (stt.k == .Enum) {
+            for (stt.variants.items) |*v| {
+                if (text.eq(v.name, f.name)) { return enums.enumValue(stt, f.name, 1, n.list.items, n.tok); }
+            }
+        }
+        let m = names.findMethod(stt, f.name) orelse diag.at(f.tok, text.f("'{s}' has no method '{s}'", .{ty.tname(stt), f.name}));
+        return callFn(m, n.list.items, null, n.tok);
+    }
+    var l = access.newLV();
+    var v = b.vVoid();
+    let have_lv = access.isLvalueNode(base);
+    if (have_lv) {
+        l = access.lval(base);
+    } else {
+        v = cv.defaulted(expr.expr(base, null)); // (0.25).toString() calls f64's method
+        l.t = v.t;
+        l.a = v.a;
+        l.temp = true;
+    }
+    let rt = l.t;
+    var m = names.findMethod(rt, f.name);
+    if (m == null && ty.isSlice(rt) && !rt.is_const) { m = names.findMethod(ty.sliceOfQ(rt.E(), true), f.name); } // []u8 has str's methods
+    if (m == null && ty.isSlice(rt) && (text.eq(f.name, "push") || text.eq(f.name, "pop"))) {
+        diag.at(f.tok, text.f("slices can't grow: '{s}' would allocate behind your back; use an ArrayList({s}), which takes an allocator",
+                              .{f.name, ty.tname(rt.E())}));
+    }
+    var via_ptr = false; // receiver is a pointer to the method's type: auto-deref
+    if (m == null && ty.isPtr(rt) && !rt.many) {
+        m = names.findMethod(rt.E(), f.name);
+        via_ptr = m != null;
+    }
+    if (m == null) { // a field holding a function: s.callback(x)
+        var stt = rt;
+        var ba = l.a;
+        if (ty.isPtr(rt) && !rt.many) {
+            ba = b.aReg(if (have_lv) b.load(rt, l.a) else b.regOf(v), 0);
+            stt = rt.E();
+        }
+        if (stt.k == .Struct) {
+            for (stt.fields.items) |*fd| {
+                if (!text.eq(fd.name, f.name)) { continue; }
+                if (!ty.isFn(fd.t) && !(fd.t.k == .Opt && ty.isFn(fd.t.E()))) {
+                    diag.at(f.tok, text.f("field '{s}' is {s}, not a function", .{fd.name, ty.tname(fd.t)}));
+                }
+                return calls.callValue(b.loadVal(fd.t, b.aAdd(ba, fd.off as i64)), n.list.items, f.tok);
+            }
+        }
+    }
+    if (m == null && rt.k == .Opt) { access.optMisuse(f.tok, rt); }
+    let mm = m orelse diag.at(f.tok, text.f("{s} has no method '{s}'", .{ty.tname(rt), f.name}));
+    let bt = if (via_ptr) rt.E() else rt;
+    if (mm.self_kind == 0) {
+        diag.at(f.tok, text.f("'{s}.{s}' doesn't take self; call it as {s}.{s}(...)", .{ty.tname(bt), f.name, ty.tname(bt), f.name}));
+    }
+    var self_: b.Val = undefined;
+    if (mm.self_kind == 2) {
+        if (via_ptr) {
+            self_ = if (have_lv) b.vReg(rt, b.load(rt, l.a)) else v;
+        } else if (have_lv && !l.temp) {
+            if (l.bits != 0) { diag.at(f.tok, text.f("'{s}' takes a pointer, but a packed struct field has no address", .{f.name})); }
+            if (l.ro && !mm.pt.items[0].is_const) {
+                diag.at(f.tok, text.f("'{s}' modifies its receiver, which is immutable here (declare it with 'var')", .{f.name}));
+            }
+            self_ = b.vReg(ty.ptrToQ(rt, l.ro), b.addrReg(l.a));
+        } else {
+            diag.at(f.tok, text.f("'{s}' modifies its receiver, so it needs a variable, not a temporary", .{f.name}));
+        }
+    } else {
+        if (via_ptr) {
+            self_ = b.loadVal(bt, b.aReg(if (have_lv) b.load(rt, l.a) else b.regOf(v), 0));
+        } else {
+            self_ = if (have_lv) access.lvLoad(l) else v;
+        }
+    }
+    return callFn(mm, n.list.items, &self_, n.tok);
+}
