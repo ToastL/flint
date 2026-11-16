@@ -3,10 +3,6 @@
 What's left to build, plus the known gaps in what exists. What's already done is in
 [CHANGELOG.md](CHANGELOG.md). The design is [docs/design.md](docs/design.md); section numbers refer to it.
 
-## Language
-
-- [ ] Inline assembly `asm { }` (§6.1 item 7)
-
 ## Backend and performance
 
 - [ ] The self-hosted compiler never frees memory (one process-wide heap); fine for one compile, but it could use arenas per function

@@ -41,7 +41,7 @@ pub fn count(f: *ir.IRFunc) {
         if (blk.dead) { continue; }
         for (blk.insts.items) |*in| {
             if (in.dst >= 0) { defcnt[in.dst as usize] += 1; }
-            if (in.op == .Call) {
+            if (ir.hasArgs(in)) {
                 if (in.args.len > 64) { continue; }
                 for (in.args) |a| { if (a.k == .Reg) { usecnt[a.v as usize] += 1; } }
                 continue;

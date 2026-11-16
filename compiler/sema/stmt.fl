@@ -23,6 +23,7 @@ import sema.ctexec;
 import sema.ctbranch;
 import sema.members;
 import sema.program;
+import sema.asmblock;
 
 // Runs the defers of every scope from the innermost up to `stop` (null: all). errdefers run only
 // when `err` is given, i.e. when leaving with an error.
@@ -369,6 +370,7 @@ fn stmtIn(n: *ast.Node) {
         }
         .Switch => { _ = cases.lowerSwitch(n, null); }
         .Comptime => { ctexec.ctBlock(n.a.?); }
+        .Asm => { asmblock.lower(n); }
         .Fallthrough => { diag.at(n.tok, "fallthrough must be the last statement of a switch case"); }
         .Block => {
             let u: i32 = if (n.is_unsafe) 1 else 0;

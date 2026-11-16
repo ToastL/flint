@@ -188,7 +188,7 @@ pub fn run(f: *ir.IRFunc) -> bool {
                 .Store => {
                     if (in.cls == .I) { _ = s.sub(&in.b); }
                 }
-                .Call => {
+                .Call, .Asm => {
                     for (0..in.args.len) |k| { if (in.argcls[k] == .I) { _ = s.sub(&in.args[k]); } }
                 }
                 .Ret => {

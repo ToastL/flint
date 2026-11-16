@@ -71,7 +71,7 @@ fn substOne(o: *ir.Opd, e: *Env, ch: *bool) {
 }
 
 fn substCopies(in: *ir.Inst, e: *Env, ch: *bool) {
-    if (in.op == .Call) {
+    if (ir.hasArgs(in)) {
         for (in.args) |*a| { substOne(a, e, ch); }
         return;
     }

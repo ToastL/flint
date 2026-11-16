@@ -1,0 +1,4 @@
+fn main() {
+    let a: i64 = 1;
+    unsafe { asm { in x9 = a; "nop"; } }
+}

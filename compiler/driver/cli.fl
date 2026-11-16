@@ -130,7 +130,7 @@ pub fn main(argv: []const []const u8) -> u8 {
         }
     }
     var job = build.Job {
-        asm_text: asm_text, pkg: pkg, mode: mode, out: exe, keep: text.eq(cmd, "build"),
+        asm_text: asm_text, has_asm: m.has_asm, pkg: pkg, mode: mode, out: exe, keep: text.eq(cmd, "build"),
         run: text.eq(cmd, "run") || test_mode, prog_args: prog_args,
     };
     return build.build(&job);

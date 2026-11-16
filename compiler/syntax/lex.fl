@@ -10,7 +10,7 @@ let KEYWORDS = [_][]const u8 {
     "struct", "enum", "switch", "fallthrough", "orelse", "unreachable", "true", "false", "null", "undefined",
     "error", "try", "catch", "errdefer",
     "as", "extern", "export",
-    "pub", "defer", "union", "packed", "unsafe", "comptime", "import", "test", "where",
+    "pub", "defer", "union", "packed", "unsafe", "comptime", "import", "test", "where", "asm",
 };
 
 // longest first, so "..=" wins over ".." and "."

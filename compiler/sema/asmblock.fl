@@ -1,0 +1,124 @@
+// sema.asmblock - inline assembly: asm { in x0 = a; "add x0, x0, #1"; out x0 -> r; }
+//
+// The lines are pasted into the generated assembly as written. `in` puts a value in a register
+// before the block, `out` stores a register to a place after it; the registers are the ones
+// arguments and results travel in (x0-x7, d0-d7, s0-s7), which hold nothing else. The block is one
+// Asm instruction that the optimizer and the register allocator treat like a call, directly
+// followed by one AsmOut per output.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import syntax.ast;
+import ir.ir;
+import sema.state as st;
+import sema.types as ty;
+import sema.irbuild as b;
+import sema.convert as cv;
+import sema.names;
+import sema.access;
+import sema.expr;
+
+struct Reg {
+    cls: ir.Cls,
+    n: i32,
+}
+
+fn regOf(it: *ast.Node) -> Reg {
+    let s = it.name;
+    if (s.len == 2 && s[1] >= '0' && s[1] <= '7') {
+        let n = (s[1] - '0') as i32;
+        if (s[0] == 'x') { return Reg { cls: .I, n: n }; }
+        if (s[0] == 'd') { return Reg { cls: .F64, n: n }; }
+        if (s[0] == 's') { return Reg { cls: .F32, n: n }; }
+    }
+    diag.at(it.tok, text.f("'{s}' can't carry a value {s} an asm block: use x0-x7 (integers and pointers), d0-d7 (f64) or s0-s7 (f32)",
+        .{s, if (it.flag == 1) "into" else "out of"}));
+}
+
+fn regsFor(cls: ir.Cls) -> []const u8 {
+    return if (cls == .I) "x0-x7" else if (cls == .F64) "d0-d7" else "s0-s7";
+}
+
+fn checkType(t: *ty.Type, r: Reg, it: *ast.Node) {
+    if (ty.isAgg(t) || t.k == .Void || t.k == .NoReturn || t.k == .Null || t.k == .Type) {
+        diag.at(it.a.?.tok, text.f("a register can't hold a value of type {s}", .{ty.tname(t)}));
+    }
+    if (ty.clsOf(t) != r.cls) {
+        diag.at(it.a.?.tok, text.f("{s} can't hold a value of type {s}: use {s}", .{it.name, ty.tname(t), regsFor(ty.clsOf(t))}));
+    }
+}
+
+// x<n> is one register, d<n> and s<n> are two names of another
+fn claim(used: []bool, r: Reg, it: *ast.Node) {
+    let k = (if (r.cls == .I) r.n else r.n + 8) as usize;
+    if (used[k]) {
+        diag.at(it.tok, text.f("{s} is already {s} in this asm block", .{it.name, if (it.flag == 1) "an input" else "an output"}));
+    }
+    used[k] = true;
+}
+
+pub fn lower(n: *ast.Node) {
+    names.requireUnsafe(n.tok, "inline assembly");
+    var args: alloc.Vec(ir.Opd) = .{};
+    var cls: alloc.Vec(ir.Cls) = .{};
+    var regs: alloc.Vec(i32) = .{};
+    var code: text.Buf = .{};
+    var ins = @zeroes([16]bool);
+    var outs = @zeroes([16]bool);
+    for (n.list.items) |it| {
+        if (it.flag == 0) {
+            code.byte('\t');
+            code.add(it.str);
+            code.byte('\n');
+        } else if (it.flag == 1) {
+            let r = regOf(it);
+            claim(ins[..], r, it);
+            let want: ?*ty.Type = if (r.cls == .F32) ty.f32_ else if (r.cls == .F64) ty.f64_ else null;
+            var v = expr.expr(it.a.?, want);
+            if (want != null && ty.isLit(v.t)) { v = cv.coerce(v, want.?, it.a.?.tok, "the asm input"); }
+            v = cv.defaulted(v);
+            checkType(v.t, r, it);
+            args.push(b.opdOf(v));
+            cls.push(r.cls);
+            regs.push(r.n);
+        } else {
+            claim(outs[..], regOf(it), it);
+        }
+    }
+    st.M.has_asm = true;
+    let i = b.emit(.Asm);
+    i.sym = code.items;
+    i.args = args.items;
+    i.argcls = cls.items;
+    i.regs = regs.items;
+    i.nfixed = args.items.len as i32;
+    // every output is read before anything else runs: storing one may need code of its own
+    var got: alloc.Vec(i32) = .{};
+    for (n.list.items) |it| {
+        if (it.flag != 2) { continue; }
+        let r = regOf(it);
+        let d = b.newVreg(r.cls);
+        let o = b.emit(.AsmOut);
+        o.dst = d;
+        o.cls = r.cls;
+        o.imm = r.n as i64;
+        got.push(d);
+    }
+    var k: usize = 0;
+    for (n.list.items) |it| {
+        if (it.flag != 2) { continue; }
+        let target = it.a.?;
+        let l = access.lval(target);
+        if (l.ro) {
+            if (target.k == .Name) {
+                diag.at(target.tok, text.f("can't store to '{s}': it's immutable (use 'var' to declare a mutable variable)", .{target.name}));
+            }
+            diag.at(target.tok, "can't store here: the location is read-only");
+        }
+        if (l.temp) { diag.at(target.tok, "can't store to a field of a temporary value"); }
+        checkType(l.t, regOf(it), it);
+        access.lvStore(l, b.vReg(l.t, cv.norm(got.items[k], l.t)), target.tok);
+        k += 1;
+    }
+}

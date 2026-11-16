@@ -33,6 +33,9 @@ pub enum Op {
     SMulH, UMulH, // high 64 bits of a 128-bit product (overflow checks)
     Vec,     // SIMD on memory: [a] = [b] op [c] (a, b, c hold addresses); mem = a Vop, imm = vlanes()
     VReduce, // dst = the sum of the lanes at [a]; imm = vlanes()
+    Asm,     // inline assembly: sym = its text; args[i] (class argcls[i]) is in register regs[i] when
+             // it starts. Like a call, it may overwrite every caller-saved register
+    AsmOut,  // dst = register imm (x<imm>, or d/s<imm> by cls) as the Asm just before left it
 }
 
 // Vec operations. Splat: every lane of [a] = b (a scalar of class cls); Neg: [a] = -[b]
@@ -68,6 +71,7 @@ pub struct Inst {
     args: []Opd,
     argcls: []Cls,
     nfixed: i32,   // args past nfixed are C varargs
+    regs: []i32,   // Asm: the register each argument goes in
     tok: ?*token.Token, // the source it came from (for errors found when it runs at compile time)
 }
 
@@ -129,15 +133,19 @@ pub struct Module {
     main_errors: bool,               // main returns !void
     strs: alloc.Vec(StrLit),
     globals: alloc.Vec(GlobalVar),
+    has_asm: bool,                   // some function has an asm block
 }
 
 // build modes (design.md section 6.2)
 pub enum Mode { Debug, Safe, Fast }
 
+// its operands are in `args` (not a, b, c)
+pub fn hasArgs(in: *const Inst) -> bool { return in.op == .Call || in.op == .Asm; }
+
 // vregs read by an instruction, into out; returns how many
 pub fn instUses(in: *const Inst, out: *alloc.Vec(i32)) {
     out.truncate(0);
-    if (in.op == .Call) {
+    if (hasArgs(in)) {
         for (in.args) |a| { if (a.k == .Reg) { out.push(a.v as i32); } }
         return;
     }
@@ -150,7 +158,7 @@ pub fn isTerm(in: *const Inst) -> bool { return in.op == .Jmp || in.op == .Br ||
 
 pub fn hasEffects(in: *const Inst) -> bool {
     switch (in.op) {
-        .Store, .Call, .Memcpy, .Memzero, .Vec, .Jmp, .Br, .Ret, .Trap => { return true; }
+        .Store, .Call, .Asm, .Memcpy, .Memzero, .Vec, .Jmp, .Br, .Ret, .Trap => { return true; }
         else => { return false; }
     }
 }

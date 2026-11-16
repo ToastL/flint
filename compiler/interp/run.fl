@@ -368,6 +368,7 @@ pub fn exec(f: *ir.IRFunc, args: []const i64, argcls: []const ir.Cls, nfixed: us
                     return result;
                 }
                 .Trap => { return mem.fail(null, "comptime code reached unreachable code"); }
+                .Asm, .AsmOut => { return mem.fail(in.tok, "inline assembly can't run at compile time"); }
             }
             if (next >= 0) { break; }
         }

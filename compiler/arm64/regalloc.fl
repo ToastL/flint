@@ -140,7 +140,7 @@ pub fn regalloc() {
             ir.instUses(in, &u);
             for (u.items) |x| { ext(start, end, x as usize, p); }
             if (in.dst >= 0) { ext(start, end, in.dst as usize, p); }
-            if (in.op == .Call) { calls.push(p); }
+            if (ir.hasArgs(in)) { calls.push(p); } // an asm block clobbers what a call does
         }
     }
     var ivs: alloc.Vec(Iv) = .{};

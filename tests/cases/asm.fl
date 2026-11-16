@@ -1,0 +1,172 @@
+// asm { }: lines of assembly, pasted as written. `in` puts a value in a register before the block,
+// `out` stores a register afterwards. The block may overwrite what a call may (x0-x17, v0-v7,
+// v16-v31, the flags), and it is only allowed in unsafe code.
+
+import std.io;
+
+struct Wide { lo: u64, hi: u64 }
+
+fn add(a: i64, c: i64) -> i64 {
+    var r: i64 = 0;
+    unsafe {
+        asm {
+            in x0 = a;
+            in x1 = c;
+            "add x0, x0, x1";
+            out x0 -> r;
+        }
+    }
+    return r;
+}
+
+// two results, stored to fields
+fn mulWide(a: u64, c: u64) -> Wide {
+    var w = Wide { lo: 0, hi: 0 };
+    unsafe {
+        asm {
+            in x0 = a;
+            in x1 = c;
+            "mul x2, x0, x1";
+            "umulh x3, x0, x1";
+            out x2 -> w.lo;
+            out x3 -> w.hi;
+        }
+    }
+    return w;
+}
+
+fn root(x: f64) -> f64 {
+    var r: f64 = 0.0;
+    unsafe {
+        asm { in d0 = x; "fsqrt d0, d0"; out d0 -> r; }
+    }
+    return r;
+}
+
+fn half(x: f32) -> f32 {
+    var r: f32 = 0.0;
+    unsafe {
+        asm {
+            in s0 = x;
+            in s1 = 0.5;
+            "fmul s0, s0, s1";
+            out s0 -> r;
+        }
+    }
+    return r;
+}
+
+// a loop: numeric labels are local to where they're used
+fn popcount(x: u64) -> u8 {
+    var n: u8 = 0;
+    unsafe {
+        asm {
+            in x0 = x;
+            "mov x1, #0";
+            "1:";
+            "cbz x0, 2f";
+            "sub x2, x0, #1";
+            "and x0, x0, x2";
+            "add x1, x1, #1";
+            "b 1b";
+            "2:";
+            "add x1, x1, #0x300"; // more than a u8 holds: the store keeps the low byte
+            out x1 -> n;
+        }
+    }
+    return n;
+}
+
+// the write system call, without libc
+fn rawWrite(fd: i32, s: []const u8) -> i64 {
+    var r: i64 = 0;
+    unsafe {
+        asm {
+            in x0 = fd;
+            in x1 = s.ptr;
+            in x2 = s.len;
+            "mov x16, #4";
+            "svc #0x80";
+            out x0 -> r;
+        }
+    }
+    return r;
+}
+
+// memory through a pointer, and no outputs
+fn bump(p: *i32) {
+    unsafe {
+        asm {
+            in x0 = p;
+            "ldr w1, [x0]";
+            "add w1, w1, #1";
+            "str w1, [x0]";
+        }
+    }
+}
+
+fn twice(comptime T: type, x: T) -> T {
+    var r: T = 0;
+    unsafe {
+        asm { in x0 = x; "lsl x0, x0, #1"; out x0 -> r; }
+    }
+    return r;
+}
+
+// a block that overwrites every register it may
+fn scribble() {
+    unsafe {
+        asm {
+            "mov x0, #-1";  "mov x1, #-1";  "mov x2, #-1";  "mov x3, #-1";  "mov x4, #-1";  "mov x5, #-1";
+            "mov x6, #-1";  "mov x7, #-1";  "mov x8, #-1";  "mov x9, #-1";  "mov x10, #-1"; "mov x11, #-1";
+            "mov x12, #-1"; "mov x13, #-1"; "mov x14, #-1"; "mov x15, #-1"; "mov x16, #-1"; "mov x17, #-1";
+            "movi v0.16b, #255";  "movi v1.16b, #255";  "movi v2.16b, #255";  "movi v3.16b, #255";
+            "movi v4.16b, #255";  "movi v5.16b, #255";  "movi v6.16b, #255";  "movi v7.16b, #255";
+            "movi v16.16b, #255"; "movi v17.16b, #255"; "movi v18.16b, #255"; "movi v19.16b, #255";
+            "movi v20.16b, #255"; "movi v21.16b, #255"; "movi v22.16b, #255"; "movi v23.16b, #255";
+            "movi v24.16b, #255"; "movi v25.16b, #255"; "movi v26.16b, #255"; "movi v27.16b, #255";
+            "movi v28.16b, #255"; "movi v29.16b, #255"; "movi v30.16b, #255"; "movi v31.16b, #255";
+            "cmp x0, x0";
+        }
+    }
+}
+
+fn main() -> !void {
+    try io.print("{} {}\n", .{ add(40, 2), add(-5, 3) });
+    let w = mulWide(0xffffffffffffffff, 16);
+    try io.print("{x} {x}\n", .{ w.hi, w.lo });
+    try io.print("{} {}\n", .{ root(2.25), half(7.0) });
+    try io.print("{} {}\n", .{ popcount(0xf0f0), popcount(0) });
+    try io.print("{} {}\n", .{ twice(u8, 100), twice(i64, -21) });
+
+    var c: i32 = 41;
+    bump(&c);
+    try io.print("{}\n", .{c});
+
+    // values that live across blocks: integers and floats, in a loop
+    var xs = [_]i64 { 0, 0, 0, 0 };
+    var sum: i64 = 0;
+    var fsum: f64 = 0.5;
+    for (0..4) |i| {
+        let k = i as i64 * 10;
+        let f = k as f64 / 4.0;
+        scribble();
+        unsafe {
+            asm {
+                in x0 = k;
+                in x1 = sum;
+                "add x0, x0, x1";
+                "add x0, x0, #1";
+                out x0 -> xs[i];
+            }
+        }
+        scribble();
+        sum += xs[i] - k;
+        fsum += f;
+    }
+    try io.print("{} {} {} {} {} {}\n", .{ xs[0], xs[1], xs[2], xs[3], sum, fsum });
+
+    try io.flush();
+    let n = rawWrite(1, "written by svc\n");
+    try io.print("{}\n", .{n});
+}

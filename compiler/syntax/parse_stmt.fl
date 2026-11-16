@@ -9,6 +9,40 @@ import syntax.parser;
 import syntax.parse_expr;
 import syntax.parse_type;
 
+// asm { in x0 = a; "add x0, x0, #1"; out x0 -> r; }: lines of assembly, and the registers that
+// carry values in and out. `in` and `out` are only special here.
+fn asmBlock(p: *parser.Parser) -> *ast.Node {
+    let n = p.mk(.Asm, p.next());
+    if (!p.at("{")) { diag.at(p.cur(), text.f("expected '{{' after 'asm', found {s}", .{parser.desc(p.cur())})); }
+    _ = p.next();
+    while (!p.at("}")) {
+        let t = p.cur();
+        let it = p.mk(.AsmItem, t);
+        if (t.k == .Str) {
+            _ = p.next();
+            it.str = t.str;
+            p.semi("the line of assembly");
+        } else if (t.k == .Id && (text.eq(t.s, "in") || text.eq(t.s, "out"))) {
+            let is_in = text.eq(t.s, "in");
+            _ = p.next();
+            it.flag = if (is_in) 1 else 2;
+            it.name = p.ident("a register (x0-x7, d0-d7 or s0-s7)").s;
+            if (is_in) {
+                _ = p.expect("=", "'=' and the value the register starts with");
+            } else {
+                _ = p.expect("->", "'->' and the place the register is stored to");
+            }
+            it.a = parse_expr.expr(p);
+            p.semi(if (is_in) "the input" else "the output");
+        } else {
+            diag.at(t, text.f("expected a string of assembly, 'in' or 'out' in an asm block, found {s}", .{parser.desc(t)}));
+        }
+        n.add(it);
+    }
+    _ = p.next();
+    return n;
+}
+
 pub fn letStmt(p: *parser.Parser) -> *ast.Node {
     let kw = p.next(); // let | var
     let immutable: i32 = if (text.eq(kw.s, "let")) 1 else 0;
@@ -310,6 +344,7 @@ pub fn stmt(p: *parser.Parser) -> *ast.Node {
         b.is_unsafe = true;
         return b;
     }
+    if (p.at("asm")) { return asmBlock(p); }
     if (p.at("comptime") && p.atN(1, "{")) { // comptime { ... }: runs while compiling
         _ = p.next();
         let n = p.mk(.Comptime, t);

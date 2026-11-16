@@ -1,0 +1,1 @@
+inline assembly is only allowed inside an 'unsafe' block

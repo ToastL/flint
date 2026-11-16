@@ -25,6 +25,8 @@ pub enum NodeKind {
     Test,      // test "name" { ... }: str = the name, c = the body
     Comptime,  // comptime expr / comptime { ... } (flag = 1: a block, run for its effects): a = it
     TVector,   // @Vector(N, T): c = N, a = T
+    Asm,       // asm { ... }: list = its items
+    AsmItem,   // flag 0: "text" (str). flag 1: in REG = expr. flag 2: out REG -> place. name = REG, a = expr / place
 }
 
 pub struct Node {

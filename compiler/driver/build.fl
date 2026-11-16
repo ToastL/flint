@@ -29,6 +29,7 @@ fn collectPkgs(p: *unit.Package, out: *alloc.Vec(*unit.Package)) {
 
 pub struct Job {
     asm_text: []const u8,
+    has_asm: bool, // some of it was written by hand, in asm blocks
     pkg: *unit.Package,
     mode: ir.Mode,
     out: []const u8,     // the executable to write ("" for a temporary one)
@@ -52,6 +53,7 @@ pub fn build(j: *Job) -> u8 {
     fs.writeFile(spath, j.asm_text) catch return fail(text.f("can't write {s}", .{spath}));
     let exe = if (j.out.len > 0) j.out else text.f("{s}/prog", .{dir});
     if (run(&[_][]const u8 { "as", "-arch", "arm64", "-o", opath, spath }) != 0) {
+        if (j.has_asm) { return fail("the assembler rejected the program: check the lines in its asm blocks (FLINT_KEEP=1 keeps the file)"); }
         return fail(text.f("internal error: the generated assembly didn't assemble ({s})", .{spath}));
     }
     var pkgs: alloc.Vec(*unit.Package) = .{};

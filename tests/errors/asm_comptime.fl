@@ -1,0 +1,7 @@
+fn one() -> i64 {
+    var r: i64 = 0;
+    unsafe { asm { "mov x0, #1"; out x0 -> r; } }
+    return r;
+}
+let X = comptime one();
+fn main() {}

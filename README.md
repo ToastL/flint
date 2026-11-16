@@ -57,7 +57,7 @@ A package is a directory with a `flint.toml` (name, path dependencies, C sources
 
 ## Status
 
-Version 0.7.0 implements the design's milestones 1–7: the type system (tagged unions, optionals, error unions, arrays, slices, tuples, packed structs), the safety model with three build modes, allocators and checked formatting with no hidden allocation, modules and packages, C header import, `flint test`, comptime and generics, SIMD vectors, and a compiler written in Flint that builds itself. [CHANGELOG.md](CHANGELOG.md) lists everything in detail; [TODO.md](TODO.md) has what's left (inline assembly, register returns, more backends, known gaps).
+Version 0.7.0 implements the design's milestones 1–7: the type system (tagged unions, optionals, error unions, arrays, slices, tuples, packed structs), the safety model with three build modes, allocators and checked formatting with no hidden allocation, modules and packages, C header import, `flint test`, comptime and generics, SIMD vectors, inline assembly (`asm { }`), and a compiler written in Flint that builds itself. [CHANGELOG.md](CHANGELOG.md) lists everything in detail; [TODO.md](TODO.md) has what's left (register returns, more backends, known gaps).
 
 ## How it compiles
 

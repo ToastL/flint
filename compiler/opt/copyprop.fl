@@ -7,7 +7,7 @@ import opt.opt;
 
 fn replaceUses(in: *ir.Inst, rep: []i32) -> bool {
     var ch = false;
-    if (in.op == .Call) {
+    if (ir.hasArgs(in)) {
         for (in.args) |*a| {
             if (a.k == .Reg && rep[a.v as usize] >= 0) {
                 a.v = rep[a.v as usize] as i64;

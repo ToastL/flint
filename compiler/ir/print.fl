@@ -12,7 +12,7 @@ let OPNAME = [_][]const u8 {
     "cmp", "fcmp", "sel", "ext", "scvtf", "ucvtf", "fcvtzs", "fcvtzu", "fcvt",
     "load", "store", "addrslot", "addrsym", "call", "memcpy", "memzero",
     "jmp", "br", "ret", "trap",
-    "smulh", "umulh", "vec", "vreduce",
+    "smulh", "umulh", "vec", "vreduce", "asm", "asmout",
 };
 let VOPNAME = [_][]const u8 { "add", "sub", "mul", "div", "and", "or", "xor", "neg", "splat" };
 let CCNAME = [_][]const u8 { "eq", "ne", "lt", "le", "gt", "ge", "lo", "ls", "hi", "hs", "mi", "pl" };
@@ -20,6 +20,8 @@ let CCNAME = [_][]const u8 { "eq", "ne", "lt", "le", "gt", "ge", "lo", "ls", "hi
 fn opd(o: *text.Buf, x: ir.Opd) {
     if (x.k == .Reg) { o.addf("v{}", .{x.v}); } else if (x.k == .Imm) { o.addf("#{}", .{x.v}); }
 }
+
+fn regLetter(cls: ir.Cls) -> []const u8 { return if (cls == .I) "x" else if (cls == .F32) "s" else "d"; }
 
 fn inst(o: *text.Buf, in: *const ir.Inst) {
     o.add("    ");
@@ -29,6 +31,16 @@ fn inst(o: *text.Buf, in: *const ir.Inst) {
     if (in.cls == .F64) { o.add(".d"); }
     switch (in.op) {
         .IConst, .GetArg => { o.addf(" {}", .{in.imm}); }
+        .AsmOut => { o.addf(" {s}{}", .{regLetter(in.cls), in.imm}); }
+        .Asm => {
+            o.add(" (");
+            for (0..in.args.len) |k| {
+                if (k > 0) { o.add(", "); }
+                o.addf("{s}{} = ", .{regLetter(in.argcls[k]), in.regs[k]});
+                opd(o, in.args[k]);
+            }
+            o.add(")");
+        }
         .FConst => { o.addf(" {s}", .{text.g6(in.fimm)}); }
         .Load, .Store => {
             o.addf("{}{s} [", .{in.mem & 0x7f, if ((in.mem & 0x80) != 0) "s" else ""});

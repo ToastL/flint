@@ -1,0 +1,5 @@
+fn main() {
+    var a: f64 = 1.5;
+    var c: f32 = 1.5;
+    unsafe { asm { "nop"; out d0 -> a; out s0 -> c; } }
+}

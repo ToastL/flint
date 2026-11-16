@@ -1,0 +1,4 @@
+fn main() {
+    let x: i64 = 0;
+    unsafe { asm { "mov x0, #1"; out x0 -> x; } }
+}

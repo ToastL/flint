@@ -107,6 +107,28 @@ fn binName(op: ir.Op) -> []const u8 {
     }
 }
 
+// dst = the argument or result register in.imm (x, or d / s by class)
+fn fromReg(in: *const ir.Inst) {
+    var d: i32 = 0;
+    if (in.cls == .I) {
+        d = A.di(in.dst);
+        if (d as i64 != in.imm) { E("mov {s}, {s}", .{X(d), X(in.imm as i32)}); }
+    } else {
+        d = A.df(in.dst);
+        if (d as i64 != in.imm) { E("fmov {s}, {s}", .{A.FR(d, in.cls), A.FR(in.imm as i32, in.cls)}); }
+    }
+    A.fin(in.dst, d);
+}
+
+// an asm block: its inputs into their registers (x0-x7 / d0-d7, which hold no values otherwise),
+// then its lines as written
+fn emitAsm(in: *const ir.Inst) {
+    for (0..in.args.len) |j| {
+        if (in.argcls[j] == .I) { A.intoInt(in.regs[j], in.args[j]); } else { A.intoFp(in.regs[j], in.args[j], in.argcls[j]); }
+    }
+    A.O.add(in.sym);
+}
+
 // emits one instruction; true if it also consumed the following one
 pub fn emitInst(in: *const ir.Inst, nx: ?*const ir.Inst, b: i32, last_in_func: bool) -> bool {
     var d: i32 = 0;
@@ -125,15 +147,10 @@ pub fn emitInst(in: *const ir.Inst, nx: ?*const ir.Inst, b: i32, last_in_func: b
                 A.fin(in.dst, d);
                 return false;
             }
-            if (in.cls == .I) {
-                d = A.di(in.dst);
-                if (d as i64 != in.imm) { E("mov {s}, {s}", .{X(d), X(in.imm as i32)}); }
-            } else {
-                d = A.df(in.dst);
-                if (d as i64 != in.imm) { E("fmov {s}, {s}", .{A.FR(d, in.cls), A.FR(in.imm as i32, in.cls)}); }
-            }
-            A.fin(in.dst, d);
+            fromReg(in);
         }
+        .Asm => { emitAsm(in); }
+        .AsmOut => { fromReg(in); }
         .IConst => {
             d = A.di(in.dst);
             A.movImm(d, in.imm);
