@@ -1,0 +1,86 @@
+// stages - building the compiler with itself.
+//
+//   stage 0   a Flint compiler to start from (./x finds it: FLINT_BOOTSTRAP or the pinned release)
+//   stage 1   build/stage1/flint, built by stage 0
+//   stage 2   build/flint, built by stage 1: the compiler that's tested and installed
+//   stage 3   build/check/stage3, built by stage 2, only to check that it is a fixpoint
+//
+// The compiler is an ordinary Flint package (compiler/flint.toml): each stage is `flint build`
+// in compiler/.
+
+import std.fs;
+import std.hash;
+import std.mem;
+import std.process;
+import sys;
+
+pub let STAGE1: []const u8 = "build/stage1/flint";
+pub let FLINT: []const u8 = "build/flint";
+let INPUTS: []const u8 = "build/stage1/inputs.hash";
+let LOADER: []const u8 = "compiler/modules/load.fl";
+
+fn stage0() -> []const u8 {
+    return process.getEnv("FLINT_STAGE0") orelse sys.die("FLINT_STAGE0 isn't set: start this through ./x");
+}
+
+fn compile(compiler: []const u8, mode: []const u8, out: []const u8) {
+    sys.say("{s} builds {s} ({s})\n", .{compiler, out, mode});
+    let argv = [_][]const u8 { sys.full(compiler), "build", "-O", mode, "-o", sys.full(out) };
+    if (sys.spawn(&argv, .{ cwd: "compiler" }) != 0) { sys.die(sys.f("building {s} failed", .{out})); }
+}
+
+// std is embedded in the compiler file by file: every std file must be in the loader's list
+fn checkStdList() {
+    let loader = sys.read(LOADER);
+    for (sys.listDir("std", ".fl")) |name| {
+        if (!mem.contains(loader, sys.f("\"{s}\"", .{name}))) {
+            sys.die(sys.f("std/{s} is missing from STD_FILES in {s}", .{name, LOADER}));
+        }
+    }
+}
+
+fn mix(h: u64, bytes: []const u8) -> u64 { return hash.int(h ^ hash.bytes(bytes)); }
+
+// what build/flint is made from: stage 0, the mode, and the contents of every source file
+fn fingerprint(mode: []const u8) -> []const u8 {
+    var h = mix(mix(0, stage0()), mode);
+    h = mix(h, sys.read("VERSION"));
+    h = mix(h, sys.read("compiler/flint.toml"));
+    for (sys.walk("compiler", ".fl")) |file| { h = mix(mix(h, file), sys.read(file)); }
+    for (sys.walk("std", ".fl")) |file| { h = mix(mix(h, file), sys.read(file)); }
+    return sys.f("{}\n", .{h});
+}
+
+// Builds build/flint, unless it was already built from exactly these sources.
+pub fn build(mode: []const u8, quiet: bool) {
+    checkStdList();
+    let fp = fingerprint(mode);
+    if (fs.exists(STAGE1) && fs.exists(FLINT) && sys.eq(sys.readOr(INPUTS, ""), fp)) {
+        if (!quiet) { sys.say("{s} is up to date\n", .{FLINT}); }
+        return;
+    }
+    sys.makeDirs("build/stage1");
+    fs.remove(INPUTS) catch {};
+    compile(stage0(), mode, STAGE1);
+    compile(STAGE1, mode, FLINT);
+    sys.write(INPUTS, fp);
+}
+
+fn asmOf(compiler: []const u8, mode: []const u8, out: []const u8) -> []const u8 {
+    let argv = [_][]const u8 { sys.full(compiler), "asm", "-O", mode };
+    if (sys.spawn(&argv, .{ cwd: "compiler", out: sys.full(out) }) != 0) {
+        sys.die(sys.f("{s} couldn't compile the compiler", .{compiler}));
+    }
+    return sys.read(out);
+}
+
+// The compiler builds itself to the same assembly: stage 2 and stage 3 are the same compiler.
+pub fn check(mode: []const u8) {
+    build(mode, true);
+    sys.makeDirs("build/check");
+    compile(FLINT, mode, "build/check/stage3");
+    let a = asmOf(FLINT, mode, "build/check/stage2.s");
+    let b = asmOf("build/check/stage3", mode, "build/check/stage3.s");
+    if (!sys.eq(a, b)) { sys.die("not a fixpoint: build/check/stage2.s and build/check/stage3.s differ"); }
+    sys.say("fixpoint: build/flint and build/check/stage3 produce the same compiler\n", .{});
+}

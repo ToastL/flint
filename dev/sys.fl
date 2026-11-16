@@ -1,0 +1,210 @@
+// sys - what the dev tool needs around std: strings and lists that can't fail, whole files,
+// directory listings, and running programs with their output sent to a file.
+//
+// The tool is a short-lived process, so like the compiler it never frees memory, and running out
+// of it (or any other failure it can't do anything about) ends it with a message.
+
+import std.io;
+import std.fs;
+import std.fmt;
+import std.heap;
+import std.list;
+import std.mem;
+
+extern fn opendir(path: cstr) -> ?*void;
+extern fn readdir(d: *void) -> ?*Dirent;
+extern fn closedir(d: *void) -> i32;
+extern fn posix_spawnp(pid: *i32, file: cstr, actions: ?*void, attrs: ?*void, argv: [*]?cstr, envp: [*]?cstr) -> i32;
+extern fn posix_spawn_file_actions_init(fa: *?*void) -> i32;
+extern fn posix_spawn_file_actions_destroy(fa: *?*void) -> i32;
+extern fn posix_spawn_file_actions_addopen(fa: *?*void, fd: i32, path: cstr, flags: i32, mode: u16) -> i32;
+extern fn posix_spawn_file_actions_adddup2(fa: *?*void, fd: i32, newfd: i32) -> i32;
+extern fn posix_spawn_file_actions_addchdir_np(fa: *?*void, path: cstr) -> i32;
+extern fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+extern fn _NSGetEnviron() -> *[*]?cstr;
+extern fn __error() -> *i32;
+
+// macOS's struct dirent (64-bit inodes)
+struct Dirent {
+    ino: u64,
+    seekoff: u64,
+    reclen: u16,
+    namlen: u16,
+    kind: u8,
+    name: [1024]u8,
+}
+
+// macOS values: O_WRONLY | O_CREAT | O_TRUNC
+let WRITE_NEW: i32 = 0x601;
+
+// ---- messages, strings, lists ----
+
+pub fn die(msg: []const u8) -> noreturn {
+    _ = io.flush() catch {};
+    _ = io.eprint("x: {s}\n", .{msg}) catch {};
+    exit(1);
+}
+
+pub fn say(comptime spec: []const u8, args: anytype) {
+    _ = io.print(spec, args) catch {};
+}
+
+// A new string made with a format: sys.f("{s}/{s}", .{a, b})
+pub fn f(comptime spec: []const u8, args: anytype) -> []u8 {
+    return fmt.allocPrint(heap.c_allocator, spec, args) catch die("out of memory");
+}
+
+fn z(s: []const u8) -> cstr {
+    return mem.dupeZ(heap.c_allocator, s) catch die("out of memory");
+}
+
+pub fn eq(a: []const u8, b: []const u8) -> bool { return mem.eql(u8, a, b); }
+
+// s without the newlines at its end
+pub fn trimNl(s: []const u8) -> []const u8 {
+    var n = s.len;
+    while (n > 0 && s[n - 1] == '\n') { n -= 1; }
+    return s[0..n];
+}
+
+pub fn strs() -> list.ArrayList([]const u8) {
+    return list.ArrayList([]const u8).init(heap.c_allocator);
+}
+
+pub fn push(l: *list.ArrayList([]const u8), s: []const u8) {
+    l.append(s) catch die("out of memory");
+}
+
+fn sort(xs: [][]const u8) {
+    for (1..xs.len) |i| {
+        let x = xs[i];
+        var j = i;
+        while (j > 0 && mem.compare(xs[j - 1], x) > 0) {
+            xs[j] = xs[j - 1];
+            j -= 1;
+        }
+        xs[j] = x;
+    }
+}
+
+// ---- paths and files ----
+
+var root_buf: [1024]u8 = undefined;
+var root: []const u8 = "";
+
+// p as an absolute path (relative paths start at the directory the tool was started in: the
+// repository's root)
+pub fn full(p: []const u8) -> []const u8 {
+    if (p.len > 0 && p[0] == '/') { return p; }
+    if (root.len == 0) { root = fs.cwd(root_buf[..]) catch die("can't find the current directory"); }
+    return f("{s}/{s}", .{root, p});
+}
+
+pub fn readOr(path: []const u8, fallback: []const u8) -> []const u8 {
+    return fs.readFile(heap.c_allocator, path) catch return fallback;
+}
+
+pub fn read(path: []const u8) -> []const u8 {
+    return fs.readFile(heap.c_allocator, path) catch die(f("can't read {s}", .{path}));
+}
+
+pub fn write(path: []const u8, bytes: []const u8) {
+    fs.writeFile(path, bytes) catch die(f("can't write {s}", .{path}));
+}
+
+// creates the directory and the ones above it
+pub fn makeDirs(path: []const u8) {
+    for (1..path.len) |i| {
+        if (path[i] == '/') { fs.makeDir(path[0..i]) catch {}; }
+    }
+    fs.makeDir(path) catch {};
+    if (!isDir(path)) { die(f("can't create the directory {s}", .{path})); }
+}
+
+pub fn isDir(path: []const u8) -> bool {
+    let d = opendir(z(path)) orelse return false;
+    _ = closedir(d);
+    return true;
+}
+
+// The names in dir that end with suffix, sorted (names starting with '.' are left out).
+pub fn listDir(dir: []const u8, suffix: []const u8) -> [][]const u8 {
+    var out = strs();
+    let d = opendir(z(dir)) orelse return out.items;
+    while (readdir(d)) |e| {
+        var name: []const u8 = undefined;
+        unsafe { name = e.name[0..e.namlen as usize]; }
+        if (name[0] == '.' || !mem.endsWith(u8, name, suffix)) { continue; }
+        push(&out, f("{s}", .{name}));
+    }
+    _ = closedir(d);
+    sort(out.items);
+    return out.items;
+}
+
+fn walkInto(dir: []const u8, suffix: []const u8, out: *list.ArrayList([]const u8)) {
+    for (listDir(dir, "")) |name| {
+        let full = f("{s}/{s}", .{dir, name});
+        if (isDir(full)) {
+            walkInto(full, suffix, out);
+        } else if (mem.endsWith(u8, name, suffix)) {
+            push(out, full);
+        }
+    }
+}
+
+// Every file under dir whose name ends with suffix, as dir/..., in a fixed order.
+pub fn walk(dir: []const u8, suffix: []const u8) -> [][]const u8 {
+    var out = strs();
+    walkInto(dir, suffix, &out);
+    return out.items;
+}
+
+// ---- running programs ----
+
+// where a program runs and where its output goes ("" leaves it as it is for this process)
+pub struct Spawn {
+    cwd: []const u8 = "",
+    out: []const u8 = "",  // the file its stdout is written to
+    err: []const u8 = "",  // the file its stderr is written to
+    merge: bool = false,   // stderr goes wherever stdout goes
+}
+
+// Runs argv[0] (looked up in PATH) and waits for it: its exit status, or 128 + the signal that
+// killed it. `out` and `err` are opened before the program changes to `cwd`.
+pub fn spawn(argv: []const []const u8, o: Spawn) -> u8 {
+    _ = io.flush() catch {};
+    let ptrs = heap.c_allocator.alloc(?cstr, argv.len + 1) catch die("out of memory");
+    for (0..argv.len) |i| { ptrs[i] = z(argv[i]); }
+    ptrs[argv.len] = null;
+    var fa: ?*void = null;
+    var bad = posix_spawn_file_actions_init(&fa);
+    if (o.out.len > 0) { bad |= posix_spawn_file_actions_addopen(&fa, 1, z(o.out), WRITE_NEW, 0o644); }
+    if (o.merge) {
+        bad |= posix_spawn_file_actions_adddup2(&fa, 1, 2);
+    } else if (o.err.len > 0) {
+        bad |= posix_spawn_file_actions_addopen(&fa, 2, z(o.err), WRITE_NEW, 0o644);
+    }
+    if (o.cwd.len > 0) { bad |= posix_spawn_file_actions_addchdir_np(&fa, z(o.cwd)); }
+    if (bad != 0) { die(f("can't set up running {s}", .{argv[0]})); }
+    var actions: *void = undefined;
+    unsafe { actions = @ptrCast(*void, &fa); }
+    var pid: i32 = 0;
+    let file = ptrs[0] orelse unreachable;
+    if (posix_spawnp(&pid, file, actions, null, ptrs.ptr, _NSGetEnviron().*) != 0) {
+        die(f("can't run {s}", .{argv[0]}));
+    }
+    _ = posix_spawn_file_actions_destroy(&fa);
+    var st: i32 = 0;
+    while (waitpid(pid, &st, 0) < 0) {
+        if (__error().* != 4) { die(f("lost track of {s}", .{argv[0]})); } // EINTR: try again
+    }
+    let sig = st & 0x7f;
+    if (sig == 0) { return ((st >> 8) & 0xff) as u8; }
+    return (128 + sig) as u8;
+}
+
+// spawn, for a program that has to succeed
+pub fn must(argv: []const []const u8, o: Spawn) {
+    if (spawn(argv, o) != 0) { die(f("{s} failed", .{argv[0]})); }
+}

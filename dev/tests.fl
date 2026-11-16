@@ -1,0 +1,183 @@
+// tests - the test runner. Every test runs the compiler and compares what it prints with a file:
+//
+//   examples/*.fl          output must match examples/<name>.expected
+//   tests/cases/*.fl       output (+ stderr and exit code when non-zero) must match <name>.expected.
+//                          A first line `// flint: <flags>` sets the compiler flags; otherwise a
+//                          case that exits 0 must also give the same output in ReleaseSafe and
+//                          ReleaseFast.
+//   tests/modules/*/       main.fl (plus the modules it imports): output must match expected
+//   tests/packages/*/      `flint run -- x y` and `flint test` in the package match expected-run
+//                          and expected-test
+//   tests/testblocks/*.fl  `flint test` output and exit code must match <name>.expected
+//   tests/errors/*.fl      must fail to compile with the message in <name>.expected
+//
+// Newlines at the end of the output and of the expected file don't count.
+
+import std.fs;
+import std.mem;
+import sys;
+
+let TMP: []const u8 = "build/tmp";
+
+struct Runner {
+    flint: []const u8,   // the compiler under test (an absolute path)
+    filter: []const u8,  // only tests whose name contains this
+    pass: usize = 0,
+    fail: usize = 0,
+}
+
+struct Output {
+    out: []const u8,  // stdout (and stderr, when they're merged), without the newlines at its end
+    err: []const u8,
+    code: u8,
+}
+
+fn wanted(t: *Runner, name: []const u8) -> bool {
+    return t.filter.len == 0 || mem.contains(name, t.filter);
+}
+
+// runs the compiler with these arguments in cwd ("" for the repository's root)
+fn flint(t: *Runner, argv: []const []const u8, cwd: []const u8, merge: bool) -> Output {
+    var full = sys.strs();
+    sys.push(&full, t.flint);
+    for (argv) |a| { sys.push(&full, a); }
+    let out = sys.full(sys.f("{s}/out", .{TMP}));
+    let err = sys.full(sys.f("{s}/err", .{TMP}));
+    let code = sys.spawn(full.items, .{ cwd: cwd, out: out, err: if (merge) "" else err, merge: merge });
+    return .{ out: sys.trimNl(sys.read(out)), err: if (merge) "" else sys.trimNl(sys.read(err)), code: code };
+}
+
+fn check(t: *Runner, name: []const u8, expected_text: []const u8, got_text: []const u8) {
+    let expected = sys.trimNl(expected_text);
+    let got = sys.trimNl(got_text);
+    if (sys.eq(expected, got)) {
+        t.pass += 1;
+        sys.say("ok   {s}\n", .{name});
+        return;
+    }
+    t.fail += 1;
+    sys.say("FAIL {s}\n", .{name});
+    sys.write(sys.f("{s}/expected", .{TMP}), sys.f("{s}\n", .{expected}));
+    sys.write(sys.f("{s}/got", .{TMP}), sys.f("{s}\n", .{got}));
+    _ = sys.spawn(&[_][]const u8 { "diff", "-u", "expected", "got" }, .{ cwd: TMP, out: sys.full(sys.f("{s}/diff", .{TMP})) });
+    var lines = mem.split(sys.trimNl(sys.read(sys.f("{s}/diff", .{TMP}))), "\n");
+    while (lines.next()) |line| { sys.say("     {s}\n", .{line}); }
+}
+
+fn stem(name: []const u8) -> []const u8 { return name[0..name.len - 3]; } // without ".fl"
+
+// the compiler flags a case asks for on its first line: `// flint: -O ReleaseFast`
+fn flagsOf(src: []const u8) -> [][]const u8 {
+    var out = sys.strs();
+    let marker = "// flint: ";
+    if (!mem.startsWith(u8, src, marker)) { return out.items; }
+    let end = mem.indexOf(u8, src, '\n') orelse src.len;
+    var words = mem.split(src[marker.len..end], " ");
+    while (words.next()) |w| { if (w.len > 0) { sys.push(&out, w); } }
+    return out.items;
+}
+
+fn examples(t: *Runner) {
+    for (sys.listDir("examples", ".fl")) |name| {
+        let n = stem(name);
+        if (!wanted(t, n)) { continue; }
+        let r = flint(t, &[_][]const u8 { "run", sys.f("examples/{s}", .{name}) }, "", true);
+        check(t, n, sys.readOr(sys.f("examples/{s}.expected", .{n}), ""), r.out);
+    }
+}
+
+fn cases(t: *Runner) {
+    for (sys.listDir("tests/cases", ".fl")) |name| {
+        let n = stem(name);
+        if (!wanted(t, n)) { continue; }
+        let file = sys.f("tests/cases/{s}", .{name});
+        let expected = sys.readOr(sys.f("tests/cases/{s}.expected", .{n}), "");
+        let flags = flagsOf(sys.read(file));
+        var argv = sys.strs();
+        sys.push(&argv, "run");
+        for (flags) |fl| { sys.push(&argv, fl); }
+        sys.push(&argv, file);
+        let r = flint(t, argv.items, "", false);
+        if (r.code != 0) {
+            check(t, n, expected, sys.f("{s}\n--- stderr\n{s}\n--- exit {}", .{r.out, r.err, r.code}));
+            continue;
+        }
+        check(t, n, expected, r.out);
+        if (flags.len > 0) { continue; }
+        for ([_][]const u8 { "ReleaseSafe", "ReleaseFast" }) |mode| { // same program, other build modes
+            let m = flint(t, &[_][]const u8 { "run", "-O", mode, file }, "", true);
+            check(t, sys.f("{s} -O {s}", .{n, mode}), expected, m.out);
+        }
+    }
+}
+
+// multi-file programs: main.fl and the modules it imports
+fn modules(t: *Runner) {
+    for (sys.listDir("tests/modules", "")) |d| {
+        let dir = sys.f("tests/modules/{s}", .{d});
+        let name = sys.f("module/{s}", .{d});
+        if (!sys.isDir(dir) || !wanted(t, name)) { continue; }
+        let r = flint(t, &[_][]const u8 { "run", sys.f("{s}/main.fl", .{dir}) }, "", true);
+        check(t, name, sys.readOr(sys.f("{s}/expected", .{dir}), ""), r.out);
+    }
+}
+
+// packages (flint.toml): run with arguments, and test
+fn packages(t: *Runner) {
+    for (sys.listDir("tests/packages", "")) |d| {
+        let dir = sys.f("tests/packages/{s}", .{d});
+        let name = sys.f("package/{s}", .{d});
+        if (!fs.exists(sys.f("{s}/expected-run", .{dir})) || !wanted(t, name)) { continue; }
+        let run = flint(t, &[_][]const u8 { "run", "--", "x", "y" }, dir, true);
+        check(t, sys.f("{s} run", .{name}), sys.read(sys.f("{s}/expected-run", .{dir})), run.out);
+        let tst = flint(t, &[_][]const u8 { "test" }, dir, true);
+        check(t, sys.f("{s} test", .{name}), sys.readOr(sys.f("{s}/expected-test", .{dir}), ""), tst.out);
+    }
+}
+
+// flint test: the runner's report (stdout and stderr) and its exit code
+fn testblocks(t: *Runner) {
+    for (sys.listDir("tests/testblocks", ".fl")) |file| {
+        let n = stem(file);
+        let name = sys.f("test/{s}", .{n});
+        if (!wanted(t, name)) { continue; }
+        let r = flint(t, &[_][]const u8 { "test", sys.f("tests/testblocks/{s}", .{file}) }, "", true);
+        check(t, name, sys.readOr(sys.f("tests/testblocks/{s}.expected", .{n}), ""), sys.f("{s}\n--- exit {}", .{r.out, r.code}));
+    }
+}
+
+// the first line the compiler prints, without the `file:line:col: error: ` in front of it
+fn errorMessage(out: []const u8) -> []const u8 {
+    let line = out[0..mem.indexOf(u8, out, '\n') orelse out.len];
+    let space = mem.indexOf(u8, line, ' ') orelse return line;
+    let rest = line[space + 1..];
+    return if (mem.startsWith(u8, rest, "error: ")) rest[7..] else line;
+}
+
+fn errors(t: *Runner) {
+    for (sys.listDir("tests/errors", ".fl")) |file| {
+        let n = stem(file);
+        let name = sys.f("error/{s}", .{n});
+        if (!wanted(t, name)) { continue; }
+        let r = flint(t, &[_][]const u8 { "run", sys.f("tests/errors/{s}", .{file}) }, "", true);
+        check(t, name, sys.readOr(sys.f("tests/errors/{s}.expected", .{n}), ""), errorMessage(r.out));
+    }
+}
+
+// Runs every test whose name contains `filter` with the compiler at `compiler`; the exit status.
+pub fn run(compiler: []const u8, filter: []const u8) -> u8 {
+    if (!fs.exists(compiler)) { sys.die(sys.f("there's no compiler at {s}", .{compiler})); }
+    var runner = Runner { flint: sys.full(compiler), filter: filter };
+    let t = &runner;
+    sys.makeDirs(TMP);
+    examples(t);
+    cases(t);
+    modules(t);
+    packages(t);
+    testblocks(t);
+    errors(t);
+    sys.must(&[_][]const u8 { "rm", "-rf", TMP }, .{});
+    sys.say("{} passed, {} failed\n", .{t.pass, t.fail});
+    if (t.pass + t.fail == 0) { sys.die(sys.f("no test's name contains '{s}'", .{filter})); }
+    return if (t.fail == 0) 0 else 1;
+}

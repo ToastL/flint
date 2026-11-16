@@ -6,6 +6,4 @@ jobs:
     runs-on: macos-14   # Apple Silicon: Flint generates ARM64 Mach-O code
     steps:
       - uses: actions/checkout@v4
-      - run: make
-      - run: make selfhost-check
-      - run: make test
+      - run: ./x ci

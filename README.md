@@ -42,15 +42,15 @@ fn main() -> !void {
 ```
 
 ```sh
-make                                  # builds build/flint (macOS on Apple Silicon); see "Building" below
+./x                                   # builds build/flint (macOS on Apple Silicon); see "Building" below
 ./build/flint run   examples/tour.fl
 ./build/flint build examples/tour.fl -o tour
 ./build/flint build -O ReleaseFast examples/tour.fl  # -O Debug (default) | ReleaseSafe | ReleaseFast
 ./build/flint asm   examples/tour.fl  # the generated ARM64 assembly
 ./build/flint ir    examples/tour.fl  # the optimized IR
 ./build/flint test  file.fl           # runs its `test "name" { ... }` blocks
-make test
-make install                          # PREFIX=/usr/local by default; also DESTDIR, make uninstall
+./x test
+./x install                           # PREFIX=/usr/local by default; also DESTDIR, ./x uninstall
 ```
 
 A package is a directory with a `flint.toml` (name, path dependencies, C sources to build and libraries to link). Inside it, `flint build`, `flint run -- args` and `flint test` need no file name; see `tests/packages/app`.
@@ -86,20 +86,36 @@ source ─syntax/─▶ syntax tree ─sema/─▶ IR ─opt/─▶ optimized IR
 The compiler builds itself, so it needs a Flint compiler to start from:
 
 ```sh
-make                                     # stage 0 builds stage 1, which builds build/flint
-make FLINT_BOOTSTRAP=path/to/flint       # start from another flint instead
-make selfhost-check                      # build/flint rebuilds itself to the same assembly
-make release                             # build/release/flint-<version>-aarch64-macos.tar.gz
+./x                                      # stage 0 builds build/stage1/flint, which builds build/flint
+FLINT_BOOTSTRAP=path/to/flint ./x        # start from another flint instead
+./x check                                # build/flint rebuilds itself to the same assembly
+./x test [filter]                        # the tests (only those whose name contains filter)
+./x dist                                 # build/dist/flint-<version>-<arch>-<os>.tar.gz and its sha256
+./x ci                                   # build, check and test: what CI runs
+./x clean                                # removes build/
 ```
 
-Stage 0 is the release pinned in `bootstrap/release`: `bootstrap/fetch.sh` downloads it and checks its sha256. The compiler is an ordinary Flint package (`compiler/flint.toml`), so each stage is just `flint build` in `compiler/`. Its own source may use what the pinned release supports; to use a new language feature in the compiler itself, publish a release with it and pin that one.
+`-O Debug|ReleaseSafe|ReleaseFast` picks the mode the compiler is built in (ReleaseSafe by default). `./x help` lists everything.
+
+The build is a Flint program too: `dev/`. `./x` is a few lines of shell that find stage 0 and run `dev/main.fl` with it. A build is skipped when `build/flint` was already made from the same sources (their contents are hashed, so timestamps don't matter). Everything it makes is in `build/`:
+
+```
+build/flint             the compiler
+build/stage0/<version>  the pinned release
+build/stage1/flint      the compiler built by stage 0
+build/check/            ./x check: stage 3 and both assembly files
+build/dist/             ./x dist: the release
+```
+
+Stage 0 is the release pinned in `bootstrap/release`: `./x` downloads it once and checks its sha256. The compiler is an ordinary Flint package (`compiler/flint.toml`), so each stage is just `flint build` in `compiler/`. Its own source, and `dev/`, may use what the pinned release supports; to use a new language feature in the compiler itself, publish a release with it and pin that one.
 
 ## Layout
 
 - `compiler/` holds the compiler (in Flint), one directory per stage
 - `std/` holds the standard library (one module per file), including the runtime `rt.fl`
-- `bootstrap/` pins the release that builds the compiler (`release`) and fetches it (`fetch.sh`)
+- `bootstrap/release` pins the release that builds the compiler
+- `x` and `dev/` are the build: the launcher, and the build tool it runs (in Flint)
 - `docs/design.md` is the language spec
 - `examples/` has example programs, next to their expected output
-- `tests/` has output tests (run in every build mode), compile-error tests, multi-file module tests, `flint test` tests (`testblocks/`) and sample packages; `tests/run.sh` runs them all
+- `tests/` has output tests (run in every build mode), compile-error tests, multi-file module tests, `flint test` tests (`testblocks/`) and sample packages; `./x test` runs them all
 - `CHANGELOG.md` is what each release added; `TODO.md` is what's left

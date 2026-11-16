@@ -1,0 +1,49 @@
+// dist - packaging a release, and installing the compiler.
+
+import std.fs;
+import std.mem;
+import std.process;
+import std.target;
+import sys;
+import stages;
+
+// the release's name: flint-<version>-<arch>-<os>
+fn releaseName() -> []const u8 {
+    let arch = if (target.arch == .aarch64) "aarch64" else "x86_64";
+    let os = if (target.os == .macos) "macos" else if (target.os == .linux) "linux" else "windows";
+    return sys.f("flint-{s}-{s}-{s}", .{mem.trim(sys.read("VERSION")), arch, os});
+}
+
+// A release: the single flint binary (std and the runtime are embedded in it) and the README in
+// build/dist/<name>.tar.gz, with its checksum next to it.
+pub fn dist() {
+    let name = releaseName();
+    let dir = sys.f("build/dist/{s}", .{name});
+    let tarball = sys.f("{s}.tar.gz", .{name});
+    sys.makeDirs(dir);
+    sys.must(&[_][]const u8 { "cp", stages.FLINT, "README.md", dir }, .{});
+    sys.must(&[_][]const u8 { "tar", "-czf", tarball, name }, .{ cwd: "build/dist" });
+    let sum = sys.f("build/dist/{s}.sha256", .{tarball});
+    sys.must(&[_][]const u8 { "shasum", "-a", "256", tarball }, .{ cwd: "build/dist", out: sys.full(sum) });
+    sys.say("build/dist/{s}\n{s}", .{tarball, sys.read(sum)});
+}
+
+// $DESTDIR$PREFIX/bin (PREFIX is /usr/local unless it's set)
+fn binDir() -> []const u8 {
+    let prefix = process.getEnv("PREFIX") orelse "/usr/local";
+    return sys.f("{s}{s}/bin", .{process.getEnv("DESTDIR") orelse "", prefix});
+}
+
+pub fn install() {
+    let bin = binDir();
+    sys.must(&[_][]const u8 { "install", "-d", bin }, .{});
+    sys.must(&[_][]const u8 { "install", "-m", "755", stages.FLINT, sys.f("{s}/flint", .{bin}) }, .{});
+    sys.say("installed {s}/flint\n", .{bin});
+}
+
+pub fn uninstall() {
+    let path = sys.f("{s}/flint", .{binDir()});
+    if (!fs.exists(path)) { return; }
+    fs.remove(path) catch sys.die(sys.f("can't remove {s}", .{path}));
+    sys.say("removed {s}\n", .{path});
+}

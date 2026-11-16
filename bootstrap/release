@@ -1,4 +1,4 @@
-# The release that bootstraps the compiler (bootstrap/fetch.sh downloads it and checks the sha256):
+# The release that bootstraps the compiler (./x downloads it and checks the sha256):
 # version, download URL and sha256 of the tarball.
 version=0.7.0
 url=https://github.com/ToastL/flint/releases/download/v0.7.0/flint-0.7.0-aarch64-macos.tar.gz
