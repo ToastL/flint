@@ -3,13 +3,15 @@
 //   examples/*.fl          output must match examples/<name>.expected
 //   tests/cases/*.fl       output (+ stderr and exit code when non-zero) must match <name>.expected.
 //                          A first line `// flint: <flags>` sets the compiler flags; otherwise a
-//                          case that exits 0 must also give the same output in ReleaseSafe and
-//                          ReleaseFast.
+//                          case that exits 0 must also give the same output with -O2 and with
+//                          -O2 --overflow=wrap.
 //   tests/modules/*/       main.fl (plus the modules it imports): output must match expected
 //   tests/packages/*/      `flint run -- x y` and `flint test` in the package match expected-run
 //                          and expected-test
 //   tests/testblocks/*.fl  `flint test` output and exit code must match <name>.expected
 //   tests/errors/*.fl      must fail to compile with the message in <name>.expected
+//   tests/cli/*/           the command line itself: `flint <the words in args>`, run in tests/cli,
+//                          must print expected (stdout, stderr and the exit code)
 //
 // Newlines at the end of the output and of the expected file don't count.
 
@@ -66,7 +68,7 @@ fn check(t: *Runner, name: []const u8, expected_text: []const u8, got_text: []co
 
 fn stem(name: []const u8) -> []const u8 { return name[0..name.len - 3]; } // without ".fl"
 
-// the compiler flags a case asks for on its first line: `// flint: -O ReleaseFast`
+// the compiler flags a case asks for on its first line: `// flint: -O2 --overflow=wrap`
 fn flagsOf(src: []const u8) -> [][]const u8 {
     var out = sys.strs();
     let marker = "// flint: ";
@@ -104,10 +106,11 @@ fn cases(t: *Runner) {
         }
         check(t, n, expected, r.out);
         if (flags.len > 0) { continue; }
-        for ([_][]const u8 { "ReleaseSafe", "ReleaseFast" }) |mode| { // same program, other build modes
-            let m = flint(t, &[_][]const u8 { "run", "-O", mode, file }, "", true);
-            check(t, sys.f("{s} -O {s}", .{n, mode}), expected, m.out);
-        }
+        // the same program optimized, and optimized with wrapping overflow
+        let safe = flint(t, &[_][]const u8 { "run", "-O2", file }, "", true);
+        check(t, sys.f("{s} -O2", .{n}), expected, safe.out);
+        let wrap = flint(t, &[_][]const u8 { "run", "-O2", "--overflow=wrap", file }, "", true);
+        check(t, sys.f("{s} -O2 --overflow=wrap", .{n}), expected, wrap.out);
     }
 }
 
@@ -164,6 +167,33 @@ fn errors(t: *Runner) {
     }
 }
 
+// s without any occurrence of `sub`
+fn without(s: []const u8, sub: []const u8) -> []const u8 {
+    var out: []const u8 = "";
+    var rest = s;
+    while (mem.find(rest, sub)) |at| {
+        out = sys.f("{s}{s}", .{out, rest[0..at]});
+        rest = rest[at + sub.len..];
+    }
+    return sys.f("{s}{s}", .{out, rest});
+}
+
+// the command line: help, and the errors for a command line that's wrong. Compile errors name
+// files by their full path, so the path of tests/cli is taken out of the output.
+fn cli(t: *Runner) {
+    let here = sys.f("{s}/", .{sys.full("tests/cli")});
+    for (sys.listDir("tests/cli", "")) |d| {
+        let dir = sys.f("tests/cli/{s}", .{d});
+        let name = sys.f("cli/{s}", .{d});
+        if (!sys.isDir(dir) || !wanted(t, name)) { continue; }
+        var argv = sys.strs();
+        var words = mem.split(sys.trimNl(sys.read(sys.f("{s}/args", .{dir}))), " ");
+        while (words.next()) |w| { if (w.len > 0) { sys.push(&argv, w); } }
+        let r = flint(t, argv.items, "tests/cli", true);
+        check(t, name, sys.readOr(sys.f("{s}/expected", .{dir}), ""), sys.f("{s}\n--- exit {}", .{without(r.out, here), r.code}));
+    }
+}
+
 // Runs every test whose name contains `filter` with the compiler at `compiler`; the exit status.
 pub fn run(compiler: []const u8, filter: []const u8) -> u8 {
     if (!fs.exists(compiler)) { sys.die(sys.f("there's no compiler at {s}", .{compiler})); }
@@ -176,6 +206,7 @@ pub fn run(compiler: []const u8, filter: []const u8) -> u8 {
     packages(t);
     testblocks(t);
     errors(t);
+    cli(t);
     sys.must(&[_][]const u8 { "rm", "-rf", TMP }, .{});
     sys.say("{} passed, {} failed\n", .{t.pass, t.fail});
     if (t.pass + t.fail == 0) { sys.die(sys.f("no test's name contains '{s}'", .{filter})); }

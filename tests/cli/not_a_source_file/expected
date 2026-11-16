@@ -1,0 +1,3 @@
+flint: error: 'ok' isn't a Flint source file
+  hint: did you mean 'ok.fl'?
+--- exit 2

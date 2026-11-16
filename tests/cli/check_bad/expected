@@ -1,0 +1,4 @@
+bad.fl:3:18: error: type mismatch: expected i32, found []const u8 for 'x'
+     3 |     let x: i32 = "text";
+       |                  ^
+--- exit 1

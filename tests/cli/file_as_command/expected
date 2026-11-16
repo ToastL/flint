@@ -1,0 +1,3 @@
+flint: error: 'hello.fl' is a file, not a command
+  hint: to compile and run it: flint run hello.fl
+--- exit 2

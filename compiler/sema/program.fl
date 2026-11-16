@@ -293,11 +293,13 @@ fn flatten(it: *ast.Node, out: *alloc.Vec(*ast.Node)) {
 
 fn isTypeFn(d: *ast.Node) -> bool { return d.k == .Fn && d.b != null && d.b.?.k == .TName && text.eq(d.b.?.name, "type"); }
 
-pub fn lowerProgram(units: []*unit.Unit, mode: ir.Mode, test_mode: bool) -> *ir.Module {
+// optimize: -O2 (off is -O0, which also keeps the debugging aids). wrap: --overflow=wrap.
+pub fn lowerProgram(units: []*unit.Unit, optimize: bool, wrap: bool, test_mode: bool) -> *ir.Module {
     ty.init();
     st.M = alloc.new(ir.Module);
     interp.init(st.M, ctexec.ctLookup);
-    st.MODE = mode;
+    st.OPTIMIZE = optimize;
+    st.WRAP = wrap;
     st.UNITS = units;
     var all: alloc.Vec(*ast.Node) = .{};
     for (units) |u| { for (u.items) |it| { flatten(it, &all); } }

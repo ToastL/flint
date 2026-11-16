@@ -21,6 +21,7 @@ import std.fs;
 import std.heap;
 import base.alloc;
 import base.text;
+import base.term;
 import modules.unit;
 
 struct TP {
@@ -35,7 +36,7 @@ struct TP {
 
 fn bad(t: *TP, msg: []const u8) -> noreturn {
     _ = io.flush() catch {};
-    _ = io.eprint("{s}:{}: error: {s}\n", .{t.file, t.line, msg}) catch {};
+    _ = io.eprint("{s} {s}: {s}\n", .{term.bold(term.ERR, text.f("{s}:{}:", .{t.file, t.line})), term.label("error"), msg}) catch {};
     exit(1);
 }
 
@@ -192,7 +193,7 @@ pub fn read(dir0: []const u8) -> *unit.Package {
     for (loaded.items) |l| { if (text.eq(l.dir, dir)) { return l; } }
     let file = text.f("{s}/flint.toml", .{dir});
     let src = fs.readFile(heap.c_allocator, file) catch {
-        _ = io.eprint("flint: can't read {s}\n", .{file}) catch {};
+        _ = io.eprint("flint: {s}: can't read {s}\n", .{term.label("error"), file}) catch {};
         exit(1);
     };
     let pkg = alloc.new(unit.Package);

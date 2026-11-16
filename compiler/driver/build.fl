@@ -7,15 +7,15 @@ import std.heap;
 import std.process;
 import base.alloc;
 import base.text;
+import base.term;
 import modules.unit;
 import modules.load;
-import ir.ir;
 
 // runs argv and returns its exit status (128 + the signal if it was killed; 127 if it couldn't start)
 pub fn run(argv: []const []const u8) -> u8 {
     _ = io.flush() catch {};
     return process.run(heap.c_allocator, argv) catch {
-        _ = io.eprint("flint: can't run {s}\n", .{argv[0]}) catch {};
+        _ = io.eprint("flint: {s}: can't run {s}\n", .{term.label("error"), argv[0]}) catch {};
         return 127;
     };
 }
@@ -31,7 +31,7 @@ pub struct Job {
     asm_text: []const u8,
     has_asm: bool, // some of it was written by hand, in asm blocks
     pkg: *unit.Package,
-    mode: ir.Mode,
+    optimize: bool,      // -O2: the packages' C sources are optimized too
     out: []const u8,     // the executable to write ("" for a temporary one)
     keep: bool,          // build: keep the executable
     run: bool,           // run it afterwards
@@ -39,7 +39,7 @@ pub struct Job {
 }
 
 fn fail(msg: []const u8) -> u8 {
-    _ = io.eprint("flint: {s}\n", .{msg}) catch {};
+    _ = io.eprint("flint: {s}: {s}\n", .{term.label("error"), msg}) catch {};
     return 1;
 }
 
@@ -66,7 +66,7 @@ pub fn build(j: *Job) -> u8 {
             var cc: alloc.Vec([]const u8) = .{};
             cc.push(load.cc);
             cc.push("-c");
-            cc.push(if (j.mode == .Debug) "-O0" else "-O2");
+            cc.push(if (j.optimize) "-O2" else "-O0");
             for (pk.cinc.items) |inc| { cc.push(text.f("-I{s}", .{inc})); }
             for (pk.cflags.items) |fl| { cc.push(fl); }
             cc.push(pk.csrc.items[i]);

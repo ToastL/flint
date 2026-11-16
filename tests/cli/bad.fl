@@ -1,0 +1,4 @@
+// used by the tests in this directory: doesn't compile
+fn main() {
+    let x: i32 = "text";
+}

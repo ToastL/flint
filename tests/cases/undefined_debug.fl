@@ -1,5 +1,5 @@
-// flint: -O Debug
-// Debug builds fill `undefined` memory with 0xAA bytes, so reading it by mistake stands out.
+// flint: -O0
+// -O0 builds fill `undefined` memory with 0xAA bytes, so reading it by mistake stands out.
 
 import std.io;
 

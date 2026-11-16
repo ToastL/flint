@@ -255,7 +255,7 @@ fn globalLetAt(n: *ast.Node, owner: ?*ty.Type) {
     } else if (init != null && init.?.k == .Undefined) { // globals start zeroed
         if (n.flag != 0) { diag.at(init.?.tok, "a 'let' needs a real value; 'undefined' is only for 'var'"); }
         if (t == null) { diag.at(n.tok, text.f("'{s}' needs a type to be undefined: 'var {s}: T = undefined;'", .{n.name, n.name})); }
-        g.kind = if (st.MODE == .Debug) .Fill else .Zero;
+        g.kind = if (st.OPTIMIZE) .Zero else .Fill;
     } else if (init != null && init.?.k == .Comptime) { // let TABLE = comptime crcTable();
         var o = @zeroes(ctdata.CtOut);
         let vt = ctexec.ctCompute(init.?.a.?, false, t, text.f("'{s}'", .{name}), &o);

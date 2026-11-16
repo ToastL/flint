@@ -1,0 +1,8 @@
+// used by the tests in this directory: adds two u8s that overflow
+import std.io;
+
+fn get(x: u8) -> u8 { return x; }
+
+fn main() -> !void {
+    try io.print("sum {}\n", .{ get(200) + get(100) });
+}

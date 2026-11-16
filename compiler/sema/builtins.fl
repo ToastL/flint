@@ -195,10 +195,10 @@ pub fn exBuiltin(n: *ast.Node, want: ?*ty.Type) -> b.Val {
         if (!ty.isPtr(v.t) && !ty.isOptPtr(v.t)) { diag.at(n.at(0).tok, text.f("@ptrToInt needs a pointer, found {s}", .{ty.tname(v.t)})); }
         return b.vReg(ty.usize_, b.regOf(v));
     }
-    if (text.eq(nm, "@assume")) { // an optimizer hint: checked in Debug, trusted otherwise
+    if (text.eq(nm, "@assume")) { // an optimizer hint: checked at -O0, trusted at -O2
         names.requireUnsafe(n.tok, "@assume");
         if (n.count() != 1) { diag.at(n.tok, "@assume takes one condition"); }
-        if (st.MODE == .Debug) {
+        if (!st.OPTIMIZE) {
             let c = expr.expr(n.at(0), ty.bool_);
             if (c.t != ty.bool_) { diag.at(n.at(0).tok, text.f("@assume needs a bool, found {s}", .{ty.tname(c.t)})); }
             if (!c.isconst || c.ival == 0) {

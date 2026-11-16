@@ -1,0 +1,21 @@
+flint test: run `test` blocks
+
+Usage:
+  flint test [options] [file.fl]
+
+  Runs every `test "name" { ... }` block of the file and of the modules it imports; in a
+  package, of every .fl file. Each test runs in its own process, so a panic fails only
+  that test. The exit status is 1 when a test failed.
+
+Options:
+  -O0, -O2             no optimization, with debugging aids (default); or optimized
+  --overflow=<mode>    integer overflow: trap (default) or wrap
+  --color=<when>       colored output: auto (default), always or never
+  -h, --help           show this help
+
+  Bounds, null, cast and division checks are always on: only 'unsafe' removes them.
+
+Examples:
+  flint test parser.fl
+  flint test                    (in a package)
+--- exit 0

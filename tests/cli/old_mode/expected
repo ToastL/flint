@@ -1,0 +1,2 @@
+flint: error: '-O ReleaseFast' is now '-O2 --overflow=wrap'
+--- exit 2

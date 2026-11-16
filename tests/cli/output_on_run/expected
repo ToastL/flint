@@ -1,0 +1,3 @@
+flint: error: '-o' doesn't apply to 'flint run'
+  hint: 'flint run' doesn't keep the executable; 'flint build -o <path>' does
+--- exit 2

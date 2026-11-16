@@ -1,0 +1,22 @@
+flint build: compile to a native executable
+
+Usage:
+  flint build [options] [file.fl]
+
+  The executable is named after the file (hello.fl makes ./hello); a package's is
+  out/<name>. -o writes it somewhere else.
+
+Options:
+  -O0, -O2             no optimization, with debugging aids (default); or optimized
+  --overflow=<mode>    integer overflow: trap (default) or wrap
+  -o, --output <path>  where to write the executable
+  --color=<when>       colored output: auto (default), always or never
+  -h, --help           show this help
+
+  Bounds, null, cast and division checks are always on: only 'unsafe' removes them.
+
+Examples:
+  flint build hello.fl
+  flint build -O2 hello.fl -o bin/hello
+  flint build -O2 --overflow=wrap   (in a package)
+--- exit 0

@@ -10,6 +10,7 @@
 
 import std.fs;
 import std.hash;
+import std.list;
 import std.mem;
 import std.process;
 import sys;
@@ -23,10 +24,30 @@ fn stage0() -> []const u8 {
     return process.getEnv("FLINT_STAGE0") orelse sys.die("FLINT_STAGE0 isn't set: start this through ./x");
 }
 
+// `compiler <cmd>` with the flags for a build mode. Releases up to 0.7.0 take the mode's name
+// (`-O ReleaseSafe`); later compilers take -O0/-O2 and --overflow, and know `--version`, which is
+// how the two are told apart. Once bootstrap/release pins a newer release, the first form can go.
+fn command(compiler: []const u8, cmd: []const u8, mode: []const u8) -> list.ArrayList([]const u8) {
+    var argv = sys.strs();
+    sys.push(&argv, sys.full(compiler));
+    sys.push(&argv, cmd);
+    let probe = [_][]const u8 { sys.full(compiler), "--version" };
+    if (sys.spawn(&probe, .{ out: "/dev/null", merge: true }) != 0) {
+        sys.push(&argv, "-O");
+        sys.push(&argv, mode);
+        return argv;
+    }
+    sys.push(&argv, if (sys.eq(mode, "Debug")) "-O0" else "-O2");
+    if (sys.eq(mode, "ReleaseFast")) { sys.push(&argv, "--overflow=wrap"); }
+    return argv;
+}
+
 fn compile(compiler: []const u8, mode: []const u8, out: []const u8) {
     sys.say("{s} builds {s} ({s})\n", .{compiler, out, mode});
-    let argv = [_][]const u8 { sys.full(compiler), "build", "-O", mode, "-o", sys.full(out) };
-    if (sys.spawn(&argv, .{ cwd: "compiler" }) != 0) { sys.die(sys.f("building {s} failed", .{out})); }
+    var argv = command(compiler, "build", mode);
+    sys.push(&argv, "-o");
+    sys.push(&argv, sys.full(out));
+    if (sys.spawn(argv.items, .{ cwd: "compiler" }) != 0) { sys.die(sys.f("building {s} failed", .{out})); }
 }
 
 // std is embedded in the compiler file by file: every std file must be in the loader's list
@@ -67,8 +88,8 @@ pub fn build(mode: []const u8, quiet: bool) {
 }
 
 fn asmOf(compiler: []const u8, mode: []const u8, out: []const u8) -> []const u8 {
-    let argv = [_][]const u8 { sys.full(compiler), "asm", "-O", mode };
-    if (sys.spawn(&argv, .{ cwd: "compiler", out: sys.full(out) }) != 0) {
+    let argv = command(compiler, "asm", mode);
+    if (sys.spawn(argv.items, .{ cwd: "compiler", out: sys.full(out) }) != 0) {
         sys.die(sys.f("{s} couldn't compile the compiler", .{compiler}));
     }
     return sys.read(out);

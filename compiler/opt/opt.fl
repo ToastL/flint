@@ -1,4 +1,4 @@
-// opt.opt - IR optimizations (ReleaseSafe and ReleaseFast; Debug skips them), in this order:
+// opt.opt - IR optimizations (-O2; -O0 skips them), in this order:
 //
 //   cfg.simplify   thread jumps through empty blocks, drop unreachable blocks
 //   promote        slots whose address never escapes become vregs (mem2reg + scalar replacement

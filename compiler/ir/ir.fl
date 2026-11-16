@@ -136,9 +136,6 @@ pub struct Module {
     has_asm: bool,                   // some function has an asm block
 }
 
-// build modes (design.md section 6.2)
-pub enum Mode { Debug, Safe, Fast }
-
 // its operands are in `args` (not a, b, c)
 pub fn hasArgs(in: *const Inst) -> bool { return in.op == .Call || in.op == .Asm; }
 

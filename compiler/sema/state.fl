@@ -123,7 +123,8 @@ pub var UNITS: []*unit.Unit = @zeroes([]*unit.Unit); // every module of the prog
 pub var G_ONLY: bool = false;       // looking up a module's member: skip the caller's local variables
 pub var C: ?*Ctx = null;            // the function being lowered
 pub var M: *ir.Module = undefined;
-pub var MODE: ir.Mode = .Debug;
+pub var OPTIMIZE: bool = false;     // -O2. Off (-O0) also keeps the debugging aids: undefined memory is 0xAA, @assume is checked
+pub var WRAP: bool = false;         // --overflow=wrap: integer overflow wraps instead of trapping
 pub var CUR_TOK: ?*token.Token = null; // the node being lowered; instructions remember it
 pub var structs: alloc.Vec(*types.Type) = @zeroes(alloc.Vec(*types.Type));
 pub var fns: alloc.Vec(*FnInfo) = @zeroes(alloc.Vec(*FnInfo));
@@ -140,8 +141,8 @@ pub fn inUnsafe() -> bool {
     return false;
 }
 
-// overflow checks: Debug and ReleaseSafe, outside unsafe blocks
-pub fn safeArith() -> bool { return MODE != .Fast && !inUnsafe(); }
+// overflow checks: unless --overflow=wrap, outside unsafe blocks
+pub fn safeArith() -> bool { return !WRAP && !inUnsafe(); }
 
-// bounds checks: every mode, outside unsafe blocks
+// bounds checks: always, outside unsafe blocks
 pub fn boundsChecked() -> bool { return !inUnsafe(); }

@@ -14,7 +14,7 @@ What's left to build, plus the known gaps in what exists. What's already done is
 - [ ] Remove bounds checks in more loop shapes. n-body now costs nothing extra (0.90s checked vs 0.92s unchecked), but indexing with a loop-invariant offset still checks every time.
 - [ ] Register allocation:
   - [ ] remove redundant `mov`s where control flow joins
-  - [ ] split live intervals instead of spilling whole ones. This is most of ReleaseSafe's cost today: in n-body the `i + 1` overflow check lengthens the outer counter's interval and it gets spilled, so ReleaseSafe runs 1.87s vs 1.57s for ReleaseFast. The inner loop has no extra checks.
+  - [ ] split live intervals instead of spilling whole ones. This is most of what overflow checks cost today: in n-body the `i + 1` overflow check lengthens the outer counter's interval and it gets spilled, so `-O2` runs 1.87s vs 1.57s for `-O2 --overflow=wrap`. The inner loop has no extra checks.
   - [ ] use x0–x7 for values that don't cross calls
 - [ ] Leaf functions without a frame
 - [ ] Keep `@Vector` values in SIMD registers between operations (today each operation loads, computes and stores)
@@ -52,7 +52,6 @@ What's left to build, plus the known gaps in what exists. What's already done is
 ## Tooling
 
 - [ ] `flint fmt`
-- [ ] `flint init` to start a package
 - [ ] Editor support: syntax highlighting, then a language server
 
 ## Open design questions

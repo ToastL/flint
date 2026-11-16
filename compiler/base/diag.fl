@@ -5,6 +5,8 @@
 
 import std.io;
 import base.alloc;
+import base.text;
+import base.term;
 import syntax.token;
 
 // the root file, for errors without a token
@@ -28,23 +30,25 @@ fn showLine(t: *const token.Token) {
     }
     var e = i;
     while (e < p.len && p[e] != '\n') { e += 1; }
-    _ = io.eprint("  {d:>4} | {s}\n", .{t.line, p[i..e]}) catch {};
-    err("       | ");
+    let bar = term.dim(term.ERR, "|");
+    _ = io.eprint("  {d:>4} {s} {s}\n", .{t.line, bar, p[i..e]}) catch {};
+    _ = io.eprint("       {s} ", .{bar}) catch {};
     var c: i32 = 1;
     while (c < t.col) {
         let at = i + (c - 1) as usize;
         err(if (at < p.len && p[at] == '\t') "\t" else " ");
         c += 1;
     }
-    err("^\n");
+    _ = io.eprint("{s}\n", .{term.green(term.ERR, "^")}) catch {};
 }
 
 fn header(t: ?*const token.Token, kind: []const u8, msg: []const u8) {
     if (t) |tk| {
-        _ = io.eprint("{s}:{}:{}: {s}: {s}\n", .{pathOf(tk), tk.line, tk.col, kind, msg}) catch {};
+        let place = term.bold(term.ERR, text.f("{s}:{}:{}:", .{pathOf(tk), tk.line, tk.col}));
+        _ = io.eprint("{s} {s}: {s}\n", .{place, term.label(kind), msg}) catch {};
         showLine(tk);
     } else {
-        _ = io.eprint("{s}: {s}: {s}\n", .{path, kind, msg}) catch {};
+        _ = io.eprint("{s} {s}: {s}\n", .{term.bold(term.ERR, text.f("{s}:", .{path})), term.label(kind), msg}) catch {};
     }
 }
 

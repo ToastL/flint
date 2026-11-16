@@ -1,31 +1,109 @@
-// driver.cli - the `flint` command line: run, build, test, asm, ir, version; build modes; and
-// package mode (a directory with flint.toml).
+// driver.cli - the `flint` command line: reading the arguments, help, and the errors for a
+// command line that's wrong. Commands and what each accepts are in COMMANDS; the help texts and
+// the "did you mean" suggestions come from that table.
+//
+// A command line that's wrong gets one line saying what's wrong and a hint saying what to type
+// instead (exit status 2), never the whole usage text.
 
 import std.io;
 import std.fs;
 import base.alloc;
 import base.text;
+import base.term;
 import base.diag;
 import modules.unit;
 import modules.load;
-import ir.ir;
 import ir.print;
 import sema.program;
 import opt.opt;
 import arm64.func;
 import driver.manifest;
 import driver.build;
+import driver.scaffold;
 
-let USAGE: []const u8 = "usage:\n  flint run   file.fl [args...]   compile and run\n  flint build file.fl [-o out]    compile to a native executable\n  flint test  file.fl             run the file's `test` blocks (and those of the modules it imports)\n  flint asm   file.fl             print the generated ARM64 assembly\n  flint ir    file.fl             print the optimized IR\n  flint version                   print the compiler's version\nin a package (a directory with flint.toml), leave out the file:\n  flint build [-o out]            builds out/<name>\n  flint run [-- args...]\n  flint test                      runs the tests in every .fl file of the package\noptions:\n  -O Debug        all safety checks, undefined memory filled with 0xAA, no optimization (default)\n  -O ReleaseSafe  optimized, all safety checks\n  -O ReleaseFast  optimized; integer overflow wraps instead of trapping\n                  (bounds, null, cast and division checks stay: only 'unsafe' removes them)\n";
+extern fn setenv(name: cstr, value: cstr, overwrite: i32) -> i32;
 
-fn usage(extra: []const u8) -> u8 {
-    _ = io.eprint("{s}{s}", .{extra, USAGE}) catch {};
-    return 2;
+struct Command {
+    name: []const u8,
+    args: []const u8,     // what follows the name in its usage line
+    summary: []const u8,  // one line, for the overview
+    detail: []const u8,   // a paragraph for `flint help <command>`
+    examples: []const u8, // one per line
+    compiles: bool,       // takes a file (or the package), -O0/-O2 and --overflow
+    output: bool,         // takes -o
 }
 
-fn known(cmd: []const u8) -> bool {
-    return text.oneOf(cmd, &[_][]const u8 { "run", "build", "asm", "ir", "test", "version" });
-}
+let COMMANDS = [_]Command {
+    .{
+        name: "run", args: "[options] [file.fl] [args...]", summary: "compile and run a program",
+        detail: "Everything after the file is passed to the program, so options go before it.\nIn a package, leave out the file and put the program's arguments after '--'.",
+        examples: "flint run hello.fl\nflint run -O2 hello.fl input.txt\nflint run -- input.txt        (in a package)",
+        compiles: true, output: false,
+    },
+    .{
+        name: "build", args: "[options] [file.fl]", summary: "compile to a native executable",
+        detail: "The executable is named after the file (hello.fl makes ./hello); a package's is\nout/<name>. -o writes it somewhere else.",
+        examples: "flint build hello.fl\nflint build -O2 hello.fl -o bin/hello\nflint build -O2 --overflow=wrap   (in a package)",
+        compiles: true, output: true,
+    },
+    .{
+        name: "test", args: "[options] [file.fl]", summary: "run `test` blocks",
+        detail: "Runs every `test \"name\" { ... }` block of the file and of the modules it imports; in a\npackage, of every .fl file. Each test runs in its own process, so a panic fails only\nthat test. The exit status is 1 when a test failed.",
+        examples: "flint test parser.fl\nflint test                    (in a package)",
+        compiles: true, output: false,
+    },
+    .{
+        name: "check", args: "[options] [file.fl]", summary: "report compile errors without building",
+        detail: "Type-checks the program and stops: nothing is assembled, linked or run.",
+        examples: "flint check hello.fl\nflint check                   (in a package)",
+        compiles: true, output: false,
+    },
+    .{
+        name: "asm", args: "[options] [file.fl]", summary: "print the generated ARM64 assembly",
+        detail: "Prints the assembly that 'flint build' would hand to the assembler.",
+        examples: "flint asm hello.fl\nflint asm -O2 hello.fl",
+        compiles: true, output: false,
+    },
+    .{
+        name: "ir", args: "[options] [file.fl]", summary: "print the compiler's IR",
+        detail: "Prints the IR the assembly is generated from: optimized with -O2, as lowered otherwise.",
+        examples: "flint ir hello.fl\nflint ir -O2 hello.fl",
+        compiles: true, output: false,
+    },
+    .{
+        name: "init", args: "[name]", summary: "start a new package",
+        detail: "Creates flint.toml and src/main.fl: in a new directory <name>, or without a name in\nthe current directory. Existing files are left alone.",
+        examples: "flint init hello\nflint init                    (in an empty directory)",
+        compiles: false, output: false,
+    },
+    .{
+        name: "clean", args: "", summary: "remove a package's build output",
+        detail: "Removes the executable 'flint build' made in the package's out/ directory.",
+        examples: "flint clean",
+        compiles: false, output: false,
+    },
+    .{
+        name: "help", args: "[command]", summary: "show this overview, or a command's help",
+        detail: "'flint <command> --help' shows the same text.",
+        examples: "flint help\nflint help build",
+        compiles: false, output: false,
+    },
+    .{
+        name: "version", args: "", summary: "print the compiler's version",
+        detail: "'flint --version' prints it too.",
+        examples: "flint version",
+        compiles: false, output: false,
+    },
+};
+
+// every option, for suggestions
+let OPTIONS = [_][]const u8 { "-O0", "-O2", "--overflow", "--output", "--color", "--help", "--version" };
+
+let OPT_LEVEL: []const u8 = "  -O0, -O2             no optimization, with debugging aids (default); or optimized";
+let OPT_OVERFLOW: []const u8 = "  --overflow=<mode>    integer overflow: trap (default) or wrap";
+let OPT_OUTPUT: []const u8 = "  -o, --output <path>  where to write the executable";
+let OPT_COLOR: []const u8 = "  --color=<when>       colored output: auto (default), always or never";
+let OPT_HELP: []const u8 = "  -h, --help           show this help";
 
 // the repository's VERSION file, read when the compiler is built
 let VERSION_FILE: []const u8 = @embedFile("../../VERSION");
@@ -41,86 +119,317 @@ fn dirname(p: []const u8) -> []const u8 {
     return if (slash == 0) "/" else p[0..slash];
 }
 
+fn out(s: []const u8) { _ = io.print("{s}", .{s}) catch {}; }
+
+fn find(name: []const u8) -> ?*const Command {
+    for (COMMANDS) |*c| { if (text.eq(c.name, name)) { return c; } }
+    return null;
+}
+
+// ---- errors ----
+
+// The command line is wrong: says what, and what to do about it. Ends flint with status 2.
+fn die(msg: []const u8, hint: []const u8) -> noreturn {
+    _ = io.flush() catch {};
+    _ = io.eprint("flint: {s}: {s}\n", .{term.label("error"), msg}) catch {};
+    if (hint.len > 0) { _ = io.eprint("  {s}: {s}\n", .{term.label("hint"), hint}) catch {}; }
+    exit(2);
+}
+
+fn min3(a: usize, b: usize, c: usize) -> usize {
+    let m = if (a < b) a else b;
+    return if (m < c) m else c;
+}
+
+// how many single-character edits turn a into b (99 for words too long to be worth comparing)
+fn distance(a: []const u8, b: []const u8) -> usize {
+    var prev: [32]usize = undefined;
+    var cur: [32]usize = undefined;
+    if (a.len >= 32 || b.len >= 32) { return 99; }
+    for (0..b.len + 1) |j| { prev[j] = j; }
+    for (0..a.len) |i| {
+        cur[0] = i + 1;
+        for (0..b.len) |j| {
+            let change: usize = if (a[i] == b[j]) 0 else 1;
+            cur[j + 1] = min3(prev[j + 1] + 1, cur[j] + 1, prev[j] + change);
+        }
+        for (0..b.len + 1) |j| { prev[j] = cur[j]; }
+    }
+    return prev[b.len];
+}
+
+// the candidate closest to `word`, when it's close enough to be a typo of it
+fn closest(word: []const u8, candidates: []const []const u8) -> ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_d: usize = 3; // at most two edits away
+    for (candidates) |c| {
+        let d = distance(word, c);
+        if (d < best_d && d < c.len) {
+            best = c;
+            best_d = d;
+        }
+    }
+    return best;
+}
+
+fn unknownCommand(word: []const u8) -> noreturn {
+    if (text.endsWith(word, ".fl")) {
+        die(text.f("'{s}' is a file, not a command", .{word}), text.f("to compile and run it: flint run {s}", .{word}));
+    }
+    if (word.len > 0 && word[0] == '-') {
+        die(text.f("unknown option '{s}'", .{word}), "the command comes first, like 'flint build -O2 file.fl' ('flint help' lists the commands)");
+    }
+    var names: alloc.Vec([]const u8) = .{};
+    for (COMMANDS) |*c| { names.push(c.name); }
+    if (closest(word, names.items)) |c| {
+        die(text.f("unknown command '{s}'", .{word}), text.f("did you mean '{s}'? ('flint help' lists the commands)", .{c}));
+    }
+    die(text.f("unknown command '{s}'", .{word}), "'flint help' lists the commands");
+}
+
+fn unknownOption(c: *const Command, a: []const u8) -> noreturn {
+    let dashes = if (text.startsWith(a, "--")) a[0..text.indexOf(a, '=') orelse a.len] else a;
+    if (closest(dashes, OPTIONS[..])) |o| {
+        die(text.f("unknown option '{s}'", .{a}), text.f("did you mean '{s}'? ('flint help {s}' lists the options)", .{o, c.name}));
+    }
+    die(text.f("unknown option '{s}'", .{a}), text.f("'flint help {s}' lists the options", .{c.name}));
+}
+
+// ---- help ----
+
+fn heading(s: []const u8) { _ = io.print("{s}\n", .{term.bold(term.OUT, s)}) catch {}; }
+
+// `text` with every line indented
+fn indented(body: []const u8) {
+    var rest = body;
+    while (rest.len > 0) {
+        let nl = text.indexOf(rest, '\n') orelse rest.len;
+        _ = io.print("  {s}\n", .{rest[0..nl]}) catch {};
+        rest = if (nl < rest.len) rest[nl + 1..] else rest[rest.len..];
+    }
+}
+
+fn overview() {
+    _ = io.print("{s} {s}: C with its historical accidents fixed\n\n", .{term.bold(term.OUT, "Flint"), version()}) catch {};
+    heading("Usage:");
+    out("  flint <command> [options] [file.fl]\n\n");
+    heading("Commands:");
+    for (COMMANDS) |*c| {
+        _ = io.print("  {s}  {s}\n", .{term.green(term.OUT, text.f("{s:<8}", .{c.name})), c.summary}) catch {};
+    }
+    out("\n");
+    heading("Options:");
+    _ = io.print("{s}\n{s}\n{s}\n{s}\n{s}\n\n", .{OPT_LEVEL, OPT_OVERFLOW, OPT_OUTPUT, OPT_COLOR, OPT_HELP}) catch {};
+    out("In a package (a directory with flint.toml), leave out the file.\n");
+    out("'flint help <command>' has the details and examples.\n");
+}
+
+fn commandHelp(c: *const Command) {
+    _ = io.print("{s}: {s}\n\n", .{term.bold(term.OUT, text.f("flint {s}", .{c.name})), c.summary}) catch {};
+    heading("Usage:");
+    _ = io.print("  flint {s}{s}{s}\n\n", .{c.name, if (c.args.len > 0) " " else "", c.args}) catch {};
+    indented(c.detail);
+    out("\n");
+    if (c.compiles) {
+        heading("Options:");
+        _ = io.print("{s}\n{s}\n", .{OPT_LEVEL, OPT_OVERFLOW}) catch {};
+        if (c.output) { _ = io.print("{s}\n", .{OPT_OUTPUT}) catch {}; }
+        _ = io.print("{s}\n{s}\n\n", .{OPT_COLOR, OPT_HELP}) catch {};
+        out("  Bounds, null, cast and division checks are always on: only 'unsafe' removes them.\n\n");
+    }
+    heading("Examples:");
+    indented(c.examples);
+}
+
+// ---- the arguments ----
+
+struct Options {
+    path: []const u8 = "",      // the .fl file ("": the package around the current directory)
+    out: []const u8 = "",       // -o
+    name: []const u8 = "",      // init's package name
+    optimize: bool = false,     // -O2
+    wrap: bool = false,         // --overflow=wrap
+    help: bool = false,
+    prog_args: []const []const u8 = @zeroes([]const []const u8),
+}
+
+struct Args {
+    argv: []const []const u8,
+    i: usize,
+    cmd: *const Command,
+}
+
+// If argv[i] is the option `long` (or `short`), its value: `--long=value`, or the next argument.
+fn valueOf(p: *Args, long: []const u8, short: []const u8) -> ?[]const u8 {
+    let a = p.argv[p.i];
+    if (long.len > 0 && text.startsWith(a, long) && a.len > long.len && a[long.len] == '=') {
+        if (a.len == long.len + 1) { die(text.f("'{s}' needs a value after the '='", .{long}), ""); }
+        return a[long.len + 1..];
+    }
+    if (!text.eq(a, long) && !(short.len > 0 && text.eq(a, short))) { return null; }
+    if (p.i + 1 >= p.argv.len) {
+        die(text.f("'{s}' needs a value", .{a}), text.f("'flint help {s}' shows how it's used", .{p.cmd.name}));
+    }
+    p.i += 1;
+    return p.argv[p.i];
+}
+
+fn needsCompile(p: *Args, flag: []const u8) {
+    if (p.cmd.compiles) { return; }
+    die(text.f("'{s}' doesn't apply to 'flint {s}'", .{flag, p.cmd.name}), "it belongs to the commands that compile: run, build, test, check, asm and ir");
+}
+
+// -O and what follows it: -O0, -O2 (or just -O)
+fn level(p: *Args, o: *Options) {
+    let a = p.argv[p.i];
+    needsCompile(p, a);
+    if (text.eq(a, "-O") && p.i + 1 < p.argv.len) { // the build modes of flint 0.7 and before
+        let m = p.argv[p.i + 1];
+        if (text.eq(m, "Debug")) { die("'-O Debug' is now '-O0', which is also the default", ""); }
+        if (text.eq(m, "ReleaseSafe")) { die("'-O ReleaseSafe' is now '-O2'", ""); }
+        if (text.eq(m, "ReleaseFast")) { die("'-O ReleaseFast' is now '-O2 --overflow=wrap'", ""); }
+    }
+    if (text.eq(a, "-O0")) {
+        o.optimize = false;
+    } else if (text.eq(a, "-O") || text.eq(a, "-O2")) {
+        o.optimize = true;
+    } else {
+        die(text.f("unknown optimization level '{s}'", .{a}), "flint has two: -O0 (none, the default) and -O2 (optimized)");
+    }
+}
+
+fn readArgs(argv: []const []const u8, cmd: *const Command) -> Options {
+    var o: Options = .{};
+    var args = Args { argv: argv, i: 2, cmd: cmd };
+    let p = &args;
+    let is_run = text.eq(cmd.name, "run");
+    while (p.i < argv.len) {
+        let a = argv[p.i];
+        if (is_run && o.path.len > 0) { // everything after the file goes to the program
+            o.prog_args = argv[p.i..];
+            break;
+        }
+        if (is_run && text.eq(a, "--")) {
+            o.prog_args = argv[p.i + 1..];
+            break;
+        }
+        if (text.eq(a, "-h") || text.eq(a, "--help")) {
+            o.help = true;
+        } else if (text.startsWith(a, "-O")) {
+            level(p, &o);
+        } else if (valueOf(p, "--overflow", "")) |v| {
+            needsCompile(p, "--overflow");
+            if (text.eq(v, "wrap")) {
+                o.wrap = true;
+            } else if (text.eq(v, "trap")) {
+                o.wrap = false;
+            } else {
+                die(text.f("unknown overflow mode '{s}'", .{v}), "use --overflow=trap (the default) or --overflow=wrap");
+            }
+        } else if (valueOf(p, "--output", "-o")) |v| {
+            if (!cmd.output) {
+                let hint = if (is_run) "'flint run' doesn't keep the executable; 'flint build -o <path>' does" else "only 'flint build' writes an executable";
+                die(text.f("'{s}' doesn't apply to 'flint {s}'", .{a, cmd.name}), hint);
+            }
+            o.out = v;
+        } else if (valueOf(p, "--color", "")) |v| {
+            if (text.eq(v, "auto")) {
+                term.when = .Auto;
+            } else if (text.eq(v, "always")) {
+                term.when = .Always;
+            } else if (text.eq(v, "never")) {
+                term.when = .Never;
+            } else {
+                die(text.f("unknown color setting '{s}'", .{v}), "use --color=auto, --color=always or --color=never");
+            }
+        } else if (a.len > 1 && a[0] == '-') {
+            unknownOption(cmd, a);
+        } else if (text.eq(cmd.name, "init") && o.name.len == 0) {
+            o.name = a;
+        } else if (!cmd.compiles) {
+            die(text.f("unexpected argument '{s}'", .{a}), text.f("usage: flint {s} {s}", .{cmd.name, cmd.args}));
+        } else if (o.path.len > 0) {
+            die(text.f("unexpected argument '{s}'", .{a}), text.f("'flint {s}' takes one file ({s}); the modules it imports are found by themselves", .{cmd.name, o.path}));
+        } else if (!text.endsWith(a, ".fl")) {
+            let hint = if (fs.exists(text.f("{s}.fl", .{a}))) text.f("did you mean '{s}.fl'?", .{a}) else "Flint source files end in .fl";
+            die(text.f("'{s}' isn't a Flint source file", .{a}), hint);
+        } else {
+            o.path = a;
+        }
+        p.i += 1;
+    }
+    return o;
+}
+
 // The whole command; returns the exit status.
 pub fn main(argv: []const []const u8) -> u8 {
-    var mode: ir.Mode = .Debug;
-    if (argv.len < 2 || !known(argv[1])) { return usage(""); }
-    let cmd = argv[1];
-    if (text.eq(cmd, "version")) {
+    if (argv.len < 2) {
+        overview();
+        return 0;
+    }
+    var word = argv[1];
+    if (text.eq(word, "-h") || text.eq(word, "--help")) { word = "help"; }
+    if (text.eq(word, "-V") || text.eq(word, "--version")) { word = "version"; }
+    let cmd = find(word) orelse unknownCommand(word);
+    if (text.eq(cmd.name, "help")) {
+        if (argv.len < 3) {
+            overview();
+            return 0;
+        }
+        commandHelp(find(argv[2]) orelse unknownCommand(argv[2]));
+        return 0;
+    }
+    let o = readArgs(argv, cmd);
+    if (o.help) {
+        commandHelp(cmd);
+        return 0;
+    }
+    if (text.eq(cmd.name, "version")) {
         _ = io.print("flint {s}\n", .{version()}) catch {};
         return 0;
     }
-    var path: []const u8 = "";
-    var out: []const u8 = "";
-    var prog_args: []const []const u8 = @zeroes([]const []const u8);
-    var i: usize = 2;
-    while (i < argv.len) {
-        let a = argv[i];
-        if (path.len > 0 && text.eq(cmd, "run")) { // everything after the file goes to the program
-            prog_args = argv[i..];
-            break;
-        }
-        if (text.eq(a, "--") && text.eq(cmd, "run")) {
-            prog_args = argv[i + 1..];
-            break;
-        }
-        if (text.eq(a, "-O") && i + 1 < argv.len) {
-            i += 1;
-            let m = argv[i];
-            if (text.eq(m, "Debug")) {
-                mode = .Debug;
-            } else if (text.eq(m, "ReleaseSafe")) {
-                mode = .Safe;
-            } else if (text.eq(m, "ReleaseFast")) {
-                mode = .Fast;
-            } else {
-                _ = io.eprint("flint: unknown build mode '{s}' (Debug, ReleaseSafe or ReleaseFast)\n", .{m}) catch {};
-                return 2;
-            }
-        } else if (text.eq(a, "-o") && i + 1 < argv.len) {
-            i += 1;
-            out = argv[i];
-        } else if (path.len == 0 && text.endsWith(a, ".fl")) {
-            path = a;
-        } else {
-            return usage(text.f("flint: unexpected argument '{s}'\n", .{a}));
-        }
-        i += 1;
-    }
-    let test_mode = text.eq(cmd, "test");
+    if (text.eq(cmd.name, "init")) { return scaffold.init(o.name); }
+    if (text.eq(cmd.name, "clean")) { return scaffold.clean(); }
+
+    let test_mode = text.eq(cmd.name, "test");
     var pkg: *unit.Package = undefined;
     var package_mode = false;
-    if (path.len > 0) { // a single file: its directory is the root that module paths start from
+    if (o.path.len > 0) { // a single file: its directory is the root that module paths start from
+        if (!fs.exists(o.path)) { die(text.f("there's no file '{s}'", .{o.path}), ""); }
         pkg = alloc.new(unit.Package);
-        pkg.dir = dirname(path);
+        pkg.dir = dirname(o.path);
         pkg.rootdir = pkg.dir;
-        pkg.root = path;
-        let base = if (text.lastIndexOf(path, '/')) |s| path[s + 1..] else path;
+        pkg.root = o.path;
+        let base = if (text.lastIndexOf(o.path, '/')) |s| o.path[s + 1..] else o.path;
         pkg.name = if (text.lastIndexOf(base, '.')) |d| base[0..d] else base;
     } else {
         var cbuf: [1024]u8 = undefined;
         let cwd = fs.cwd(cbuf[..]) catch return 1;
-        let dir = manifest.find(alloc.dupe(u8, cwd)) orelse return usage("flint: no file given, and no flint.toml in this directory or above it\n");
+        let dir = manifest.find(alloc.dupe(u8, cwd)) orelse die(
+            "no file given, and this directory isn't in a package",
+            text.f("name a file ('flint {s} file.fl'), or start a package here with 'flint init'", .{cmd.name}));
         pkg = manifest.read(dir);
         package_mode = true;
     }
     diag.path = pkg.root;
     let units = load.loadProgram(pkg.root, pkg, test_mode && package_mode);
-    let m = program.lowerProgram(units, mode, test_mode);
-    if (mode != .Debug) { opt.optimize(m); }
-    if (text.eq(cmd, "ir")) {
+    let m = program.lowerProgram(units, o.optimize, o.wrap, test_mode);
+    if (text.eq(cmd.name, "check")) { return 0; }
+    if (o.optimize) { opt.optimize(m); }
+    if (text.eq(cmd.name, "ir")) {
         print.dump(m, io.stdout) catch {};
         return 0;
     }
     let asm_text = func.emit(m);
-    if (text.eq(cmd, "asm")) {
+    if (text.eq(cmd.name, "asm")) {
         io.stdout.writeAll(asm_text) catch {};
         return 0;
     }
+    let is_build = text.eq(cmd.name, "build");
     var exe: []const u8 = "";
-    if (text.eq(cmd, "build")) {
-        if (out.len > 0) {
-            exe = out;
+    if (is_build) {
+        if (o.out.len > 0) {
+            exe = o.out;
         } else if (package_mode) {
             let od = text.f("{s}/out", .{pkg.dir});
             fs.makeDir(od) catch {};
@@ -129,9 +438,12 @@ pub fn main(argv: []const []const u8) -> u8 {
             exe = pkg.name;
         }
     }
+    // the program's own colored output (the test report) follows --color too
+    if (term.when == .Always) { _ = setenv(text.z("FLINT_COLOR"), text.z("always"), 1); }
+    if (term.when == .Never) { _ = setenv(text.z("FLINT_COLOR"), text.z("never"), 1); }
     var job = build.Job {
-        asm_text: asm_text, has_asm: m.has_asm, pkg: pkg, mode: mode, out: exe, keep: text.eq(cmd, "build"),
-        run: text.eq(cmd, "run") || test_mode, prog_args: prog_args,
+        asm_text: asm_text, has_asm: m.has_asm, pkg: pkg, optimize: o.optimize, out: exe, keep: is_build,
+        run: !is_build, prog_args: o.prog_args,
     };
     return build.build(&job);
 }

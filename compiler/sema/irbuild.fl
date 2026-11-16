@@ -322,12 +322,12 @@ pub fn zeroAt(t: *ty.Type, dst: Addr) {
 }
 
 // The memory of an `undefined` value. Reading it must give an unspecified but *stable* value
-// (section 4.1), never UB. Debug fills it with 0xAA so such reads stand out. Release modes zero
+// (section 4.1), never UB. -O0 fills it with 0xAA so such reads stand out. -O2 zeroes
 // scalars and small aggregates (a few stores, which the optimizer turns into register values),
 // and keep large ones in memory, whose bytes are stable without a memset: the optimizer would
 // otherwise promote never-written fields to registers that hold anything at all.
 pub fn undefinedAt(t: *ty.Type, dst: Addr) {
-    if (st.MODE != .Debug) {
+    if (st.OPTIMIZE) {
         if (!ty.isAgg(t) || t.size <= 64) { zeroAt(t, dst); } else { _ = addrReg(dst); } // taking the address pins a slot in memory
         return;
     }

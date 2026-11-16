@@ -1,0 +1,4 @@
+[1mbad.fl:3:18:[0m [1;31merror[0m: type mismatch: expected i32, found []const u8 for 'x'
+     3 [2m|[0m     let x: i32 = "text";
+       [2m|[0m                  [1;32m^[0m
+--- exit 1

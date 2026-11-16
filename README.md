@@ -45,19 +45,26 @@ fn main() -> !void {
 ./x                                   # builds build/flint (macOS on Apple Silicon); see "Building" below
 ./build/flint run   examples/tour.fl
 ./build/flint build examples/tour.fl -o tour
-./build/flint build -O ReleaseFast examples/tour.fl  # -O Debug (default) | ReleaseSafe | ReleaseFast
+./build/flint build -O2 examples/tour.fl             # optimized; -O0 (the default) isn't
+./build/flint build -O2 --overflow=wrap examples/tour.fl  # integer overflow wraps instead of trapping
+./build/flint check examples/tour.fl  # compile errors only: nothing is built
 ./build/flint asm   examples/tour.fl  # the generated ARM64 assembly
-./build/flint ir    examples/tour.fl  # the optimized IR
+./build/flint ir    examples/tour.fl  # the IR (optimized with -O2)
 ./build/flint test  file.fl           # runs its `test "name" { ... }` blocks
+./build/flint help  build             # every command has its own help; `flint help` lists them
 ./x test
 ./x install                           # PREFIX=/usr/local by default; also DESTDIR, ./x uninstall
 ```
 
-A package is a directory with a `flint.toml` (name, path dependencies, C sources to build and libraries to link). Inside it, `flint build`, `flint run -- args` and `flint test` need no file name; see `tests/packages/app`.
+Two flags replace build modes. `-O0` (the default) doesn't optimize and keeps the debugging aids: undefined memory is filled with 0xAA and `@assume` is checked. `-O2` optimizes. `--overflow=trap` (the default) makes integer overflow a panic; `--overflow=wrap` makes it wrap. Bounds, null, cast and division checks are always on: only `unsafe` removes them.
+
+A package is a directory with a `flint.toml` (name, path dependencies, C sources to build and libraries to link). `flint init name` starts one. Inside it, `flint build`, `flint run -- args`, `flint test` and `flint check` need no file name, and `flint clean` removes what `flint build` made; see `tests/packages/app`.
+
+A command line that's wrong gets one line saying what's wrong and a hint (`unknown command 'biuld'`, `did you mean 'build'?`). Errors and help are colored on a terminal; `--color=always|never` or `NO_COLOR` decides otherwise.
 
 ## Status
 
-Version 0.7.0 implements the design's milestones 1–7: the type system (tagged unions, optionals, error unions, arrays, slices, tuples, packed structs), the safety model with three build modes, allocators and checked formatting with no hidden allocation, modules and packages, C header import, `flint test`, comptime and generics, SIMD vectors, inline assembly (`asm { }`), and a compiler written in Flint that builds itself. [CHANGELOG.md](CHANGELOG.md) lists everything in detail; [TODO.md](TODO.md) has what's left (register returns, more backends, known gaps).
+Version 0.7.0 implements the design's milestones 1–7: the type system (tagged unions, optionals, error unions, arrays, slices, tuples, packed structs), the safety model (overflow, bounds, null and cast checks), allocators and checked formatting with no hidden allocation, modules and packages, C header import, `flint test`, comptime and generics, SIMD vectors, inline assembly (`asm { }`), and a compiler written in Flint that builds itself. [CHANGELOG.md](CHANGELOG.md) lists everything in detail; [TODO.md](TODO.md) has what's left (register returns, more backends, known gaps).
 
 ## How it compiles
 
@@ -117,5 +124,5 @@ Stage 0 is the release pinned in `bootstrap/release`: `./x` downloads it once an
 - `x` and `dev/` are the build: the launcher, and the build tool it runs (in Flint)
 - `docs/design.md` is the language spec
 - `examples/` has example programs, next to their expected output
-- `tests/` has output tests (run in every build mode), compile-error tests, multi-file module tests, `flint test` tests (`testblocks/`) and sample packages; `./x test` runs them all
+- `tests/` has output tests (run unoptimized, optimized, and optimized with wrapping overflow), compile-error tests, multi-file module tests, `flint test` tests (`testblocks/`), command-line tests (`cli/`) and sample packages; `./x test` runs them all
 - `CHANGELOG.md` is what each release added; `TODO.md` is what's left

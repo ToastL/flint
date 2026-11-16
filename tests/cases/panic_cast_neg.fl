@@ -1,4 +1,4 @@
-// flint: -O ReleaseFast
+// flint: -O2 --overflow=wrap
 
 import std.io;
 

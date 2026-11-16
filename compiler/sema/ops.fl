@@ -198,7 +198,7 @@ pub fn arith(op: []const u8, t: *ty.Type, a: b.Val, c: b.Val, wrap: bool) -> b.V
     if (o == .SDiv || o == .UDiv || o == .SRem || o == .URem) {
         if (ob.k != .Imm) { panicIf(b.cmp(.EQ, ob, b.IMM(0)), "division by zero"); } // in every mode
         if (sg) {
-            // MIN / -1 overflows: a trap in safe modes; it wraps (to MIN) in ReleaseFast
+            // MIN / -1 overflows: a trap; with --overflow=wrap it wraps (to MIN)
             if (o == .SDiv && st.safeArith() && (ob.k != .Imm || ob.v == -1)) {
                 var bad = b.cmp(.EQ, oa, b.IMM(intMin(t)));
                 if (ob.k != .Imm) { bad = b.op2(.And, .I, b.R(bad), b.R(b.cmp(.EQ, ob, b.IMM(-1)))); }
@@ -214,7 +214,7 @@ pub fn arith(op: []const u8, t: *ty.Type, a: b.Val, c: b.Val, wrap: bool) -> b.V
         } else if (st.safeArith()) {
             panicIf(b.cmp(.HS, ob, b.IMM(bits as i64)), "shift amount too large");
         } else if (bits < 64) {
-            ob = b.R(b.op2(.And, .I, ob, b.IMM((bits - 1) as i64))); // ReleaseFast: the amount is taken mod the width
+            ob = b.R(b.op2(.And, .I, ob, b.IMM((bits - 1) as i64))); // --overflow=wrap: the amount is taken mod the width
         }
     }
     let r = b.op2(o, .I, oa, ob);

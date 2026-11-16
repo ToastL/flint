@@ -1,0 +1,3 @@
+flint: error: unknown overflow mode 'saturate'
+  hint: use --overflow=trap (the default) or --overflow=wrap
+--- exit 2

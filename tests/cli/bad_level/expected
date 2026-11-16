@@ -1,0 +1,3 @@
+flint: error: unknown optimization level '-O3'
+  hint: flint has two: -O0 (none, the default) and -O2 (optimized)
+--- exit 2

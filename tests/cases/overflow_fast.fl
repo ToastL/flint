@@ -1,5 +1,5 @@
-// flint: -O ReleaseFast
-// ReleaseFast: overflow wraps (defined), shift amounts are taken mod the width
+// flint: -O2 --overflow=wrap
+// --overflow=wrap: overflow wraps (defined), shift amounts are taken mod the width
 
 import std.io;
 
