@@ -26,7 +26,7 @@ fn ivLess(x: *const Iv, y: *const Iv) -> bool {
     return x.v < y.v;
 }
 
-// sorts by (start, vreg): a merge sort (the keys are unique, so the order is the C compiler's)
+// sorts by (start, vreg): a merge sort (the keys are unique, so the order is fully determined)
 fn sortIvs(a: []Iv) {
     if (a.len < 2) { return; }
     let tmp = alloc.make(Iv, a.len);

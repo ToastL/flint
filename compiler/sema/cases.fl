@@ -17,7 +17,7 @@ import sema.stmt;
 import sema.enums;
 
 // Case values compared in one order: a signed value's sign bit is flipped, so every value of the
-// switched type maps to a u64 with the same order (the C compiler used 128-bit integers here).
+// switched type maps to a u64 with the same order.
 struct Interval {
     lo: u64,
     hi: u64,

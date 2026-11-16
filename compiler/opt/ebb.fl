@@ -54,7 +54,7 @@ fn cseOk(in: *const ir.Inst) -> bool {
 fn opdEq(x: ir.Opd, y: ir.Opd) -> bool { return x.k == y.k && (x.k == .None || x.v == y.v); }
 fn opdIs(x: ir.Opd, v: i32) -> bool { return x.k == .Reg && x.v == v as i64; }
 
-// the same symbol string (by identity, like the C compiler's pointer comparison)
+// the same symbol string, by identity (two symbols made separately never match)
 fn sameSym(x: []const u8, y: []const u8) -> bool { return x.len == y.len && (x.len == 0 || x.ptr == y.ptr); }
 
 fn substOne(o: *ir.Opd, e: *Env, ch: *bool) {

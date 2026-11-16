@@ -1,0 +1,11 @@
+# Builds the compiler from the pinned release and runs the test suite on every push and pull request.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-14   # Apple Silicon: Flint generates ARM64 Mach-O code
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - run: make selfhost-check
+      - run: make test

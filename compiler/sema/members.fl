@@ -109,8 +109,8 @@ pub fn callFn(f: *st.FnInfo, args: []*ast.Node, self_: ?*b.Val, tok: ?*token.Tok
         diag.at(tok, text.f("'{s}' takes {} argument(s), got {}", .{f.name, np as i64 - first as i64, args.len}));
     }
     if (given > 40) { diag.at(tok, "too many arguments"); }
-    var vals = alloc_vals(given);
-    var toks = alloc_toks(given);
+    let vals = alloc.make(b.Val, given);
+    let toks = alloc.make(?*token.Token, given);
     for (0..given) |i| {
         if (i < first) {
             vals[i] = self_.?.*;
@@ -124,13 +124,10 @@ pub fn callFn(f: *st.FnInfo, args: []*ast.Node, self_: ?*b.Val, tok: ?*token.Tok
     return calls.callCore(f, vals, toks, tok);
 }
 
-fn alloc_vals(n: usize) -> []b.Val { return alloc.make(b.Val, n); }
-fn alloc_toks(n: usize) -> []?*token.Token { return alloc.make(?*token.Token, n); }
-
 // a method of the standard library, called by the compiler with these arguments
 pub fn libCall(recv: *ty.Type, name: []const u8, args: []const b.Val, tok: ?*token.Token) -> b.Val {
     let m = names.findMethod(recv, name) orelse diag.at(tok, text.f("internal error: prelude method {s}.{s} is missing", .{ty.tname(recv), name}));
-    let toks = alloc_toks(args.len);
+    let toks = alloc.make(?*token.Token, args.len);
     for (0..args.len) |i| { toks[i] = tok; }
     return calls.callCore(m, args, toks, tok);
 }

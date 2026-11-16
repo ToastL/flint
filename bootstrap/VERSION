@@ -1,5 +1,0 @@
-# The release that bootstraps the compiler: version, download URL and sha256 of the tarball.
-# Empty until the first release is published; until then `make` starts from the C compiler (src/).
-version=version=0.7.0
-url=https://github.com/ToastL/flint/releases/download/v0.7.0/flint-0.7.0-aarch64-macos.tar.gz
-sha256=21754fae362a5a7bbb53e4aba99c99845f06c3753749a04d7f17eb3233a041c1

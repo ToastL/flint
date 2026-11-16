@@ -89,7 +89,7 @@ fn checkFree(name: []const u8, tok: ?*token.Token) {
 // let n = 42;  ->  a compile-time constant, inlined at every use
 fn declareConst(name: []const u8, v: b.Val, tok: ?*token.Token) {
     checkFree(name, tok);
-    let var_ = names_new();
+    let var_ = compileTimeVar();
     var_.name = name;
     var_.t = v.t;
     var_.kind = .Const;
@@ -101,7 +101,7 @@ fn declareConst(name: []const u8, v: b.Val, tok: ?*token.Token) {
 
 fn declareTypeAlias(name: []const u8, t: *ty.Type, tok: ?*token.Token) {
     checkFree(name, tok);
-    let var_ = names_new();
+    let var_ = compileTimeVar();
     var_.name = name;
     var_.t = t;
     var_.kind = .Type;
@@ -109,7 +109,8 @@ fn declareTypeAlias(name: []const u8, t: *ty.Type, tok: ?*token.Token) {
     st.c().cur.?.vars.push(var_);
 }
 
-fn names_new() -> *st.Var {
+// a Var that isn't a variable at run time (a constant or a type alias): no slot, no register
+fn compileTimeVar() -> *st.Var {
     let v = alloc.new(st.Var);
     v.slot = -1;
     v.reg = -1;

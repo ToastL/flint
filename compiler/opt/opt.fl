@@ -26,7 +26,7 @@ pub var defcnt: []i32 = @zeroes([]i32);
 pub var usecnt: []i32 = @zeroes([]i32);
 
 // how often each vreg is defined and used (uses of calls with more than 64 arguments aren't
-// counted, as in the C compiler)
+// counted: such a call is left alone by the passes that rely on use counts)
 pub fn count(f: *ir.IRFunc) {
     let nv = f.vcls.items.len;
     if (defcnt.len < nv + 1) {

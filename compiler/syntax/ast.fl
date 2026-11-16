@@ -1,6 +1,6 @@
 // syntax.ast - the syntax tree the parser builds.
 //
-// One node type for everything, as in the C compiler: which fields mean what depends on `k`
+// One node type for everything: which fields mean what depends on `k`
 // (documented on the fields). An absent name is "", an absent child is null.
 
 import base.alloc;

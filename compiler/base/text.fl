@@ -66,7 +66,7 @@ pub fn span(c: cstr) -> []const u8 { return mem.span(c); }
 // C's strtod on s (the whole text should be a number; the lexer only hands it digits)
 pub fn parseFloat(s: []const u8) -> f64 { return strtod(z(s), null); }
 
-// printf's "%.*g": how the C compiler printed floats in dumps and messages
+// printf's "%.*g": how floats appear in IR dumps and messages
 pub fn g(v: f64, prec: i32) -> []u8 {
     var buf: [64]u8 = undefined;
     let n = snprintf(&buf, buf.len, "%.*g", prec, v);

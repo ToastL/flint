@@ -1,5 +1,5 @@
-// driver.cli - the `flint` command line: run, build, test, asm, ir (and the tokens/ast dumps used
-// to compare compilers), build modes, and package mode (a directory with flint.toml).
+// driver.cli - the `flint` command line: run, build, test, asm, ir, version; build modes; and
+// package mode (a directory with flint.toml).
 
 import std.io;
 import std.fs;
@@ -15,9 +15,8 @@ import opt.opt;
 import arm64.func;
 import driver.manifest;
 import driver.build;
-import driver.dumps;
 
-let USAGE: []const u8 = "usage:\n  flint run   file.fl [args...]   compile and run\n  flint build file.fl [-o out]    compile to a native executable\n  flint test  file.fl             run the file's `test` blocks (and those of the modules it imports)\n  flint asm   file.fl             print the generated ARM64 assembly\n  flint ir    file.fl             print the optimized IR\n  flint tokens file.fl            print the tokens (for comparing compilers)\nin a package (a directory with flint.toml), leave out the file:\n  flint build [-o out]            builds out/<name>\n  flint run [-- args...]\n  flint test                      runs the tests in every .fl file of the package\noptions:\n  -O Debug        all safety checks, undefined memory filled with 0xAA, no optimization (default)\n  -O ReleaseSafe  optimized, all safety checks\n  -O ReleaseFast  optimized; integer overflow wraps instead of trapping\n                  (bounds, null, cast and division checks stay: only 'unsafe' removes them)\n";
+let USAGE: []const u8 = "usage:\n  flint run   file.fl [args...]   compile and run\n  flint build file.fl [-o out]    compile to a native executable\n  flint test  file.fl             run the file's `test` blocks (and those of the modules it imports)\n  flint asm   file.fl             print the generated ARM64 assembly\n  flint ir    file.fl             print the optimized IR\n  flint version                   print the compiler's version\nin a package (a directory with flint.toml), leave out the file:\n  flint build [-o out]            builds out/<name>\n  flint run [-- args...]\n  flint test                      runs the tests in every .fl file of the package\noptions:\n  -O Debug        all safety checks, undefined memory filled with 0xAA, no optimization (default)\n  -O ReleaseSafe  optimized, all safety checks\n  -O ReleaseFast  optimized; integer overflow wraps instead of trapping\n                  (bounds, null, cast and division checks stay: only 'unsafe' removes them)\n";
 
 fn usage(extra: []const u8) -> u8 {
     _ = io.eprint("{s}{s}", .{extra, USAGE}) catch {};
@@ -25,7 +24,16 @@ fn usage(extra: []const u8) -> u8 {
 }
 
 fn known(cmd: []const u8) -> bool {
-    return text.oneOf(cmd, &[_][]const u8 { "run", "build", "asm", "ir", "test", "tokens", "ast" });
+    return text.oneOf(cmd, &[_][]const u8 { "run", "build", "asm", "ir", "test", "version" });
+}
+
+// the repository's VERSION file, read when the compiler is built
+let VERSION_FILE: []const u8 = @embedFile("../../VERSION");
+
+fn version() -> []const u8 {
+    var v = VERSION_FILE;
+    while (v.len > 0 && (v[v.len - 1] == '\n' || v[v.len - 1] == ' ')) { v = v[0..v.len - 1]; }
+    return v;
 }
 
 fn dirname(p: []const u8) -> []const u8 {
@@ -38,6 +46,10 @@ pub fn main(argv: []const []const u8) -> u8 {
     var mode: ir.Mode = .Debug;
     if (argv.len < 2 || !known(argv[1])) { return usage(""); }
     let cmd = argv[1];
+    if (text.eq(cmd, "version")) {
+        _ = io.print("flint {s}\n", .{version()}) catch {};
+        return 0;
+    }
     var path: []const u8 = "";
     var out: []const u8 = "";
     var prog_args: []const []const u8 = @zeroes([]const []const u8);
@@ -76,10 +88,6 @@ pub fn main(argv: []const []const u8) -> u8 {
         i += 1;
     }
     let test_mode = text.eq(cmd, "test");
-    if (text.eq(cmd, "tokens") || text.eq(cmd, "ast")) {
-        if (path.len == 0) { return usage(""); }
-        return if (text.eq(cmd, "tokens")) dumps.tokens(path) else dumps.tree(path);
-    }
     var pkg: *unit.Package = undefined;
     var package_mode = false;
     if (path.len > 0) { // a single file: its directory is the root that module paths start from
