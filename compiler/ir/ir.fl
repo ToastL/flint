@@ -160,22 +160,18 @@ pub fn hasEffects(in: *const Inst) -> bool {
     }
 }
 
-// a block's successors (0, 1 or 2 of them)
-pub fn succs(b: *const Block) -> ([2]i32, usize) {
-    var out: [2]i32 = .{ -1, -1 };
+// a block's successors, into out, each block once (in target order: Br's t1 before t2)
+pub fn succs(b: *const Block, out: *alloc.Vec(i32)) {
+    out.truncate(0);
     let n = b.insts.items.len;
-    if (n == 0) { return .{out, 0}; }
+    if (n == 0) { return; }
     let t = &b.insts.items[n - 1];
     if (t.op == .Jmp) {
-        out[0] = t.t1;
-        return .{out, 1};
+        out.push(t.t1);
+    } else if (t.op == .Br) {
+        out.push(t.t1);
+        if (t.t2 != t.t1) { out.push(t.t2); }
     }
-    if (t.op == .Br) {
-        out[0] = t.t1;
-        out[1] = t.t2;
-        return .{out, 2};
-    }
-    return .{out, 0};
 }
 
 pub fn newVreg(f: *IRFunc, cls: Cls) -> i32 {

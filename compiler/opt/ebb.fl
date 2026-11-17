@@ -164,19 +164,20 @@ fn walk(f: *ir.IRFunc, b: i32, e: *Env, preds: []i32, ch: *bool, depth: i32) {
         }
     }
     if (depth > 200) { return; }
-    let (s, ns) = ir.succs(blk);
+    var s: alloc.Vec(i32) = .{};
+    ir.succs(blk, &s);
     let n = blk.insts.items.len;
-    for (0..ns) |k| {
-        if (preds[s[k] as usize] != 1 || s[k] == b || (k == 1 && s[1] == s[0])) { continue; }
+    for (s.items) |sb| {
+        if (preds[sb as usize] != 1 || sb == b) { continue; }
         var child = envClone(e);
         if (n > 0) {
             let t = &f.blocks.items[b as usize].insts.items[n - 1];
             if (t.op == .Br && t.a.k == .Reg && t.t1 != t.t2) {
                 child.kc.push(t.a.v as i32);
-                child.kv.push(s[k] == t.t1);
+                child.kv.push(sb == t.t1);
             }
         }
-        walk(f, s[k], &child, preds, ch, depth + 1);
+        walk(f, sb, &child, preds, ch, depth + 1);
     }
 }
 
@@ -184,12 +185,11 @@ pub fn run(f: *ir.IRFunc) -> bool {
     var ch = false;
     let nb = f.blocks.items.len;
     let preds = alloc.make(i32, nb + 1);
+    var s: alloc.Vec(i32) = .{};
     for (f.blocks.items) |*blk| {
         if (blk.dead) { continue; }
-        let (s, ns) = ir.succs(blk);
-        for (0..ns) |k| {
-            if (!(k == 1 && s[1] == s[0])) { preds[s[k] as usize] += 1; }
-        }
+        ir.succs(blk, &s);
+        for (s.items) |x| { preds[x as usize] += 1; }
     }
     for (0..nb) |b| {
         if (f.blocks.items[b].dead || (b != 0 && preds[b] == 1)) { continue; }

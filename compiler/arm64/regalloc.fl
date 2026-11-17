@@ -102,16 +102,17 @@ pub fn regalloc() {
         }
     }
     var changed = true;
+    var s: alloc.Vec(i32) = .{};
     while (changed) {
         changed = false;
         var k = A.order.items.len;
         while (k > 0) {
             k -= 1;
             let b = A.order.items[k] as usize;
-            let (s, ns) = ir.succs(&F.blocks.items[b]);
+            ir.succs(&F.blocks.items[b], &s);
             for (0..W) |w| {
                 var o: u64 = 0;
-                for (0..ns) |j| { o |= lin[s[j] as usize * W + w]; }
+                for (s.items) |x| { o |= lin[x as usize * W + w]; }
                 let i2 = use[b * W + w] | (o & ~def[b * W + w]);
                 if (o != lout[b * W + w] || i2 != lin[b * W + w]) { changed = true; }
                 lout[b * W + w] = o;

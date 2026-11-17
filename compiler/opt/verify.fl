@@ -1,0 +1,90 @@
+// opt.verify - checks that a function's IR is well formed. Off by default; FLINT_VERIFY=1 turns it
+// on after every optimizer pass and before code generation (the test runner sets it). A broken
+// invariant is an internal error naming the function, the block and the pass that broke it.
+//
+//   - every block that's emitted (the entry, and every live non-empty block) ends in exactly one
+//     terminator, and has no terminator before that
+//   - every branch target is a live, non-empty block
+//   - every vreg operand and result exists, and a result's class is the vreg's class
+//   - every slot exists
+//   - dominators and loops (opt.loops) are consistent
+
+import std.process;
+import base.text;
+import base.diag;
+import ir.ir;
+import opt.loops;
+
+var mode: i32 = -1; // -1: not looked at yet, 0: off, 1: on
+
+pub fn enabled() -> bool {
+    if (mode < 0) {
+        mode = 0;
+        if (process.getEnv("FLINT_VERIFY")) |v| { if (v.len > 0 && !text.eq(v, "0")) { mode = 1; } }
+    }
+    return mode == 1;
+}
+
+fn fail(f: *ir.IRFunc, b: usize, after: []const u8, what: []const u8) -> noreturn {
+    diag.at(null, text.f("internal error: invalid IR in {s}, block b{}, after {s}: {s}", .{f.sym, b, after, what}));
+}
+
+fn opdOk(f: *ir.IRFunc, o: ir.Opd) -> bool {
+    return o.k != .Reg || (o.v >= 0 && o.v < f.vcls.items.len as i64);
+}
+
+fn targetOk(f: *ir.IRFunc, t: i32) -> bool {
+    if (t < 0 || t as usize >= f.blocks.items.len) { return false; }
+    let blk = &f.blocks.items[t as usize];
+    return !blk.dead && blk.insts.items.len > 0;
+}
+
+// (a Call without a result still has a cls, so only instructions with a result are compared)
+fn checkInst(f: *ir.IRFunc, b: usize, in: *const ir.Inst, after: []const u8) {
+    let nv = f.vcls.items.len;
+    if (in.dst >= nv as i32) { fail(f, b, after, text.f("result v{} doesn't exist", .{in.dst})); }
+    if (in.dst >= 0 && in.op != .Call && in.cls != f.vcls.items[in.dst as usize]) {
+        fail(f, b, after, text.f("result v{} has class {} but the instruction makes {}", .{in.dst, f.vcls.items[in.dst as usize] as i32, in.cls as i32}));
+    }
+    if (ir.hasArgs(in)) {
+        for (in.args) |a| { if (!opdOk(f, a)) { fail(f, b, after, text.f("argument v{} doesn't exist", .{a.v})); } }
+    } else {
+        if (!opdOk(f, in.a) || !opdOk(f, in.b) || !opdOk(f, in.c)) { fail(f, b, after, "an operand's vreg doesn't exist"); }
+    }
+    if ((in.op == .Load || in.op == .Store || in.op == .AddrSlot) && in.slot >= f.slots.items.len as i32) {
+        fail(f, b, after, text.f("slot {} doesn't exist", .{in.slot}));
+    }
+    if (in.op == .Jmp || in.op == .Br) {
+        if (!targetOk(f, in.t1)) { fail(f, b, after, text.f("jumps to b{}, which isn't a live block", .{in.t1})); }
+    }
+    if (in.op == .Br && !targetOk(f, in.t2)) { fail(f, b, after, text.f("branches to b{}, which isn't a live block", .{in.t2})); }
+}
+
+pub fn func(f: *ir.IRFunc, after: []const u8) {
+    for (0..f.blocks.items.len) |b| {
+        let blk = &f.blocks.items[b];
+        if (blk.dead) { continue; }
+        let insts = blk.insts.items;
+        if (insts.len == 0) {
+            if (b == 0) { fail(f, b, after, "the entry block is empty"); }
+            continue;
+        }
+        for (0..insts.len) |i| {
+            let term = ir.isTerm(&insts[i]);
+            if (term && i + 1 < insts.len) { fail(f, b, after, text.f("instruction {} ends the block early", .{i})); }
+            if (!term && i + 1 == insts.len) { fail(f, b, after, "the block has no terminator"); }
+            checkInst(f, b, &insts[i], after);
+        }
+    }
+    loops.check(f);
+}
+
+pub fn module(m: *ir.Module, after: []const u8) {
+    if (!enabled()) { return; }
+    for (m.funcs.items) |f| { func(f, after); }
+}
+
+// one function, if verifying is on
+pub fn check(f: *ir.IRFunc, after: []const u8) {
+    if (enabled()) { func(f, after); }
+}

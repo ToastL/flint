@@ -48,15 +48,16 @@ pub fn simplify(f: *ir.IRFunc) -> bool {
     let nb = f.blocks.items.len;
     let seen = alloc.make(bool, nb + 1);
     var stack: alloc.Vec(i32) = .{};
+    var s: alloc.Vec(i32) = .{};
     stack.push(0);
     seen[0] = true;
     while (stack.items.len > 0) {
         let b = stack.pop();
-        let (s, k) = ir.succs(&f.blocks.items[b as usize]);
-        for (0..k) |i| {
-            if (!seen[s[i] as usize]) {
-                seen[s[i] as usize] = true;
-                stack.push(s[i]);
+        ir.succs(&f.blocks.items[b as usize], &s);
+        for (s.items) |x| {
+            if (!seen[x as usize]) {
+                seen[x as usize] = true;
+                stack.push(x);
             }
         }
     }

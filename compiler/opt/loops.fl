@@ -1,0 +1,315 @@
+// opt.loops - the shape of a function's control flow: predecessors, dominators and natural loops.
+//
+//   let li = loops.analyze(f);
+//   li.depth[b]        how many loops block b is in (0: none)
+//   li.loops.items     every loop, inner loops before the loops around them
+//   loops.inLoop(&li, l, b)
+//
+// Dominators use the iterative algorithm of Cooper, Harvey and Kennedy over reverse postorder. A
+// natural loop is a header plus every block that reaches a back edge (u -> h with h dominating u)
+// without passing through h; back edges to the same header make one loop.
+//
+// The result describes the function as it was: after changing the CFG (ensurePreheader does),
+// analyze again.
+
+import base.alloc;
+import base.text;
+import base.diag;
+import ir.ir;
+
+pub struct Loop {
+    header: i32,
+    blocks: alloc.Vec(i32), // the header first
+    parent: i32,            // the innermost loop around this one (-1: none)
+    depth: i32,             // 1 for an outermost loop
+}
+
+pub struct Info {
+    nb: usize,
+    pred_at: []i32,  // predecessors of b: preds[pred_at[b] .. pred_at[b + 1]]
+    preds: []i32,
+    rpo: alloc.Vec(i32), // reachable blocks in reverse postorder (the entry first)
+    rpo_idx: []i32,      // block -> index in rpo (-1: unreachable)
+    idom: []i32,         // immediate dominator (the entry's is itself; -1: unreachable)
+    loops: alloc.Vec(Loop),
+    member: []bool,      // loop l contains block b: member[l * nb + b]
+    depth: []i32,        // block -> loop nesting depth
+    innermost: []i32,    // block -> innermost loop containing it (-1: none)
+}
+
+pub fn predsOf(li: *const Info, b: i32) -> []i32 {
+    return li.preds[li.pred_at[b as usize] as usize..li.pred_at[b as usize + 1] as usize];
+}
+
+pub fn inLoop(li: *const Info, l: usize, b: i32) -> bool { return li.member[l * li.nb + b as usize]; }
+
+// a dominates b (both reachable)
+pub fn dominates(li: *const Info, a: i32, b: i32) -> bool {
+    var x = b;
+    while (x != a) {
+        let up = li.idom[x as usize];
+        if (up == x || up < 0) { return false; }
+        x = up;
+    }
+    return true;
+}
+
+// each loop's parent: the smallest other loop containing its header (natural loops with different
+// headers are nested or disjoint, so the sizes order them)
+fn findParents(li: *Info) {
+    let nl = li.loops.items.len;
+    for (0..nl) |l| {
+        let h = li.loops.items[l].header;
+        var best: i32 = -1;
+        for (0..nl) |o| {
+            if (o == l || !inLoop(li, o, h)) { continue; }
+            if (best < 0 || li.loops.items[o].blocks.items.len < li.loops.items[best as usize].blocks.items.len) { best = o as i32; }
+        }
+        li.loops.items[l].parent = best;
+    }
+}
+
+fn intersect(li: *Info, b1: i32, b2: i32) -> i32 {
+    var x = b1;
+    var y = b2;
+    while (x != y) {
+        while (li.rpo_idx[x as usize] > li.rpo_idx[y as usize]) { x = li.idom[x as usize]; }
+        while (li.rpo_idx[y as usize] > li.rpo_idx[x as usize]) { y = li.idom[y as usize]; }
+    }
+    return x;
+}
+
+pub fn analyze(f: *ir.IRFunc) -> Info {
+    let nb = f.blocks.items.len;
+    var li = Info {
+        nb: nb, pred_at: alloc.make(i32, nb + 2), preds: alloc.make(i32, 1), rpo: .{},
+        rpo_idx: alloc.make(i32, nb + 1), idom: alloc.make(i32, nb + 1), loops: .{},
+        member: alloc.make(bool, 1), depth: alloc.make(i32, nb + 1), innermost: alloc.make(i32, nb + 1),
+    };
+    var s: alloc.Vec(i32) = .{};
+
+    // predecessors, as counts then a prefix sum (each edge once: succs lists a block once)
+    for (0..nb) |b| {
+        if (f.blocks.items[b].dead) { continue; }
+        ir.succs(&f.blocks.items[b], &s);
+        for (s.items) |x| { li.pred_at[x as usize + 1] += 1; }
+    }
+    for (0..nb) |b| { li.pred_at[b + 1] += li.pred_at[b]; }
+    li.preds = alloc.make(i32, li.pred_at[nb] as usize + 1);
+    let fill = alloc.make(i32, nb + 1);
+    for (0..nb) |b| {
+        if (f.blocks.items[b].dead) { continue; }
+        ir.succs(&f.blocks.items[b], &s);
+        for (s.items) |x| {
+            li.preds[(li.pred_at[x as usize] + fill[x as usize]) as usize] = b as i32;
+            fill[x as usize] += 1;
+        }
+    }
+
+    // postorder by an explicit DFS (block, next successor to visit)
+    for (0..nb) |b| {
+        li.rpo_idx[b] = -1;
+        li.idom[b] = -1;
+        li.innermost[b] = -1;
+    }
+    let seen = alloc.make(bool, nb + 1);
+    var post: alloc.Vec(i32) = .{};
+    var stk: alloc.Vec(i32) = .{};
+    var nxt: alloc.Vec(i32) = .{};
+    if (nb > 0) {
+        stk.push(0);
+        nxt.push(0);
+        seen[0] = true;
+    }
+    while (stk.items.len > 0) {
+        let top = stk.items.len - 1;
+        let b = stk.items[top];
+        ir.succs(&f.blocks.items[b as usize], &s);
+        let k = nxt.items[top];
+        if (k < s.items.len as i32) {
+            nxt.items[top] = k + 1;
+            let x = s.items[k as usize];
+            if (!seen[x as usize]) {
+                seen[x as usize] = true;
+                stk.push(x);
+                nxt.push(0);
+            }
+        } else {
+            post.push(b);
+            _ = stk.pop();
+            _ = nxt.pop();
+        }
+    }
+    var i = post.items.len;
+    while (i > 0) {
+        i -= 1;
+        li.rpo_idx[post.items[i] as usize] = li.rpo.items.len as i32;
+        li.rpo.push(post.items[i]);
+    }
+
+    // dominators
+    if (nb > 0) { li.idom[0] = 0; }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (li.rpo.items) |b| {
+            if (b == 0) { continue; }
+            var nd: i32 = -1;
+            for (predsOf(&li, b)) |p| {
+                if (li.idom[p as usize] < 0) { continue; } // unreachable, or not processed yet
+                nd = if (nd < 0) p else intersect(&li, p, nd);
+            }
+            if (nd != li.idom[b as usize]) {
+                li.idom[b as usize] = nd;
+                changed = true;
+            }
+        }
+    }
+
+    // natural loops: one per header that has back edges
+    var headers: alloc.Vec(i32) = .{};
+    for (li.rpo.items) |h| {
+        for (predsOf(&li, h)) |p| {
+            if (li.rpo_idx[p as usize] >= 0 && dominates(&li, h, p)) {
+                headers.push(h);
+                break;
+            }
+        }
+    }
+    let nl = headers.items.len;
+    li.member = alloc.make(bool, nl * nb + 1);
+    var work: alloc.Vec(i32) = .{};
+    for (0..nl) |l| {
+        let h = headers.items[l];
+        var lp = Loop { header: h, blocks: .{}, parent: -1, depth: 0 };
+        li.member[l * nb + h as usize] = true;
+        lp.blocks.push(h);
+        work.truncate(0);
+        for (predsOf(&li, h)) |p| {
+            if (li.rpo_idx[p as usize] >= 0 && dominates(&li, h, p) && !li.member[l * nb + p as usize]) {
+                li.member[l * nb + p as usize] = true;
+                lp.blocks.push(p);
+                work.push(p);
+            }
+        }
+        while (work.items.len > 0) {
+            let x = work.pop();
+            for (predsOf(&li, x)) |p| {
+                if (li.rpo_idx[p as usize] < 0 || li.member[l * nb + p as usize]) { continue; }
+                li.member[l * nb + p as usize] = true;
+                lp.blocks.push(p);
+                work.push(p);
+            }
+        }
+        li.loops.push(lp);
+    }
+
+    findParents(&li);
+    for (0..nl) |l| {
+        var d: i32 = 1;
+        var p = li.loops.items[l].parent;
+        while (p >= 0) {
+            d += 1;
+            p = li.loops.items[p as usize].parent;
+        }
+        li.loops.items[l].depth = d;
+    }
+    // inner loops first (deeper first; ties by header order, so the result is deterministic)
+    var j: usize = 1;
+    while (j < nl) {
+        let x = li.loops.items[j];
+        var k = j;
+        while (k > 0 && li.loops.items[k - 1].depth < x.depth) {
+            li.loops.items[k] = li.loops.items[k - 1];
+            k -= 1;
+        }
+        li.loops.items[k] = x;
+        j += 1;
+    }
+    // membership rows and parents follow the loops' new order
+    li.member = alloc.make(bool, nl * nb + 1);
+    for (0..nl) |l| { for (li.loops.items[l].blocks.items) |b| { li.member[l * nb + b as usize] = true; } }
+    findParents(&li);
+    for (0..nb) |b| {
+        var d: i32 = 0;
+        for (0..nl) |l| {
+            if (!li.member[l * nb + b]) { continue; }
+            if (li.loops.items[l].depth > d) {
+                d = li.loops.items[l].depth;
+                li.innermost[b] = l as i32;
+            }
+        }
+        li.depth[b] = d;
+    }
+    return li;
+}
+
+fn retarget(t: *ir.Inst, from: i32, to: i32) {
+    if ((t.op == .Jmp || t.op == .Br) && t.t1 == from) { t.t1 = to; }
+    if (t.op == .Br && t.t2 == from) { t.t2 = to; }
+}
+
+// The block that every entry into loop l comes through: an existing predecessor outside the loop
+// whose only successor is the header, or a new block that just jumps to it (laid out right before
+// the header). -1 when the header is the entry block, which can't get one. cfg.simplify threads
+// jumps through empty blocks, so make it only when there's something to put in it. li is stale
+// afterwards.
+pub fn ensurePreheader(f: *ir.IRFunc, li: *const Info, l: usize) -> i32 {
+    let h = li.loops.items[l].header;
+    if (h == 0) { return -1; }
+    var outside: alloc.Vec(i32) = .{};
+    for (predsOf(li, h)) |p| { if (!inLoop(li, l, p)) { outside.push(p); } }
+    var s: alloc.Vec(i32) = .{};
+    if (outside.items.len == 1) {
+        let p = outside.items[0];
+        ir.succs(&f.blocks.items[p as usize], &s);
+        if (s.items.len == 1) { return p; }
+    }
+    let hb = &f.blocks.items[h as usize];
+    var nbk = @zeroes(ir.Block);
+    nbk.seq = hb.seq - 1; // ties keep block order, so it lands after that block and before h
+    nbk.cold = hb.cold;
+    var j = @zeroes(ir.Inst);
+    j.op = .Jmp;
+    j.cls = .None;
+    j.dst = -1;
+    j.slot = -1;
+    j.t1 = h;
+    j.t2 = -1;
+    j.tok = if (hb.insts.items.len > 0) hb.insts.items[0].tok else null;
+    nbk.insts.push(j);
+    f.blocks.push(nbk);
+    let pre = (f.blocks.items.len - 1) as i32;
+    for (outside.items) |p| {
+        let pb = &f.blocks.items[p as usize];
+        retarget(&pb.insts.items[pb.insts.items.len - 1], h, pre);
+    }
+    return pre;
+}
+
+// FLINT_VERIFY: the facts other passes rely on
+pub fn check(f: *ir.IRFunc) {
+    let li = analyze(f);
+    for (li.rpo.items) |b| {
+        if (b != 0 && (li.idom[b as usize] < 0 || !dominates(&li, li.idom[b as usize], b))) {
+            diag.at(null, text.f("internal error: loops: b{} of {s} has no dominator", .{b, f.sym}));
+        }
+    }
+    for (0..li.loops.items.len) |l| {
+        let lp = &li.loops.items[l];
+        for (lp.blocks.items) |b| {
+            if (!dominates(&li, lp.header, b)) {
+                diag.at(null, text.f("internal error: loops: header b{} of {s} doesn't dominate b{} of its loop", .{lp.header, f.sym, b}));
+            }
+        }
+        if (lp.parent >= 0) {
+            let pl = lp.parent as usize;
+            if (li.loops.items[pl].depth != lp.depth - 1) {
+                diag.at(null, text.f("internal error: loops: bad nesting at b{} of {s}", .{lp.header, f.sym}));
+            }
+            for (lp.blocks.items) |b| {
+                if (!inLoop(&li, pl, b)) { diag.at(null, text.f("internal error: loops: b{} of {s} is in a loop but not its parent", .{b, f.sym})); }
+            }
+        }
+    }
+}

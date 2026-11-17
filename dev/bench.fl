@@ -1,0 +1,132 @@
+// bench - ./x bench [filter]: performance of the code the compiler makes, and of the compiler.
+//
+//   bench/*.fl   each is built with -O2 and with -O2 --overflow=wrap and run 5 times; the best
+//                wall time counts. Both builds must print the same thing.
+//   flintc       build/flintc compiling itself (-O2): best time of 3, and its peak memory
+//
+// Times come from /usr/bin/time -l (which also reports the peak resident set size). The results
+// go to build/bench/results.txt; when the file is already there, each number is shown next to the
+// one it replaces, so a change can be measured with two runs: one before it, one after.
+
+import std.fmt;
+import std.fs;
+import std.mem;
+import sys;
+
+let DIR: []const u8 = "build/bench";
+let RUNS: usize = 5;
+
+struct Sample {
+    secs: f64,
+    rss: u64, // bytes
+}
+
+// "   1.12 real   0.88 user ..." and "  1234567  maximum resident set size"
+fn parseTime(out: []const u8) -> Sample {
+    var s = Sample { secs: -1.0, rss: 0 };
+    var lines = mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        let t = mem.trim(line);
+        if (mem.find(t, " real") != null && s.secs < 0.0) {
+            let end = mem.indexOf(u8, t, ' ') orelse t.len;
+            s.secs = fmt.parseFloat(f64, t[0..end]) catch -1.0;
+        } else if (mem.endsWith(u8, t, "maximum resident set size")) {
+            let end = mem.indexOf(u8, t, ' ') orelse t.len;
+            s.rss = fmt.parseInt(u64, t[0..end], 10) catch 0;
+        }
+    }
+    return s;
+}
+
+// runs argv under /usr/bin/time -l, n times: the fastest run (and the most memory any run used)
+fn measure(argv: []const []const u8, cwd: []const u8, out: []const u8, n: usize) -> Sample {
+    var best = Sample { secs: -1.0, rss: 0 };
+    let terr = sys.full(sys.f("{s}/time.txt", .{DIR}));
+    for (0..n) |_| {
+        var full = sys.strs();
+        sys.push(&full, "/usr/bin/time");
+        sys.push(&full, "-l");
+        for (argv) |a| { sys.push(&full, a); }
+        if (sys.spawn(full.items, .{ cwd: cwd, out: out, err: terr }) != 0) {
+            sys.die(sys.f("{s} failed (its output is in {s} and {s})", .{argv[0], out, terr}));
+        }
+        let s = parseTime(sys.read(terr));
+        if (s.secs < 0.0) { sys.die(sys.f("can't read the time of {s} from {s}", .{argv[0], terr})); }
+        if (best.secs < 0.0 || s.secs < best.secs) { best.secs = s.secs; }
+        if (s.rss > best.rss) { best.rss = s.rss; }
+    }
+    return best;
+}
+
+// the number this key had in the last results file, or -1
+fn previous(old: []const u8, key: []const u8) -> f64 {
+    var lines = mem.splitScalar(u8, old, '\n');
+    while (lines.next()) |line| {
+        let sp = mem.indexOf(u8, line, ' ') orelse continue;
+        if (sys.eq(line[0..sp], key)) { return fmt.parseFloat(f64, mem.trim(line[sp + 1..])) catch -1.0; }
+    }
+    return -1.0;
+}
+
+fn cell(old: []const u8, key: []const u8, v: f64, unit: []const u8, results: *[]const u8) -> []const u8 {
+    results.* = sys.f("{s}{s} {d:.3}\n", .{results.*, key, v});
+    let p = previous(old, key);
+    if (p <= 0.0) { return sys.f("{d:.2}{s}", .{v, unit}); }
+    let pct = (v - p) / p * 100.0;
+    return sys.f("{d:.2}{s} ({s}{d:.1}%)", .{v, unit, if (pct >= 0.0) "+" else "", pct});
+}
+
+pub fn run(compiler: []const u8, filter: []const u8) -> u8 {
+    sys.makeDirs(DIR);
+    let flintc = sys.full(compiler);
+    let rpath = sys.f("{s}/results.txt", .{DIR});
+    let old = sys.readOr(rpath, "");
+    var results: []const u8 = "";
+    sys.say("{s:<12} {s:<22} {s:<22}\n", .{"benchmark", "-O2", "-O2 --overflow=wrap"});
+    for (sys.listDir("bench", ".fl")) |file| {
+        let name = file[0..file.len - 3];
+        if (filter.len > 0 && mem.find(name, filter) == null) { continue; }
+        var cols = sys.strs();
+        var first: []const u8 = "";
+        for (0..2) |w| {
+            let wrap = w == 1;
+            let exe = sys.full(sys.f("{s}/{s}{s}", .{DIR, name, if (wrap) "-wrap" else ""}));
+            var argv = sys.strs();
+            sys.push(&argv, flintc);
+            sys.push(&argv, "build");
+            sys.push(&argv, "-O2");
+            if (wrap) { sys.push(&argv, "--overflow=wrap"); }
+            sys.push(&argv, sys.f("bench/{s}", .{file}));
+            sys.push(&argv, "-o");
+            sys.push(&argv, exe);
+            sys.must(argv.items, .{});
+            let out = sys.full(sys.f("{s}/{s}.out", .{DIR, if (wrap) "wrap" else "o2"}));
+            let s = measure(&[_][]const u8 { exe }, "", out, RUNS);
+            let printed = sys.read(out);
+            if (!wrap) {
+                first = printed;
+            } else if (!sys.eq(first, printed)) {
+                sys.die(sys.f("bench/{s} prints something else with --overflow=wrap", .{file}));
+            }
+            sys.push(&cols, cell(old, sys.f("{s}{s}", .{name, if (wrap) "-wrap" else ""}), s.secs, "s", &results));
+        }
+        sys.say("{s:<12} {s:<22} {s:<22}\n", .{name, cols.items[0], cols.items[1]});
+    }
+    if (filter.len == 0 || mem.find("flintc", filter) != null) {
+        let exe = sys.full(sys.f("{s}/flintc-self", .{DIR}));
+        let argv = [_][]const u8 { flintc, "build", "-O2", "main.fl", "-o", exe };
+        let s = measure(&argv, "compiler", sys.full(sys.f("{s}/self.out", .{DIR})), 3);
+        let t = cell(old, "flintc-self", s.secs, "s", &results);
+        let m = cell(old, "flintc-self-mb", s.rss as f64 / 1048576.0, " MB", &results);
+        sys.say("{s:<12} {s:<22} peak memory {s}\n", .{"flintc", t, m});
+    }
+    // what a filtered run didn't measure keeps its old number
+    var lines = mem.splitScalar(u8, old, '\n');
+    while (lines.next()) |line| {
+        let sp = mem.indexOf(u8, line, ' ') orelse continue;
+        if (previous(results, line[0..sp]) < 0.0) { results = sys.f("{s}{s}\n", .{results, line}); }
+    }
+    sys.write(rpath, results);
+    sys.say("(saved to {s}; the next run compares with it)\n", .{rpath});
+    return 0;
+}

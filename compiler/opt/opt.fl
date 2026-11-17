@@ -21,6 +21,7 @@ import opt.constprop;
 import opt.copyprop;
 import opt.ebb;
 import opt.dce;
+import opt.verify;
 
 pub var defcnt: []i32 = @zeroes([]i32);
 pub var usecnt: []i32 = @zeroes([]i32);
@@ -77,22 +78,32 @@ pub fn nop(in: *ir.Inst) {
 }
 
 pub fn optimize(m: *ir.Module) {
+    verify.module(m, "lowering");
     for (m.funcs.items) |f| {
         _ = cfg.simplify(f);
+        verify.check(f, "cfg.simplify");
         promote.promote(f);
+        verify.check(f, "promote");
         var iter: i32 = 0;
         while (iter < 8) {
             var ch = false;
             ch = constprop.run(f) || ch;
+            verify.check(f, "constprop");
             ch = cfg.simplify(f) || ch;
+            verify.check(f, "cfg.simplify");
             ch = copyprop.run(f) || ch;
+            verify.check(f, "copyprop");
             ch = ebb.run(f) || ch;
+            verify.check(f, "ebb");
             ch = dce.run(f) || ch;
+            verify.check(f, "dce");
             if (!ch) { break; }
             iter += 1;
         }
         dce.coalesce(f);
+        verify.check(f, "coalesce");
         _ = dce.run(f);
         _ = cfg.simplify(f);
+        verify.check(f, "the last cleanup");
     }
 }

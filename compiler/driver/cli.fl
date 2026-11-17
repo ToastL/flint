@@ -21,6 +21,7 @@ import modules.load;
 import ir.print;
 import sema.program;
 import opt.opt;
+import opt.verify;
 import arm64.func;
 import driver.build;
 
@@ -474,7 +475,7 @@ pub fn main(argv: []const []const u8) -> u8 {
     let units = load.loadProgram(pkg.root, pkg, test_mode && o.all_files);
     let m = program.lowerProgram(units, o.optimize, o.wrap, test_mode);
     if (text.eq(cmd.name, "check")) { return 0; }
-    if (o.optimize) { opt.optimize(m); }
+    if (o.optimize) { opt.optimize(m); } else { verify.module(m, "lowering"); }
     if (text.eq(cmd.name, "ir")) {
         print.dump(m, io.stdout) catch {};
         return 0;

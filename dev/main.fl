@@ -2,6 +2,7 @@
 //
 //   stages.fl  building the compiler with itself, and the fixpoint check
 //   tests.fl   the test runner
+//   bench.fl   the benchmarks in bench/, and the compiler compiling itself
 //   dist.fl    release tarballs, install and uninstall
 //   sys.fl     files, directories and running programs
 //
@@ -13,9 +14,10 @@ import std.process;
 import sys;
 import stages;
 import tests;
+import bench;
 import dist;
 
-let USAGE: []const u8 = "usage: ./x [command] [options]\n  build              stage 0 builds build/stage1/flintc, which builds build/flintc (the compiler),\n                     which builds build/flint (the project tool); the default\n  test [filter]      builds, then runs the tests (only those whose name contains filter)\n  check              builds, then checks that build/flintc rebuilds itself to the same assembly\n  ci                 build, check and test\n  dist               builds, then packs build/dist/flint-<version>-<arch>-<os>.tar.gz\n  install            builds, then installs flintc and flint into $DESTDIR$PREFIX/bin (PREFIX: /usr/local)\n  uninstall          removes them from there\n  clean              removes build/\noptions:\n  -O mode            the mode the compiler is built in: Debug, ReleaseSafe (default), ReleaseFast\n  --flintc path      test: the compiler to test (and the flint next to it), instead of building them\nstage 0 is the release pinned in bootstrap/release, or FLINT_BOOTSTRAP=path/to/flint\n";
+let USAGE: []const u8 = "usage: ./x [command] [options]\n  build              stage 0 builds build/stage1/flintc, which builds build/flintc (the compiler),\n                     which builds build/flint (the project tool); the default\n  test [filter]      builds, then runs the tests (only those whose name contains filter)\n  bench [filter]     builds, then times bench/*.fl (-O2, and with --overflow=wrap) and flintc\n                     compiling itself; compares with the previous run (build/bench/results.txt)\n  check              builds, then checks that build/flintc rebuilds itself to the same assembly\n  ci                 build, check and test\n  dist               builds, then packs build/dist/flint-<version>-<arch>-<os>.tar.gz\n  install            builds, then installs flintc and flint into $DESTDIR$PREFIX/bin (PREFIX: /usr/local)\n  uninstall          removes them from there\n  clean              removes build/\noptions:\n  -O mode            the mode the compiler is built in: Debug, ReleaseSafe (default), ReleaseFast\n  --flintc path      test: the compiler to test (and the flint next to it), instead of building them\nstage 0 is the release pinned in bootstrap/release, or FLINT_BOOTSTRAP=path/to/flint\n";
 
 fn usage(problem: []const u8) -> u8 {
     _ = io.eprint("{s}{s}", .{problem, USAGE}) catch {};
@@ -46,7 +48,7 @@ fn main() -> u8 {
         } else if (sys.eq(a, "--flintc") && i + 1 < argv.len && is_test) {
             i += 1;
             compiler = argv[i];
-        } else if (is_test && filter.len == 0 && a.len > 0 && a[0] != '-') {
+        } else if ((is_test || sys.eq(cmd, "bench")) && filter.len == 0 && a.len > 0 && a[0] != '-') {
             filter = a;
         } else {
             return usage(sys.f("x: unexpected argument '{s}'\n", .{a}));
@@ -66,6 +68,9 @@ fn main() -> u8 {
             tool = sys.f("{s}flint", .{compiler[0..n]});
         }
         status = tests.run(compiler, tool, filter);
+    } else if (sys.eq(cmd, "bench")) {
+        stages.build(mode, true);
+        status = bench.run(stages.FLINTC, filter);
     } else if (sys.eq(cmd, "check")) {
         stages.check(mode);
     } else if (sys.eq(cmd, "ci")) {

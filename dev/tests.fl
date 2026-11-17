@@ -283,6 +283,8 @@ pub fn run(compiler: []const u8, tool_path: []const u8, filter: []const u8) -> u
     _ = setenv("FLINT_CACHE", mem.dupeZ(heap.c_allocator, sys.full(sys.f("{s}/cache", .{TMP}))) catch sys.die("out of memory"), 1);
     // the tool calls the compiler under test, wherever each of them is
     _ = setenv("FLINTC", mem.dupeZ(heap.c_allocator, t.flint) catch sys.die("out of memory"), 1);
+    // the compiler checks its IR after every optimizer pass (opt/verify.fl)
+    _ = setenv("FLINT_VERIFY", "1", 1);
     examples(t);
     cases(t);
     modules(t);
