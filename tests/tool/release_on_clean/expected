@@ -1,0 +1,3 @@
+flint: error: '--release' doesn't apply to 'flint clean'
+  hint: it belongs to the commands that compile: build, run, test and check
+--- exit 2

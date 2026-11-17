@@ -1,4 +1,5 @@
-// dist - packaging a release, and installing the compiler.
+// dist - packaging a release, and installing its two programs: flintc (the compiler) and flint
+// (the project tool).
 
 import std.fs;
 import std.mem;
@@ -14,14 +15,14 @@ fn releaseName() -> []const u8 {
     return sys.f("flint-{s}-{s}-{s}", .{mem.trim(sys.read("VERSION")), arch, os});
 }
 
-// A release: the single flint binary (std and the runtime are embedded in it) and the README in
+// A release: flintc (std and the runtime are embedded in it), flint and the README in
 // build/dist/<name>.tar.gz, with its checksum next to it.
 pub fn dist() {
     let name = releaseName();
     let dir = sys.f("build/dist/{s}", .{name});
     let tarball = sys.f("{s}.tar.gz", .{name});
     sys.makeDirs(dir);
-    sys.must(&[_][]const u8 { "cp", stages.FLINT, "README.md", dir }, .{});
+    sys.must(&[_][]const u8 { "cp", stages.FLINTC, stages.FLINT, "README.md", dir }, .{});
     sys.must(&[_][]const u8 { "tar", "-czf", tarball, name }, .{ cwd: "build/dist" });
     let sum = sys.f("build/dist/{s}.sha256", .{tarball});
     sys.must(&[_][]const u8 { "shasum", "-a", "256", tarball }, .{ cwd: "build/dist", out: sys.full(sum) });
@@ -37,13 +38,16 @@ fn binDir() -> []const u8 {
 pub fn install() {
     let bin = binDir();
     sys.must(&[_][]const u8 { "install", "-d", bin }, .{});
+    sys.must(&[_][]const u8 { "install", "-m", "755", stages.FLINTC, sys.f("{s}/flintc", .{bin}) }, .{});
     sys.must(&[_][]const u8 { "install", "-m", "755", stages.FLINT, sys.f("{s}/flint", .{bin}) }, .{});
-    sys.say("installed {s}/flint\n", .{bin});
+    sys.say("installed {s}/flintc and {s}/flint\n", .{bin, bin});
 }
 
 pub fn uninstall() {
-    let path = sys.f("{s}/flint", .{binDir()});
-    if (!fs.exists(path)) { return; }
-    fs.remove(path) catch sys.die(sys.f("can't remove {s}", .{path}));
-    sys.say("removed {s}\n", .{path});
+    for ([_][]const u8 { "flintc", "flint" }) |name| {
+        let path = sys.f("{s}/{s}", .{binDir(), name});
+        if (!fs.exists(path)) { continue; }
+        fs.remove(path) catch sys.die(sys.f("can't remove {s}", .{path}));
+        sys.say("removed {s}\n", .{path});
+    }
 }

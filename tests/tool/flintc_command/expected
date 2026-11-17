@@ -1,0 +1,3 @@
+flint: error: 'asm' is a command of flintc, the compiler
+  hint: flintc asm file.fl
+--- exit 2

@@ -1,0 +1,1 @@
+run --pkg geometry=../packages/geometry/src/geometry.fl --dep geo=geometry usepkg.fl

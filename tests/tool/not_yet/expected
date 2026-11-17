@@ -1,0 +1,3 @@
+flint: error: there's no 'flint add' yet
+  hint: add the package to [dependencies] in flint.toml: name = { url = "...", sha256 = "..." }, or { path = "..." }
+--- exit 2

@@ -1,100 +1,106 @@
-// driver.build - from assembly to a program: assemble with the system assembler, compile the
-// packages' C sources with the C compiler, link with the C toolchain (for libc), and run.
+// driver.build - from assembly to a program, in two steps: assemble with the system assembler,
+// then link with the C toolchain (for libc), together with the objects and libraries named on
+// the command line. Then, maybe, run it.
+//
+// With --cache the steps' outputs stay in that directory, and a step whose inputs are the ones
+// it last ran with is skipped (driver.cache). Without it the build happens in a temporary
+// directory that's removed afterwards.
 
-import std.io;
 import std.fs;
-import std.heap;
+import std.hash;
 import std.process;
 import base.alloc;
 import base.text;
-import base.term;
-import modules.unit;
-import modules.load;
-
-// runs argv and returns its exit status (128 + the signal if it was killed; 127 if it couldn't start)
-pub fn run(argv: []const []const u8) -> u8 {
-    _ = io.flush() catch {};
-    return process.run(heap.c_allocator, argv) catch {
-        _ = io.eprint("flint: {s}: can't run {s}\n", .{term.label("error"), argv[0]}) catch {};
-        return 127;
-    };
-}
-
-// every package the build uses: the root package and its dependencies, each once
-fn collectPkgs(p: *unit.Package, out: *alloc.Vec(*unit.Package)) {
-    for (out.items) |x| { if (x == p) { return; } }
-    out.push(p);
-    for (p.deps.items) |*d| { collectPkgs(d.pkg, out); }
-}
+import base.cmdline;
+import driver.cache;
 
 pub struct Job {
     asm_text: []const u8,
     has_asm: bool, // some of it was written by hand, in asm blocks
-    pkg: *unit.Package,
-    optimize: bool,      // -O2: the packages' C sources are optimized too
-    out: []const u8,     // the executable to write ("" for a temporary one)
-    keep: bool,          // build: keep the executable
+    objects: []const []const u8, // --object: linked with the program
+    libs: []const []const u8,    // --lib: -l<name> for the linker
+    cache: []const u8,   // the directory the steps' outputs stay in ("": a temporary one)
+    out: []const u8,     // the executable to write ("" for one in that directory)
+    keep: bool,          // keep the executable
     run: bool,           // run it afterwards
     prog_args: []const []const u8,
 }
 
-fn fail(msg: []const u8) -> u8 {
-    _ = io.eprint("flint: {s}: {s}\n", .{term.label("error"), msg}) catch {};
-    return 1;
-}
-
-// assembles, links and (maybe) runs; the exit status for the flint command
-pub fn build(j: *Job) -> u8 {
-    var tbuf: [64]u8 = undefined;
-    let tdir = fs.makeTempDir("flint-", tbuf[..]) catch return fail("can't create a temp directory");
-    let dir = alloc.dupe(u8, tdir);
+// prog.s -> prog.o; the object's key, or null if the assembler failed (it said why)
+fn assemble(j: *Job, dir: []const u8, cached: bool) -> ?[]const u8 {
     let spath = text.f("{s}/prog.s", .{dir});
     let opath = text.f("{s}/prog.o", .{dir});
-    fs.writeFile(spath, j.asm_text) catch return fail(text.f("can't write {s}", .{spath}));
-    let exe = if (j.out.len > 0) j.out else text.f("{s}/prog", .{dir});
-    if (run(&[_][]const u8 { "as", "-arch", "arm64", "-o", opath, spath }) != 0) {
-        if (j.has_asm) { return fail("the assembler rejected the program: check the lines in its asm blocks (FLINT_KEEP=1 keeps the file)"); }
-        return fail(text.f("internal error: the generated assembly didn't assemble ({s})", .{spath}));
-    }
-    var pkgs: alloc.Vec(*unit.Package) = .{};
-    collectPkgs(j.pkg, &pkgs);
-    var objs: alloc.Vec([]const u8) = .{};
-    for (0..pkgs.items.len) |p| { // the packages' C sources, compiled by the C compiler
-        let pk = pkgs.items[p];
-        for (0..pk.csrc.items.len) |i| {
-            let obj = text.f("{s}/c{}_{}.o", .{dir, p, i});
-            var cc: alloc.Vec([]const u8) = .{};
-            cc.push(load.cc);
-            cc.push("-c");
-            cc.push(if (j.optimize) "-O2" else "-O0");
-            for (pk.cinc.items) |inc| { cc.push(text.f("-I{s}", .{inc})); }
-            for (pk.cflags.items) |fl| { cc.push(fl); }
-            cc.push(pk.csrc.items[i]);
-            cc.push("-o");
-            cc.push(obj);
-            if (run(cc.items) != 0) { return fail(text.f("compiling {s} failed", .{pk.csrc.items[i]})); }
-            objs.push(obj);
+    let kpath = text.f("{s}/prog.key", .{dir});
+    let key = cache.hex(hash.bytes(j.asm_text));
+    if (cached && fs.exists(opath) && text.eq(cache.read(kpath), key)) { return key; }
+    if (cached) { fs.remove(kpath) catch {}; }
+    fs.writeFile(spath, j.asm_text) catch {
+        _ = cmdline.fail(text.f("can't write {s}", .{spath}), "");
+        return null;
+    };
+    if (cmdline.run(&[_][]const u8 { "as", "-arch", "arm64", "-o", opath, spath }) != 0) {
+        let kept = if (cached) text.f("the assembly is in {s}", .{spath}) else "FLINT_KEEP=1 keeps the file";
+        if (j.has_asm) {
+            _ = cmdline.fail(text.f("the assembler rejected the program: check the lines in its asm blocks ({s})", .{kept}), "");
+        } else {
+            _ = cmdline.fail(text.f("internal error: the generated assembly didn't assemble ({s})", .{spath}), "");
         }
+        return null;
     }
+    if (cached) { cache.write(kpath, key); }
+    return key;
+}
+
+// prog.o and the objects -> the executable; false if the linker failed
+fn link(j: *Job, dir: []const u8, cached: bool, prog_key: []const u8, exe: []const u8) -> bool {
     var ld: alloc.Vec([]const u8) = .{};
     ld.push("cc");
     ld.push("-o");
     ld.push(exe);
-    ld.push(opath);
-    for (objs.items) |o| { ld.push(o); }
-    for (pkgs.items) |pk| { for (pk.clink.items) |l| { ld.push(text.f("-l{s}", .{l})); } }
-    if (run(ld.items) != 0) { return fail("linking failed"); }
+    ld.push(text.f("{s}/prog.o", .{dir}));
+    for (j.objects) |o| { ld.push(o); }
+    for (j.libs) |l| { ld.push(text.f("-l{s}", .{l})); }
+    let kpath = text.f("{s}/link.key", .{dir});
+    var key: []const u8 = "";
+    if (cached) { // the command, the program, and what's in each object
+        var h = cache.mix(cache.ofStrings(ld.items), prog_key);
+        for (j.objects) |o| { h = cache.mix(h, cache.ofFile(o)); }
+        key = cache.hex(h);
+        if (fs.exists(exe) && text.eq(cache.read(kpath), key)) { return true; }
+        fs.remove(kpath) catch {};
+    }
+    if (cmdline.run(ld.items) != 0) {
+        _ = cmdline.fail("linking failed", "");
+        return false;
+    }
+    if (cached) { cache.write(kpath, key); }
+    return true;
+}
+
+// assembles, links and (maybe) runs; the exit status for the command
+pub fn build(j: *Job) -> u8 {
+    let cached = j.cache.len > 0;
+    var dir = j.cache;
+    if (cached) {
+        if (!cache.makeDirs(dir)) { return cmdline.fail(text.f("can't create the directory {s}", .{dir}), ""); }
+    } else {
+        var tbuf: [64]u8 = undefined;
+        let tdir = fs.makeTempDir("flint-", tbuf[..]) catch return cmdline.fail("can't create a temp directory", "");
+        dir = alloc.dupe(u8, tdir);
+    }
+    let exe = if (j.out.len > 0) j.out else text.f("{s}/prog", .{dir});
+    let key = assemble(j, dir, cached) orelse return 1;
+    if (!link(j, dir, cached, key, exe)) { return 1; }
     var status: u8 = 0;
     if (j.run) {
         var pargv: alloc.Vec([]const u8) = .{};
         pargv.push(exe);
         for (j.prog_args) |a| { pargv.push(a); }
-        status = run(pargv.items);
+        status = cmdline.run(pargv.items);
     }
-    if (process.getEnv("FLINT_KEEP") == null) {
-        fs.remove(spath) catch {};
-        fs.remove(opath) catch {};
-        for (objs.items) |o| { fs.remove(o) catch {}; }
+    if (!cached && process.getEnv("FLINT_KEEP") == null) {
+        fs.remove(text.f("{s}/prog.s", .{dir})) catch {};
+        fs.remove(text.f("{s}/prog.o", .{dir})) catch {};
         if (!j.keep) { fs.remove(exe) catch {}; }
         fs.removeDir(dir) catch {};
     }

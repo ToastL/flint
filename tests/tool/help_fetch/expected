@@ -1,0 +1,12 @@
+flint fetch: download the project's dependencies
+
+Usage:
+  flint fetch
+
+  Downloads the dependencies that flint.toml gives a url for, and theirs, into the cache
+  ($FLINT_CACHE, or ~/.cache/flint) unless they're there already. The other commands do
+  this when they need to; 'flint fetch' does it ahead of time.
+
+Examples:
+  flint fetch
+--- exit 0

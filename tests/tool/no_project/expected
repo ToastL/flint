@@ -1,0 +1,3 @@
+flint: error: this directory isn't in a project: there's no flint.toml here or above
+  hint: start one with 'flint init'; to compile one file: flintc build file.fl
+--- exit 2

@@ -6,4 +6,6 @@ jobs:
     runs-on: macos-14   # Apple Silicon: Flint generates ARM64 Mach-O code
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true   # tool/: the flint-tool repository
       - run: ./x ci

@@ -1,0 +1,3 @@
+flint: error: '-O2' is an option of flintc; a project's settings are its profiles
+  hint: --release, or a [profile.<name>] table in flint.toml (optimize, overflow) and --profile=<name>
+--- exit 2

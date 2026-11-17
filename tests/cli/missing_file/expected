@@ -1,2 +1,2 @@
-flint: error: there's no file 'nope.fl'
+flintc: error: there's no file 'nope.fl'
 --- exit 2

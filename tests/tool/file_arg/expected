@@ -1,0 +1,3 @@
+flint: error: 'flint run' works on the whole project, not on a file
+  hint: for one file: flintc run ok.fl
+--- exit 2

@@ -1,3 +1,0 @@
-flint: error: '-O2' doesn't apply to 'flint clean'
-  hint: it belongs to the commands that compile: run, build, test, check, asm and ir
---- exit 2

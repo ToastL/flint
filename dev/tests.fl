@@ -1,4 +1,5 @@
-// tests - the test runner. Every test runs the compiler and compares what it prints with a file:
+// tests - the test runner. Every test runs the compiler (flintc), or for a project the project
+// tool (flint), and compares what it prints with a file:
 //
 //   examples/*.fl          output must match examples/<name>.expected
 //   tests/cases/*.fl       output (+ stderr and exit code when non-zero) must match <name>.expected.
@@ -6,23 +7,29 @@
 //                          case that exits 0 must also give the same output with -O2 and with
 //                          -O2 --overflow=wrap.
 //   tests/modules/*/       main.fl (plus the modules it imports): output must match expected
-//   tests/packages/*/      `flint run -- x y` and `flint test` in the package match expected-run
-//                          and expected-test
+//   tests/packages/*/      `flint run -- x y` and `flint test` in the project match expected-run
+//                          and expected-test; so does a second run from out/, and --release
+//   (package/remote)       a package made in build/tmp whose dependency is downloaded
 //   tests/testblocks/*.fl  `flint test` output and exit code must match <name>.expected
 //   tests/errors/*.fl      must fail to compile with the message in <name>.expected
-//   tests/cli/*/           the command line itself: `flint <the words in args>`, run in tests/cli,
+//   tests/cli/*/           the command line itself: `flintc <the words in args>`, run in tests/cli,
 //                          must print expected (stdout, stderr and the exit code)
+//   tests/tool/*/          the same for `flint <the words in args>`, run in tests/tool
 //
 // Newlines at the end of the output and of the expected file don't count.
 
 import std.fs;
+import std.heap;
 import std.mem;
 import sys;
+
+extern fn setenv(name: cstr, value: cstr, overwrite: i32) -> i32;
 
 let TMP: []const u8 = "build/tmp";
 
 struct Runner {
-    flint: []const u8,   // the compiler under test (an absolute path)
+    flint: []const u8,   // the compiler under test, flintc (an absolute path)
+    tool: []const u8,    // the project tool under test, flint
     filter: []const u8,  // only tests whose name contains this
     pass: usize = 0,
     fail: usize = 0,
@@ -40,8 +47,17 @@ fn wanted(t: *Runner, name: []const u8) -> bool {
 
 // runs the compiler with these arguments in cwd ("" for the repository's root)
 fn flint(t: *Runner, argv: []const []const u8, cwd: []const u8, merge: bool) -> Output {
+    return exec(t, t.flint, argv, cwd, merge);
+}
+
+// runs the project tool
+fn tool(t: *Runner, argv: []const []const u8, cwd: []const u8, merge: bool) -> Output {
+    return exec(t, t.tool, argv, cwd, merge);
+}
+
+fn exec(t: *Runner, exe: []const u8, argv: []const []const u8, cwd: []const u8, merge: bool) -> Output {
     var full = sys.strs();
-    sys.push(&full, t.flint);
+    sys.push(&full, exe);
     for (argv) |a| { sys.push(&full, a); }
     let out = sys.full(sys.f("{s}/out", .{TMP}));
     let err = sys.full(sys.f("{s}/err", .{TMP}));
@@ -125,17 +141,73 @@ fn modules(t: *Runner) {
     }
 }
 
-// packages (flint.toml): run with arguments, and test
+// packages (flint.toml): run with arguments, and test. A package is built in its out/, and what's
+// there is used again: the second run finds the executable swapped for a script, and runs it.
 fn packages(t: *Runner) {
     for (sys.listDir("tests/packages", "")) |d| {
         let dir = sys.f("tests/packages/{s}", .{d});
         let name = sys.f("package/{s}", .{d});
         if (!fs.exists(sys.f("{s}/expected-run", .{dir})) || !wanted(t, name)) { continue; }
-        let run = flint(t, &[_][]const u8 { "run", "--", "x", "y" }, dir, true);
-        check(t, sys.f("{s} run", .{name}), sys.read(sys.f("{s}/expected-run", .{dir})), run.out);
-        let tst = flint(t, &[_][]const u8 { "test" }, dir, true);
+        let expected = sys.read(sys.f("{s}/expected-run", .{dir}));
+        _ = tool(t, &[_][]const u8 { "clean" }, dir, true);
+        let run = tool(t, &[_][]const u8 { "run", "--", "x", "y" }, dir, true);
+        check(t, sys.f("{s} run", .{name}), expected, run.out);
+        sys.write(sys.f("{s}/out/debug/{s}", .{dir, d}), "#!/bin/sh\necho not built again\n");
+        let again = tool(t, &[_][]const u8 { "run", "--", "x", "y" }, dir, true);
+        check(t, sys.f("{s} run again", .{name}), "not built again", again.out);
+        let release = tool(t, &[_][]const u8 { "run", "--release", "--", "x", "y" }, dir, true);
+        check(t, sys.f("{s} run --release", .{name}), expected, release.out);
+        let tst = tool(t, &[_][]const u8 { "test" }, dir, true);
         check(t, sys.f("{s} test", .{name}), sys.readOr(sys.f("{s}/expected-test", .{dir}), ""), tst.out);
+        let built = tool(t, &[_][]const u8 { "build", "--release" }, dir, true);
+        let exe = if (fs.exists(sys.f("{s}/out/release/{s}", .{dir, d}))) "out/release" else "nothing";
+        check(t, sys.f("{s} build --release", .{name}), "out/release", sys.f("{s}{s}", .{built.out, exe}));
+        _ = tool(t, &[_][]const u8 { "clean" }, dir, true);
+        check(t, sys.f("{s} clean", .{name}), "gone", if (fs.exists(sys.f("{s}/out", .{dir}))) "out/ is still there" else "gone");
     }
+}
+
+let REMOTE_MAIN: []const u8 = "import std.io;\nimport geometry;\n\nfn main() -> !void {\n    try io.print(\"area {}\\n\", .{ geometry.area(geometry.Rect { w: 5, h: 6 }) });\n}\n";
+
+fn remoteManifest(dir: []const u8, dep: []const u8) {
+    sys.write(sys.f("{s}/flint.toml", .{dir}), sys.f("[package]\nname = \"remote\"\n\n[dependencies]\ngeometry = {{ {s} }}\n", .{dep}));
+}
+
+// A dependency with a url: tests/packages/geometry, packed into an archive that a file:// url
+// names. The cache it's downloaded into is build/tmp/cache (FLINT_CACHE, set in run).
+fn remote(t: *Runner) {
+    let name = "package/remote";
+    if (!wanted(t, name)) { return; }
+    let dir = sys.f("{s}/remote", .{TMP});
+    sys.makeDirs(sys.f("{s}/src", .{dir}));
+    sys.write(sys.f("{s}/src/main.fl", .{dir}), REMOTE_MAIN);
+    let archive = sys.full(sys.f("{s}/geometry.tar.gz", .{TMP}));
+    sys.must(&[_][]const u8 { "tar", "-czf", archive, "-C", "tests/packages", "geometry" }, .{});
+    let sum = sys.f("{s}/sha", .{TMP});
+    sys.must(&[_][]const u8 { "shasum", "-a", "256", archive }, .{ out: sys.full(sum) });
+    let sha = sys.read(sum)[0..64];
+    let url = sys.f("file://{s}", .{archive});
+    let here = sys.f("{s}/", .{sys.full(dir)});
+
+    remoteManifest(dir, sys.f("url = \"{s}\"", .{url}));
+    let nohash = tool(t, &[_][]const u8 { "run" }, dir, true);
+    check(t, sys.f("{s} without a hash", .{name}),
+        "flint.toml:5: error: dependency 'geometry' needs the sha256 of its archive, so that it can't change unnoticed; what's at the url now has: sha256 = \"<sha>\"",
+        replaced(without(nohash.out, here), sha, "<sha>"));
+
+    let zeros = "0000000000000000000000000000000000000000000000000000000000000000";
+    remoteManifest(dir, sys.f("url = \"{s}\", sha256 = \"{s}\"", .{url, zeros}));
+    let wrong = tool(t, &[_][]const u8 { "run" }, dir, true);
+    check(t, sys.f("{s} with the wrong hash", .{name}),
+        "flint.toml:5: error: dependency 'geometry': <url> has the sha256 <sha>, not the one given here: it isn't the archive this package was written against",
+        replaced(replaced(without(wrong.out, here), sha, "<sha>"), url, "<url>"));
+
+    remoteManifest(dir, sys.f("url = \"{s}\", sha256 = \"{s}\"", .{url, sha}));
+    let fetched = tool(t, &[_][]const u8 { "fetch" }, dir, true);
+    check(t, sys.f("{s} fetch", .{name}), "(nothing) exit 0", sys.f("{s}(nothing) exit {}", .{fetched.out, fetched.code}));
+    fs.remove(archive) catch {}; // from here on it has to come from the cache
+    let run = tool(t, &[_][]const u8 { "run" }, dir, true);
+    check(t, sys.f("{s} run", .{name}), "area 30", run.out);
 }
 
 // flint test: the runner's report (stdout and stderr) and its exit code
@@ -167,46 +239,59 @@ fn errors(t: *Runner) {
     }
 }
 
-// s without any occurrence of `sub`
-fn without(s: []const u8, sub: []const u8) -> []const u8 {
+// s with every occurrence of `sub` replaced by `with`
+fn replaced(s: []const u8, sub: []const u8, with: []const u8) -> []const u8 {
     var out: []const u8 = "";
     var rest = s;
     while (mem.find(rest, sub)) |at| {
-        out = sys.f("{s}{s}", .{out, rest[0..at]});
+        out = sys.f("{s}{s}{s}", .{out, rest[0..at], with});
         rest = rest[at + sub.len..];
     }
     return sys.f("{s}{s}", .{out, rest});
 }
 
-// the command line: help, and the errors for a command line that's wrong. Compile errors name
-// files by their full path, so the path of tests/cli is taken out of the output.
-fn cli(t: *Runner) {
-    let here = sys.f("{s}/", .{sys.full("tests/cli")});
-    for (sys.listDir("tests/cli", "")) |d| {
-        let dir = sys.f("tests/cli/{s}", .{d});
-        let name = sys.f("cli/{s}", .{d});
+// s without any occurrence of `sub`
+fn without(s: []const u8, sub: []const u8) -> []const u8 { return replaced(s, sub, ""); }
+
+// the command line of flintc (kind: cli) or flint (kind: tool): help, and the errors for a
+// command line that's wrong. Compile errors name files by their full path, so the path of the
+// tests' directory is taken out of the output.
+fn cli(t: *Runner, kind: []const u8, exe: []const u8) {
+    let home = sys.f("tests/{s}", .{kind});
+    let here = sys.f("{s}/", .{sys.full(home)});
+    for (sys.listDir(home, "")) |d| {
+        let dir = sys.f("{s}/{s}", .{home, d});
+        let name = sys.f("{s}/{s}", .{kind, d});
         if (!sys.isDir(dir) || !wanted(t, name)) { continue; }
         var argv = sys.strs();
         var words = mem.split(sys.trimNl(sys.read(sys.f("{s}/args", .{dir}))), " ");
         while (words.next()) |w| { if (w.len > 0) { sys.push(&argv, w); } }
-        let r = flint(t, argv.items, "tests/cli", true);
+        let r = exec(t, exe, argv.items, home, true);
         check(t, name, sys.readOr(sys.f("{s}/expected", .{dir}), ""), sys.f("{s}\n--- exit {}", .{without(r.out, here), r.code}));
     }
 }
 
-// Runs every test whose name contains `filter` with the compiler at `compiler`; the exit status.
-pub fn run(compiler: []const u8, filter: []const u8) -> u8 {
+// Runs every test whose name contains `filter` with the compiler at `compiler` and the project
+// tool at `tool_path`; the exit status.
+pub fn run(compiler: []const u8, tool_path: []const u8, filter: []const u8) -> u8 {
     if (!fs.exists(compiler)) { sys.die(sys.f("there's no compiler at {s}", .{compiler})); }
-    var runner = Runner { flint: sys.full(compiler), filter: filter };
+    if (!fs.exists(tool_path)) { sys.die(sys.f("there's no project tool at {s}", .{tool_path})); }
+    var runner = Runner { flint: sys.full(compiler), tool: sys.full(tool_path), filter: filter };
     let t = &runner;
     sys.makeDirs(TMP);
+    // downloaded dependencies go here, not into the cache of whoever runs the tests
+    _ = setenv("FLINT_CACHE", mem.dupeZ(heap.c_allocator, sys.full(sys.f("{s}/cache", .{TMP}))) catch sys.die("out of memory"), 1);
+    // the tool calls the compiler under test, wherever each of them is
+    _ = setenv("FLINTC", mem.dupeZ(heap.c_allocator, t.flint) catch sys.die("out of memory"), 1);
     examples(t);
     cases(t);
     modules(t);
     packages(t);
+    remote(t);
     testblocks(t);
     errors(t);
-    cli(t);
+    cli(t, "cli", t.flint);
+    cli(t, "tool", t.tool);
     sys.must(&[_][]const u8 { "rm", "-rf", TMP }, .{});
     sys.say("{} passed, {} failed\n", .{t.pass, t.fail});
     if (t.pass + t.fail == 0) { sys.die(sys.f("no test's name contains '{s}'", .{filter})); }

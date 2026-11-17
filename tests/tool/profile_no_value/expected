@@ -1,0 +1,3 @@
+flint: error: '--profile' needs a value
+  hint: 'flint help build' shows how it's used
+--- exit 2

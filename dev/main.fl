@@ -15,7 +15,7 @@ import stages;
 import tests;
 import dist;
 
-let USAGE: []const u8 = "usage: ./x [command] [options]\n  build              stage 0 builds build/stage1/flint, which builds build/flint (the default)\n  test [filter]      builds, then runs the tests (only those whose name contains filter)\n  check              builds, then checks that build/flint rebuilds itself to the same assembly\n  ci                 build, check and test\n  dist               builds, then packs build/dist/flint-<version>-<arch>-<os>.tar.gz\n  install            builds, then installs flint into $DESTDIR$PREFIX/bin (PREFIX: /usr/local)\n  uninstall          removes it from there\n  clean              removes build/\noptions:\n  -O mode            the mode the compiler is built in: Debug, ReleaseSafe (default), ReleaseFast\n  --flint path       test: the compiler to test, instead of building build/flint\nstage 0 is the release pinned in bootstrap/release, or FLINT_BOOTSTRAP=path/to/flint\n";
+let USAGE: []const u8 = "usage: ./x [command] [options]\n  build              stage 0 builds build/stage1/flintc, which builds build/flintc (the compiler),\n                     which builds build/flint (the project tool); the default\n  test [filter]      builds, then runs the tests (only those whose name contains filter)\n  check              builds, then checks that build/flintc rebuilds itself to the same assembly\n  ci                 build, check and test\n  dist               builds, then packs build/dist/flint-<version>-<arch>-<os>.tar.gz\n  install            builds, then installs flintc and flint into $DESTDIR$PREFIX/bin (PREFIX: /usr/local)\n  uninstall          removes them from there\n  clean              removes build/\noptions:\n  -O mode            the mode the compiler is built in: Debug, ReleaseSafe (default), ReleaseFast\n  --flintc path      test: the compiler to test (and the flint next to it), instead of building them\nstage 0 is the release pinned in bootstrap/release, or FLINT_BOOTSTRAP=path/to/flint\n";
 
 fn usage(problem: []const u8) -> u8 {
     _ = io.eprint("{s}{s}", .{problem, USAGE}) catch {};
@@ -26,7 +26,8 @@ fn main() -> u8 {
     let argv = args();
     var cmd: []const u8 = "build";
     var mode: []const u8 = "ReleaseSafe";
-    var compiler: []const u8 = process.getEnv("FLINT") orelse "";
+    var compiler: []const u8 = process.getEnv("FLINTC") orelse "";
+    var tool: []const u8 = stages.FLINT;
     var filter: []const u8 = "";
     var i: usize = 1;
     if (argv.len > 1 && argv[1].len > 0 && argv[1][0] != '-') {
@@ -42,7 +43,7 @@ fn main() -> u8 {
             if (!sys.eq(mode, "Debug") && !sys.eq(mode, "ReleaseSafe") && !sys.eq(mode, "ReleaseFast")) {
                 return usage(sys.f("x: unknown build mode '{s}'\n", .{mode}));
             }
-        } else if (sys.eq(a, "--flint") && i + 1 < argv.len && is_test) {
+        } else if (sys.eq(a, "--flintc") && i + 1 < argv.len && is_test) {
             i += 1;
             compiler = argv[i];
         } else if (is_test && filter.len == 0 && a.len > 0 && a[0] != '-') {
@@ -58,14 +59,18 @@ fn main() -> u8 {
     } else if (is_test) {
         if (compiler.len == 0) {
             stages.build(mode, true);
-            compiler = stages.FLINT;
+            compiler = stages.FLINTC;
+        } else {
+            var n = compiler.len; // the flint next to that compiler
+            while (n > 0 && compiler[n - 1] != '/') { n -= 1; }
+            tool = sys.f("{s}flint", .{compiler[0..n]});
         }
-        status = tests.run(compiler, filter);
+        status = tests.run(compiler, tool, filter);
     } else if (sys.eq(cmd, "check")) {
         stages.check(mode);
     } else if (sys.eq(cmd, "ci")) {
         stages.check(mode);
-        status = tests.run(stages.FLINT, "");
+        status = tests.run(stages.FLINTC, stages.FLINT, "");
     } else if (sys.eq(cmd, "dist")) {
         stages.build(mode, true);
         dist.dist();

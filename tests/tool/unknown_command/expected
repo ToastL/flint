@@ -1,0 +1,3 @@
+flint: error: unknown command 'biuld'
+  hint: did you mean 'build'? ('flint help' lists the commands)
+--- exit 2

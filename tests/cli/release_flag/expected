@@ -1,0 +1,3 @@
+flintc: error: '--release' is an option of flint, the project tool: profiles are in flint.toml
+  hint: for a file, flintc has -O2 and --overflow=wrap
+--- exit 2

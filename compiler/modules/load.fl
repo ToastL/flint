@@ -1,7 +1,7 @@
 // modules.load - finding and reading modules: one file is one module (design.md section 4.10)
 //
 //   import std.io;      the standard library, compiled into the flint binary
-//   import geometry;    a dependency's root module (flint.toml [dependencies])
+//   import geometry;    another package's root module (--pkg and --dep on the command line)
 //   import geometry.x;  a file in that dependency
 //   import net.http;    <package root>/net/http.fl
 //
@@ -18,7 +18,7 @@ import syntax.parser;
 import syntax.parse_decl;
 import modules.unit;
 import cimport.header;
-import driver.manifest;
+import driver.cache;
 
 extern fn opendir(path: cstr) -> ?*void;
 extern fn readdir(d: *void) -> ?*Dirent;
@@ -116,7 +116,7 @@ fn stdUnit(l: *Loader, name: []const u8, tok: ?*token.Token) -> *unit.Unit {
 }
 
 fn fileUnit(l: *Loader, path: []const u8, file: []const u8, pkg: *unit.Package, tok: ?*token.Token, looked: []const u8) -> *unit.Unit {
-    let rp = manifest.real(file);
+    let rp = cache.real(file);
     if (findUnit(l, rp)) |u| { return u; }
     let src = readSource(file) orelse {
         if (tok) |t| { diag.at(t, text.f("can't find module '{s}' (looked for {s})", .{path, looked})); }
@@ -195,7 +195,7 @@ pub fn loadProgram(root_file: []const u8, pkg: *unit.Package, all_files: bool) -
     let base = if (slash) |s| root_file[s + 1..] else root_file;
     let dot = text.lastIndexOf(base, '.');
     let stem = if (dot) |d| base[0..d] else base;
-    let root = newUnit(l, stem, manifest.real(root_file), src, pkg, false);
+    let root = newUnit(l, stem, cache.real(root_file), src, pkg, false);
     root.is_root = true;
     root.prefix = "";
     root.dname = "";

@@ -1,0 +1,19 @@
+flint build: build the project's executable
+
+Usage:
+  flint build [options]
+
+  The executable is out/<profile>/<name>. What it was built from stays in out/ too, so
+  the next build only redoes what changed.
+
+Options:
+  --release            the 'release' profile: optimized
+  --profile=<name>     a profile of flint.toml; debug (the default) and release always exist
+  -v, --verbose        show the commands that are run (the C compiler, flintc)
+  --color=<when>       colored output: auto (default), always or never
+  -h, --help           show this help
+
+Examples:
+  flint build
+  flint build --release         (out/release/<name>)
+--- exit 0

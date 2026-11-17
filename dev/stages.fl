@@ -1,12 +1,16 @@
-// stages - building the compiler with itself.
+// stages - building the compiler with itself, and then the project tool with the compiler.
 //
 //   stage 0   a Flint compiler to start from (./x finds it: FLINT_BOOTSTRAP or the pinned release)
-//   stage 1   build/stage1/flint, built by stage 0
-//   stage 2   build/flint, built by stage 1: the compiler that's tested and installed
+//   stage 1   build/stage1/flintc, built by stage 0
+//   stage 2   build/flintc, built by stage 1: the compiler that's tested and installed
 //   stage 3   build/check/stage3, built by stage 2, only to check that it is a fixpoint
+//   flint     build/flint, the project tool, built by stage 2 from tool/ (the flint-tool
+//             repository, a git submodule)
 //
-// The compiler is an ordinary Flint package (compiler/flint.toml): each stage is `flint build`
-// in compiler/.
+// The compiler is the file compiler/main.fl and what it imports: each stage is
+// `flintc build main.fl` in compiler/. (The release pinned today is from before flint and flintc
+// were two programs: it builds compiler/ as a package, from compiler/flint.toml.) The tool is
+// tool/src/main.fl and what it imports, built the way its own build.sh does: one flintc call.
 
 import std.fs;
 import std.hash;
@@ -15,8 +19,9 @@ import std.mem;
 import std.process;
 import sys;
 
-pub let STAGE1: []const u8 = "build/stage1/flint";
-pub let FLINT: []const u8 = "build/flint";
+pub let STAGE1: []const u8 = "build/stage1/flintc";
+pub let FLINTC: []const u8 = "build/flintc"; // the compiler
+pub let FLINT: []const u8 = "build/flint";   // the project tool
 let INPUTS: []const u8 = "build/stage1/inputs.hash";
 let LOADER: []const u8 = "compiler/modules/load.fl";
 
@@ -24,9 +29,10 @@ fn stage0() -> []const u8 {
     return process.getEnv("FLINT_STAGE0") orelse sys.die("FLINT_STAGE0 isn't set: start this through ./x");
 }
 
-// `compiler <cmd>` with the flags for a build mode. Releases up to 0.7.0 take the mode's name
-// (`-O ReleaseSafe`); later compilers take -O0/-O2 and --overflow, and know `--version`, which is
-// how the two are told apart. Once bootstrap/release pins a newer release, the first form can go.
+// `compiler <cmd>` on the compiler's source, with the flags for a build mode. Releases up to
+// 0.7.0 take the mode's name (`-O ReleaseSafe`) and build the package they're run in; later
+// compilers take -O0/-O2 and --overflow and the file, and know `--version`, which is how the two
+// are told apart. Once bootstrap/release pins a newer release, the first form can go.
 fn command(compiler: []const u8, cmd: []const u8, mode: []const u8) -> list.ArrayList([]const u8) {
     var argv = sys.strs();
     sys.push(&argv, sys.full(compiler));
@@ -39,7 +45,25 @@ fn command(compiler: []const u8, cmd: []const u8, mode: []const u8) -> list.Arra
     }
     sys.push(&argv, if (sys.eq(mode, "Debug")) "-O0" else "-O2");
     if (sys.eq(mode, "ReleaseFast")) { sys.push(&argv, "--overflow=wrap"); }
+    sys.push(&argv, "main.fl");
     return argv;
+}
+
+// build/flint: tool/src/main.fl
+fn compileTool(mode: []const u8) {
+    if (!fs.exists("tool/src/main.fl")) {
+        sys.die("tool/ is empty: it's the flint-tool repository, a git submodule; get it with 'git submodule update --init'");
+    }
+    sys.say("{s} builds {s} ({s})\n", .{FLINTC, FLINT, mode});
+    var argv = sys.strs();
+    sys.push(&argv, sys.full(FLINTC));
+    sys.push(&argv, "build");
+    sys.push(&argv, if (sys.eq(mode, "Debug")) "-O0" else "-O2");
+    if (sys.eq(mode, "ReleaseFast")) { sys.push(&argv, "--overflow=wrap"); }
+    sys.push(&argv, "src/main.fl");
+    sys.push(&argv, "-o");
+    sys.push(&argv, sys.full(FLINT));
+    if (sys.spawn(argv.items, .{ cwd: "tool" }) != 0) { sys.die(sys.f("building {s} failed", .{FLINT})); }
 }
 
 fn compile(compiler: []const u8, mode: []const u8, out: []const u8) {
@@ -62,28 +86,31 @@ fn checkStdList() {
 
 fn mix(h: u64, bytes: []const u8) -> u64 { return hash.int(h ^ hash.bytes(bytes)); }
 
-// what build/flint is made from: stage 0, the mode, and the contents of every source file
+// what build/flintc and build/flint are made from: stage 0, the mode, and the contents of every
+// source file
 fn fingerprint(mode: []const u8) -> []const u8 {
     var h = mix(mix(0, stage0()), mode);
     h = mix(h, sys.read("VERSION"));
     h = mix(h, sys.read("compiler/flint.toml"));
     for (sys.walk("compiler", ".fl")) |file| { h = mix(mix(h, file), sys.read(file)); }
+    for (sys.walk("tool", ".fl")) |file| { h = mix(mix(h, file), sys.read(file)); }
     for (sys.walk("std", ".fl")) |file| { h = mix(mix(h, file), sys.read(file)); }
     return sys.f("{}\n", .{h});
 }
 
-// Builds build/flint, unless it was already built from exactly these sources.
+// Builds build/flintc and build/flint, unless they were already built from exactly these sources.
 pub fn build(mode: []const u8, quiet: bool) {
     checkStdList();
     let fp = fingerprint(mode);
-    if (fs.exists(STAGE1) && fs.exists(FLINT) && sys.eq(sys.readOr(INPUTS, ""), fp)) {
-        if (!quiet) { sys.say("{s} is up to date\n", .{FLINT}); }
+    if (fs.exists(STAGE1) && fs.exists(FLINTC) && fs.exists(FLINT) && sys.eq(sys.readOr(INPUTS, ""), fp)) {
+        if (!quiet) { sys.say("{s} and {s} are up to date\n", .{FLINTC, FLINT}); }
         return;
     }
     sys.makeDirs("build/stage1");
     fs.remove(INPUTS) catch {};
     compile(stage0(), mode, STAGE1);
-    compile(STAGE1, mode, FLINT);
+    compile(STAGE1, mode, FLINTC);
+    compileTool(mode);
     sys.write(INPUTS, fp);
 }
 
@@ -99,9 +126,9 @@ fn asmOf(compiler: []const u8, mode: []const u8, out: []const u8) -> []const u8 
 pub fn check(mode: []const u8) {
     build(mode, true);
     sys.makeDirs("build/check");
-    compile(FLINT, mode, "build/check/stage3");
-    let a = asmOf(FLINT, mode, "build/check/stage2.s");
+    compile(FLINTC, mode, "build/check/stage3");
+    let a = asmOf(FLINTC, mode, "build/check/stage2.s");
     let b = asmOf("build/check/stage3", mode, "build/check/stage3.s");
     if (!sys.eq(a, b)) { sys.die("not a fixpoint: build/check/stage2.s and build/check/stage3.s differ"); }
-    sys.say("fixpoint: build/flint and build/check/stage3 produce the same compiler\n", .{});
+    sys.say("fixpoint: build/flintc and build/check/stage3 produce the same compiler\n", .{});
 }

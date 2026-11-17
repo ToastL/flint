@@ -1,0 +1,27 @@
+flint 0.7.0: builds Flint projects
+
+Usage:
+  flint <command> [options]
+
+Commands:
+  init      start a new project
+  build     build the project's executable
+  run       build the project and run it
+  test      run the project's `test` blocks
+  check     report compile errors without building
+  fetch     download the project's dependencies
+  clean     remove the project's build output
+  help      show this overview, or a command's help
+  version   print flint's version
+
+Options:
+  --release            the 'release' profile: optimized
+  --profile=<name>     a profile of flint.toml; debug (the default) and release always exist
+  -v, --verbose        show the commands that are run (the C compiler, flintc)
+  --color=<when>       colored output: auto (default), always or never
+  -h, --help           show this help
+
+A project is a directory with a flint.toml: its name, dependencies, C sources and build
+profiles. flint reads it and calls the compiler, flintc; for one file, use flintc itself.
+'flint help <command>' has the details and examples.
+--- exit 0

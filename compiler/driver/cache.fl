@@ -1,0 +1,70 @@
+// driver.cache - the directory `flintc --cache <dir>` keeps its work in, and knowing when what's
+// in it can be used again:
+//
+//   prog.s  prog.o  prog.key    the program; key: the hash of its assembly
+//   link.key                    what the executable was linked from
+//
+// There are no timestamps here: a step's key is a hash of everything that goes into it, kept
+// next to its output, and the step is skipped when the key it would write is already there.
+// (flint, the project tool, gives each project's build such a directory in its out/.)
+
+import std.fs;
+import std.hash;
+import std.heap;
+import base.alloc;
+import base.text;
+
+extern fn opendir(path: cstr) -> ?*void;
+extern fn closedir(d: *void) -> i32;
+
+// ---- files and directories ----
+
+// the absolute path, or p itself if it doesn't exist
+pub fn real(p: []const u8) -> []const u8 {
+    var buf: [1024]u8 = undefined;
+    let r = fs.realPath(p, buf[..]) catch return p;
+    return alloc.dupe(u8, r);
+}
+
+fn isDir(path: []const u8) -> bool {
+    let d = opendir(text.z(path)) orelse return false;
+    _ = closedir(d);
+    return true;
+}
+
+// creates the directory and the ones above it; false if it isn't there afterwards
+pub fn makeDirs(path: []const u8) -> bool {
+    for (1..path.len) |i| {
+        if (path[i] == '/') { fs.makeDir(path[0..i]) catch {}; }
+    }
+    fs.makeDir(path) catch {};
+    return isDir(path);
+}
+
+// ---- keys ----
+
+pub fn mix(h: u64, bytes: []const u8) -> u64 { return hash.int(h ^ hash.bytes(bytes)); }
+
+pub fn hex(h: u64) -> []const u8 { return text.f("{x}", .{h}); }
+
+// the key of a file's contents ("" if it can't be read)
+pub fn ofFile(path: []const u8) -> []const u8 {
+    let bytes = fs.readFile(heap.c_allocator, path) catch return "";
+    return hex(hash.bytes(bytes));
+}
+
+// the key of a list of strings (a command line)
+pub fn ofStrings(xs: []const []const u8) -> u64 {
+    var h: u64 = 0;
+    for (xs) |x| { h = mix(h, x); }
+    return h;
+}
+
+// the key written at path ("" if there's none)
+pub fn read(path: []const u8) -> []const u8 {
+    return fs.readFile(heap.c_allocator, path) catch return "";
+}
+
+pub fn write(path: []const u8, key: []const u8) {
+    fs.writeFile(path, key) catch {};
+}

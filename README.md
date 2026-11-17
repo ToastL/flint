@@ -41,30 +41,83 @@ fn main() -> !void {
 }
 ```
 
+There are two programs. **`flintc`** is the compiler: it compiles the file it's given, and the modules that file imports. **`flint`** is the project tool: it creates projects, downloads what they depend on, and builds them by calling `flintc`.
+
 ```sh
-./x                                   # builds build/flint (macOS on Apple Silicon); see "Building" below
-./build/flint run   examples/tour.fl
-./build/flint build examples/tour.fl -o tour
-./build/flint build -O2 examples/tour.fl             # optimized; -O0 (the default) isn't
-./build/flint build -O2 --overflow=wrap examples/tour.fl  # integer overflow wraps instead of trapping
-./build/flint check examples/tour.fl  # compile errors only: nothing is built
-./build/flint asm   examples/tour.fl  # the generated ARM64 assembly
-./build/flint ir    examples/tour.fl  # the IR (optimized with -O2)
-./build/flint test  file.fl           # runs its `test "name" { ... }` blocks
-./build/flint help  build             # every command has its own help; `flint help` lists them
-./x test
-./x install                           # PREFIX=/usr/local by default; also DESTDIR, ./x uninstall
+./x                                    # builds build/flintc and build/flint (macOS on Apple Silicon); see "Building" below
+./x install                            # both, into PREFIX=/usr/local by default; also DESTDIR, ./x uninstall
+
+flintc run   examples/tour.fl          # compile and run one file
+flintc build examples/tour.fl -o tour
+flintc build -O2 examples/tour.fl                  # optimized; -O0 (the default) isn't
+flintc build -O2 --overflow=wrap examples/tour.fl  # integer overflow wraps instead of trapping
+flintc check examples/tour.fl          # compile errors only: nothing is built
+flintc asm   examples/tour.fl          # the generated ARM64 assembly
+flintc ir    examples/tour.fl          # the IR (optimized with -O2)
+flintc test  file.fl                   # runs its `test "name" { ... }` blocks
+
+flint init hello                       # a new project: hello/flint.toml and hello/src/main.fl
+flint run -- args                      # in a project: build it and run it
+flint build --release                  # out/release/<name>
+flint test                             # every `test` block in the project
+flint check
+flint fetch                            # download its dependencies ahead of time
+flint clean                            # remove out/
 ```
+
+Both have `help` and `help <command>`.
+
+## flintc: one file
 
 Two flags replace build modes. `-O0` (the default) doesn't optimize and keeps the debugging aids: undefined memory is filled with 0xAA and `@assume` is checked. `-O2` optimizes. `--overflow=trap` (the default) makes integer overflow a panic; `--overflow=wrap` makes it wrap. Bounds, null, cast and division checks are always on: only `unsafe` removes them.
 
-A package is a directory with a `flint.toml` (name, path dependencies, C sources to build and libraries to link). `flint init name` starts one. Inside it, `flint build`, `flint run -- args`, `flint test` and `flint check` need no file name, and `flint clean` removes what `flint build` made; see `tests/packages/app`.
+`flintc` knows nothing of `flint.toml`, dependencies or profiles. What a project needs is given to it as options, which is what `flint` does (`flint build --verbose` shows the command), and they work by hand too:
+
+```sh
+flintc build src/main.fl -o app \
+    --pkg geometry=../geometry/src/geometry.fl   # a package, and its root file
+    --dep geometry=geometry                      # the program imports it as `geometry`
+    --dep geometry:units=units                   # ... and package geometry imports package units
+    --include c                                  # where the C headers it imports are
+    --object fastmath.o --lib m                  # linked with the program
+    --cache out/cache                            # keep the work there; redo only what changed
+```
+
+## flint: a project
+
+A project is a directory with a `flint.toml`; see `tests/packages/app`.
+
+```toml
+[package]
+name = "app"
+version = "0.1.0"
+root = "src/main.fl"                 # the default
+
+[dependencies]
+geometry = { path = "../geometry" }
+json = { url = "https://example.com/json-1.2.0.tar.gz", sha256 = "9f2c..." }
+
+[c]                                  # C code in the package, built with the C compiler
+sources = ["c/fastmath.c"]
+include = ["c"]
+flags = ["-Wall"]
+link = ["m"]
+
+[profile.release]                    # build settings: flint build --release
+overflow = "wrap"
+c-flags = ["-march=native"]
+```
+
+- **Profiles** are named build settings: `optimize` (`-O2`), `overflow` (`"trap"` or `"wrap"`) and `c-flags`. `debug` (the default) and `release` (optimized) exist without being written; `[profile.<name>]` changes one or makes a new one, and `--release` or `--profile=<name>` picks it. Only the profiles of the project being built count, not its dependencies'.
+- **Dependencies** are a `path`, or a `url` with the `sha256` of the archive there (anything `tar` unpacks). The archive is downloaded once into `$FLINT_CACHE` (`~/.cache/flint` by default), checked against the hash and found there from then on; `flint fetch` does that ahead of time. The hash is what pins the dependency, so there's no lock file. Leave it out and flint tells you the hash of what the url has now. There's no `flint add` yet: a dependency is added by writing it in `flint.toml`.
+- **`out/`** is where a project is built: the executable is `out/<profile>/<name>`, and what it was made from stays in `out/<profile>/cache/`. Each step (each C source, assembling, linking) is skipped when its inputs, including the headers a C source includes, are the ones it last ran with. `flint clean` removes `out/`.
+- flint finds the compiler as `$FLINTC`, or the `flintc` next to itself, or the one in `PATH`.
 
 A command line that's wrong gets one line saying what's wrong and a hint (`unknown command 'biuld'`, `did you mean 'build'?`). Errors and help are colored on a terminal; `--color=always|never` or `NO_COLOR` decides otherwise.
 
 ## Status
 
-Version 0.7.0 implements the design's milestones 1–7: the type system (tagged unions, optionals, error unions, arrays, slices, tuples, packed structs), the safety model (overflow, bounds, null and cast checks), allocators and checked formatting with no hidden allocation, modules and packages, C header import, `flint test`, comptime and generics, SIMD vectors, inline assembly (`asm { }`), and a compiler written in Flint that builds itself. [CHANGELOG.md](CHANGELOG.md) lists everything in detail; [TODO.md](TODO.md) has what's left (register returns, more backends, known gaps).
+Version 0.7.0 implements the design's milestones 1–7: the type system (tagged unions, optionals, error unions, arrays, slices, tuples, packed structs), the safety model (overflow, bounds, null and cast checks), allocators and checked formatting with no hidden allocation, modules and packages, C header import, `test` blocks, comptime and generics, SIMD vectors, inline assembly (`asm { }`), and a compiler written in Flint that builds itself. [CHANGELOG.md](CHANGELOG.md) lists everything in detail; [TODO.md](TODO.md) has what's left (register returns, more backends, known gaps).
 
 ## How it compiles
 
@@ -85,17 +138,17 @@ source ─syntax/─▶ syntax tree ─sema/─▶ IR ─opt/─▶ optimized IR
   - computes repeated values once and removes redundant bounds checks
   - removes dead code
 - **arm64/** allocates registers with linear scan and emits Mach-O assembly.
-- **driver/** is the command line, `flint.toml`, and the calls to `as` and `cc`.
-- **std/** is the standard library, written in Flint and compiled into the `flint` binary. Only the parts you use end up in your program. **std/rt.fl** is the runtime: the program entry point, panics and output.
+- **driver/** is `flintc`'s command line and the last steps: the calls to `as` and `cc`, and the cache (`--cache`) that skips them.
+- **std/** is the standard library, written in Flint and compiled into the `flintc` binary. Only the parts you use end up in your program. **std/rt.fl** is the runtime: the program entry point, panics and output.
 
 ## Building
 
 The compiler builds itself, so it needs a Flint compiler to start from:
 
 ```sh
-./x                                      # stage 0 builds build/stage1/flint, which builds build/flint
-FLINT_BOOTSTRAP=path/to/flint ./x        # start from another flint instead
-./x check                                # build/flint rebuilds itself to the same assembly
+./x                                      # stage 0 builds build/stage1/flintc, which builds build/flintc, which builds build/flint
+FLINT_BOOTSTRAP=path/to/flintc ./x       # start from another compiler instead
+./x check                                # build/flintc rebuilds itself to the same assembly
 ./x test [filter]                        # the tests (only those whose name contains filter)
 ./x dist                                 # build/dist/flint-<version>-<arch>-<os>.tar.gz and its sha256
 ./x ci                                   # build, check and test: what CI runs
@@ -104,25 +157,29 @@ FLINT_BOOTSTRAP=path/to/flint ./x        # start from another flint instead
 
 `-O Debug|ReleaseSafe|ReleaseFast` picks the mode the compiler is built in (ReleaseSafe by default). `./x help` lists everything.
 
-The build is a Flint program too: `dev/`. `./x` is a few lines of shell that find stage 0 and run `dev/main.fl` with it. A build is skipped when `build/flint` was already made from the same sources (their contents are hashed, so timestamps don't matter). Everything it makes is in `build/`:
+The build is a Flint program too: `dev/`. `./x` is a few lines of shell that find stage 0 and run `dev/main.fl` with it. A build is skipped when `build/flintc` and `build/flint` were already made from the same sources (their contents are hashed, so timestamps don't matter). Everything it makes is in `build/`:
 
 ```
-build/flint             the compiler
+build/flintc            the compiler
+build/flint             the project tool, built by build/flintc
 build/stage0/<version>  the pinned release
-build/stage1/flint      the compiler built by stage 0
+build/stage1/flintc     the compiler built by stage 0
 build/check/            ./x check: stage 3 and both assembly files
 build/dist/             ./x dist: the release
 ```
 
-Stage 0 is the release pinned in `bootstrap/release`: `./x` downloads it once and checks its sha256. The compiler is an ordinary Flint package (`compiler/flint.toml`), so each stage is just `flint build` in `compiler/`. Its own source, and `dev/`, may use what the pinned release supports; to use a new language feature in the compiler itself, publish a release with it and pin that one.
+Stage 0 is the release pinned in `bootstrap/release`: `./x` downloads it once and checks its sha256. Each stage is `flintc build main.fl` in `compiler/`. The release pinned today (0.7.0) is from before `flint` and `flintc` were two programs: it is one `flint` that builds `compiler/` as a package, which is why `compiler/flint.toml` has to stay something that release can read (no `[profile.<name>]`). The compiler's source, and `dev/`, may use what the pinned release supports, including its standard library; to use a new language feature in the compiler itself, publish a release with it and pin that one.
+
+The project tool is its own repository, [flint-tool](https://github.com/fl1nt-lang/flint-tool), included here as a git submodule at `tool/` (the way Rust includes Cargo). `./x` fetches it if it's missing (or `git clone --recurse-submodules`), builds it last with the new compiler, ships it in the release next to `flintc`, and runs its tests with the others. It uses `flintc` only through its command line, so it shares no code with `compiler/`. To change both in one go, change `tool/` (commit and push there), then commit the new `tool/` here so the two stay in step.
 
 ## Layout
 
-- `compiler/` holds the compiler (in Flint), one directory per stage
+- `compiler/` holds the compiler, `flintc` (in Flint), one directory per stage
+- `tool/` is the project tool, `flint`: the flint-tool repository, as a git submodule
 - `std/` holds the standard library (one module per file), including the runtime `rt.fl`
 - `bootstrap/release` pins the release that builds the compiler
 - `x` and `dev/` are the build: the launcher, and the build tool it runs (in Flint)
 - `docs/design.md` is the language spec
 - `examples/` has example programs, next to their expected output
-- `tests/` has output tests (run unoptimized, optimized, and optimized with wrapping overflow), compile-error tests, multi-file module tests, `flint test` tests (`testblocks/`), command-line tests (`cli/`) and sample packages; `./x test` runs them all
+- `tests/` has output tests (run unoptimized, optimized, and optimized with wrapping overflow), compile-error tests, multi-file module tests, `test`-block tests (`testblocks/`), command-line tests (`cli/` for `flintc`, `tool/` for `flint`) and sample projects (`packages/`); `./x test` runs them all
 - `CHANGELOG.md` is what each release added; `TODO.md` is what's left

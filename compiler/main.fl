@@ -1,4 +1,4 @@
-// The `flint` command: the self-hosted Flint compiler.
+// The `flintc` command: the self-hosted Flint compiler. (`flint`, the project tool, is tool/.)
 //
 // Layout (each directory is one stage; see its files' header comments):
 //   base/     memory, strings, compile errors
@@ -10,7 +10,7 @@
 //   interp/   running IR at compile time (comptime)
 //   opt/      IR optimizations
 //   arm64/    IR -> ARM64 assembly
-//   driver/   the command line, flint.toml, assembling and linking
+//   driver/   the command line, assembling and linking, and the build cache
 
 import std.io;
 import driver.cli;

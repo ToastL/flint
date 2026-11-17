@@ -1,3 +1,3 @@
-flint: error: unexpected argument 'bad.fl'
-  hint: 'flint build' takes one file (ok.fl); the modules it imports are found by themselves
+flintc: error: unexpected argument 'bad.fl'
+  hint: 'flintc build' takes one file (ok.fl); the modules it imports are found by themselves
 --- exit 2

@@ -1,3 +1,3 @@
-flint: error: unknown command 'biuld'
-  hint: did you mean 'build'? ('flint help' lists the commands)
+flintc: error: unknown command 'biuld'
+  hint: did you mean 'build'? ('flintc help' lists the commands)
 --- exit 2

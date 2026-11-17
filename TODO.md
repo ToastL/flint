@@ -40,7 +40,10 @@ What's left to build, plus the known gaps in what exists. What's already done is
 - [ ] The prelude's `io.stdout`/`heap.c_allocator` have a zero `ctx`, though `*void` promises non-null (it's never dereferenced)
 - [ ] Allocator vtable calls aren't inlined, so `ArrayList.append` costs an indirect call when it grows
 - [ ] Calls to C can't pass or return structs by value (C returns small structs in registers); such imported functions are rejected, and so is an `extern fn` that returns a struct
-- [ ] `flint.toml` dependencies are local paths only; fetching by URL plus hash isn't there yet
+- [ ] `flint add` / `flint install`: adding a dependency means writing it in `flint.toml` by hand
+- [ ] A package builds one executable; `flint.toml` has no way to name several (or a library with examples)
+- [ ] A project's build skips C compiles, assembling and linking when nothing changed, but `flintc` always compiles the Flint source again
+- [ ] Downloaded dependencies are archives at a url; there's no git checkout, and no version resolution
 - [ ] C import doesn't translate function-like macros, `static inline` functions, bit fields (the struct becomes opaque), anonymous struct members, or Objective-C blocks
 - [ ] Assigning to a typed global from arithmetic on typed constants (`let b: P = .{ x: N * 2 }`) isn't folded, so it's rejected as non-constant (`comptime` works around it)
 - [ ] A literal of a type held in a local `let` needs `.{ }`: `let h: T = .{ ... };` works, `T { ... }` doesn't parse (the parser can't know `T` is a type)
@@ -62,4 +65,3 @@ See §8 of the design. Still undecided:
 - whether `let n = 42;` should make a compile-time constant
 - the automatic `&` in method calls
 - semicolons
-- declarative vs scripted build files

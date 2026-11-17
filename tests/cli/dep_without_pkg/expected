@@ -1,0 +1,3 @@
+flintc: error: '--dep geo=geometry': no --pkg names the package 'geometry'
+  hint: --pkg geometry=<its root file>
+--- exit 2

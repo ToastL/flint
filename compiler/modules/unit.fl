@@ -33,15 +33,13 @@ pub struct Dep {
     pkg: *Package,
 }
 
-// a package: a directory with a flint.toml (or, without one, the root file's directory)
+// A package, as the compiler sees one: a root file, the directory its modules are found from, and
+// the packages it may import. The program being compiled is one; the others are named on the
+// command line (--pkg, --dep), usually by `flint`, which reads them from flint.toml.
 pub struct Package {
     name: []const u8,
-    dir: []const u8,     // the manifest's directory
     root: []const u8,    // the root source file
     rootdir: []const u8, // module paths are resolved from here: the root file's directory
     deps: alloc.Vec(Dep),
-    csrc: alloc.Vec([]const u8),
-    cinc: alloc.Vec([]const u8),
-    cflags: alloc.Vec([]const u8),
-    clink: alloc.Vec([]const u8),
+    cinc: alloc.Vec([]const u8), // where its C headers are looked for (--include)
 }

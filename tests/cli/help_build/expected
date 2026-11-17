@@ -1,10 +1,10 @@
-flint build: compile to a native executable
+flintc build: compile to a native executable
 
 Usage:
-  flint build [options] [file.fl]
+  flintc build [options] file.fl
 
-  The executable is named after the file (hello.fl makes ./hello); a package's is
-  out/<name>. -o writes it somewhere else.
+  The executable is named after the file (hello.fl makes ./hello); -o writes it
+  somewhere else. --test builds the program that 'flintc test' would run.
 
 Options:
   -O0, -O2             no optimization, with debugging aids (default); or optimized
@@ -15,8 +15,17 @@ Options:
 
   Bounds, null, cast and division checks are always on: only 'unsafe' removes them.
 
+For a project (what 'flint' passes):
+  --pkg <name>=<root.fl>       a package that can be imported, and its root file
+  --dep [<pkg>:]<as>=<name>    package <pkg> (without it: the program) imports <name> as <as>
+  --include [<pkg>:]<dir>      where the C headers that <pkg> (or the program) imports are
+  --object <file.o>            an object to link with the program
+  --lib <name>                 a library to link with it (-l<name>)
+  --cache <dir>                keep what's built there, and redo only what changed
+  --test                       build the program that runs the `test` blocks
+  --all-files                  the tests of every .fl file under the file's directory too
+
 Examples:
-  flint build hello.fl
-  flint build -O2 hello.fl -o bin/hello
-  flint build -O2 --overflow=wrap   (in a package)
+  flintc build hello.fl
+  flintc build -O2 hello.fl -o bin/hello
 --- exit 0

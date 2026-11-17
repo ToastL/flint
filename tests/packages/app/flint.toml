@@ -10,3 +10,8 @@ geometry = { path = "../geometry" }
 sources = ["c/fastmath.c"]
 include = ["c"]
 link = ["m"]
+
+# `flint build --release`: the built-in release profile (-O2), changed here
+[profile.release]
+overflow = "wrap"
+c-flags = ["-fno-math-errno"]

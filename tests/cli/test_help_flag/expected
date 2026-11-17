@@ -1,11 +1,11 @@
-flint test: run `test` blocks
+flintc test: run `test` blocks
 
 Usage:
-  flint test [options] [file.fl]
+  flintc test [options] file.fl
 
-  Runs every `test "name" { ... }` block of the file and of the modules it imports; in a
-  package, of every .fl file. Each test runs in its own process, so a panic fails only
-  that test. The exit status is 1 when a test failed.
+  Runs every `test "name" { ... }` block of the file and of the modules it imports
+  (--all-files: of every .fl file under its directory). Each test runs in its own process,
+  so a panic fails only that test. The exit status is 1 when a test failed.
 
 Options:
   -O0, -O2             no optimization, with debugging aids (default); or optimized
@@ -15,7 +15,15 @@ Options:
 
   Bounds, null, cast and division checks are always on: only 'unsafe' removes them.
 
+For a project (what 'flint' passes):
+  --pkg <name>=<root.fl>       a package that can be imported, and its root file
+  --dep [<pkg>:]<as>=<name>    package <pkg> (without it: the program) imports <name> as <as>
+  --include [<pkg>:]<dir>      where the C headers that <pkg> (or the program) imports are
+  --object <file.o>            an object to link with the program
+  --lib <name>                 a library to link with it (-l<name>)
+  --cache <dir>                keep what's built there, and redo only what changed
+  --all-files                  the tests of every .fl file under the file's directory too
+
 Examples:
-  flint test parser.fl
-  flint test                    (in a package)
+  flintc test parser.fl
 --- exit 0
