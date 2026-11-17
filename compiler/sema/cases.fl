@@ -1,5 +1,11 @@
-// sema.cases - `switch`: a chain of compares (a range is one unsigned compare), then the case
-// bodies. Exhaustiveness is checked here: a missing enum variant, error or integer is an error.
+// sema.cases - `switch`: a chain of compares (a range is one unsigned compare), or for dense cases
+// a jump table, then the case bodies. Exhaustiveness is checked here: a missing enum variant,
+// error or integer is an error.
+//
+// The compare chain is always built first (checking the patterns as it goes), in blocks of its
+// own. When the cases turn out dense, the chain is dropped and the switch becomes: subtract the
+// smallest case, one unsigned compare against the span (out of range: what the chain did when
+// nothing matched), and an ir Switch on the difference.
 
 import base.alloc;
 import base.text;
@@ -24,6 +30,42 @@ struct Interval {
 }
 
 fn key(v: i64, signed: bool) -> u64 { return if (signed) @bitcast(u64, v) ^ 0x8000000000000000 else @bitcast(u64, v); }
+fn unkey(k: u64, signed: bool) -> i64 { return @bitcast(i64, if (signed) k ^ 0x8000000000000000 else k); }
+
+// one pattern of the switch, in key order: values lo..=hi go to the case body of arm
+struct Case {
+    lo: u64,
+    hi: u64,
+    arm: usize,
+}
+
+// jump tables: at least this many patterns, at most this many entries, and at least 40% of the
+// entries going somewhere other than "nothing matched"
+let JT_MIN_CASES: usize = 4;
+let JT_MAX_SPAN: u64 = 1024;
+
+// the jump table for the cases, if they're dense enough: the target of each value from the
+// smallest case on (nomatch where no case has it)
+fn jumpTable(cases: []const Case, body: []const i32, nomatch: i32) -> ?[]i32 {
+    if (cases.len < JT_MIN_CASES) { return null; }
+    var kmin = cases[0].lo;
+    var kmax = cases[0].hi;
+    for (cases) |*c| {
+        if (c.lo < kmin) { kmin = c.lo; }
+        if (c.hi > kmax) { kmax = c.hi; }
+    }
+    if (kmax - kmin >= JT_MAX_SPAN) { return null; }
+    let span = (kmax - kmin + 1) as usize;
+    var covered: u64 = 0;
+    for (cases) |*c| { covered += c.hi - c.lo + 1; }
+    if (covered * 10 < span as u64 * 4) { return null; }
+    let t = alloc.make(i32, span);
+    for (0..span) |k| { t[k] = nomatch; }
+    for (cases) |*c| {
+        for ((c.lo - kmin) as usize..(c.hi - kmin) as usize + 1) |k| { t[k] = body[c.arm]; }
+    }
+    return t;
+}
 
 fn keyStr(k: u64, signed: bool) -> []const u8 {
     if (signed) { return text.f("{}", .{@bitcast(i64, k ^ 0x8000000000000000)}); }
@@ -55,6 +97,12 @@ pub fn lowerSwitch(n: *ast.Node, want: ?*ty.Type) -> b.Val {
     var ivs: alloc.Vec(Interval) = .{};
     var else_arm: ?usize = null;
     for (0..narms) |i| { body[i] = b.newBlock(); }
+    // the compare chain gets blocks of its own, so a jump table can replace it
+    let head = st.c().blk;
+    var chain: alloc.Vec(i32) = .{};
+    var cases: alloc.Vec(Case) = .{};
+    chain.push(b.newBlock());
+    b.setBlk(chain.items[0]);
     for (0..narms) |i| {
         let arm = n.at(i);
         for (arm.list.items) |p| {
@@ -75,6 +123,7 @@ pub fn lowerSwitch(n: *ast.Node, want: ?*ty.Type) -> b.Val {
                         covered[k] = true;
                     }
                 }
+                cases.push(Case { lo: key(code as i64, sg), hi: key(code as i64, sg), arm: i });
                 b.br(b.R(b.cmp(.EQ, tag, b.IMM(code as i64))), body[i], nt);
             } else if (p.flag == 2) { // .Tag
                 if (!is_enum) { diag.at(p.tok, text.f("'.{s}' patterns need an enum, but this switch is on {s}", .{p.name, ty.tname(stt)})); }
@@ -84,6 +133,7 @@ pub fn lowerSwitch(n: *ast.Node, want: ?*ty.Type) -> b.Val {
                 let vr = &stt.variants.items[ki];
                 if (covered[ki]) { diag.at(p.tok, text.f("{s}.{s} is already handled by an earlier case", .{stt.name, vr.name})); }
                 covered[ki] = true;
+                cases.push(Case { lo: key(vr.value, sg), hi: key(vr.value, sg), arm: i });
                 b.br(b.R(b.cmp(.EQ, tag, b.IMM(vr.value))), body[i], nt);
             } else { // value, or lo..=hi
                 var lo = expr.expr(p.a.?, stt);
@@ -121,6 +171,7 @@ pub fn lowerSwitch(n: *ast.Node, want: ?*ty.Type) -> b.Val {
                     }
                     ivs.push(Interval { lo: wl, hi: wh });
                 }
+                cases.push(Case { lo: wl, hi: wh, arm: i });
                 if (wl == wh) {
                     b.br(b.R(b.cmp(.EQ, tag, b.IMM(lo.ival))), body[i], nt);
                 } else { // lo <= x <= hi  as one unsigned compare: (x - lo) <= (hi - lo)
@@ -129,9 +180,11 @@ pub fn lowerSwitch(n: *ast.Node, want: ?*ty.Type) -> b.Val {
                 }
             }
             b.setBlk(nt);
+            chain.push(nt);
         }
     }
     // nothing matched
+    let nomatch = st.c().blk;
     if (else_arm) |ea| {
         b.jmp(body[ea]);
     } else if (is_err) {
@@ -199,6 +252,22 @@ pub fn lowerSwitch(n: *ast.Node, want: ?*ty.Type) -> b.Val {
             diag.at(n.tok, text.f("switch on {s} doesn't handle every value ({s} is missing); add an 'else' case", .{ty.tname(stt), shown}));
         }
         b.trap();
+    }
+    // into the compare chain, or a jump table in its place
+    b.setBlk(head);
+    let table = if (stt == ty.bool_) null else jumpTable(cases.items, body, nomatch);
+    if (table) |t| {
+        for (chain.items) |c| { if (c != nomatch) { b.killBlock(c); } }
+        var kmin = cases.items[0].lo;
+        for (cases.items) |*c| { if (c.lo < kmin) { kmin = c.lo; } }
+        let lo = unkey(kmin, sg);
+        let d = if (lo == 0) tag else b.R(b.op2(.Sub, .I, tag, b.IMM(lo)));
+        let tb = b.newBlock();
+        b.br(b.R(b.cmp(.LS, d, b.IMM(t.len as i64 - 1))), tb, nomatch);
+        b.setBlk(tb);
+        b.switchTo(d, t);
+    } else {
+        b.jmp(chain.items[0]);
     }
     // case bodies
     let join = b.newBlock();

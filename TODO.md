@@ -6,17 +6,17 @@ What's left to build, plus the known gaps in what exists. What's already done is
 ## Backend and performance
 
 - [ ] The self-hosted compiler never frees memory (one process-wide heap); fine for one compile, but it could use arenas per function
-- [ ] The linker's UUID makes two builds' binaries differ in a few header bytes (the assembly is identical)
+- [x] The linker's UUID makes two builds' binaries differ in a few header bytes (the assembly is identical). The linker named the code signature after the output file; programs are now linked under their own name and moved, so the same source gives the same bytes (`./x check` compares the files too)
 
+- [x] Leaf functions without a frame (a panic call that never returns doesn't count as a call)
 - [ ] Return `!T`, `?T` and small structs in registers (x0–x3 / d0–d3) instead of through a hidden pointer
-- [ ] Jump tables for dense `switch`es. They're compare chains today.
+- [x] Jump tables for dense `switch`es. They're compare chains today. Now an `ir.Switch` when there are 4+ cases covering at least 40% of a span of at most 1024 values
 - [ ] Loop-invariant code motion
 - [ ] Remove bounds checks in more loop shapes. n-body now costs nothing extra (0.90s checked vs 0.92s unchecked), but indexing with a loop-invariant offset still checks every time.
 - [ ] Register allocation:
   - [ ] remove redundant `mov`s where control flow joins
   - [ ] split live intervals instead of spilling whole ones. This is most of what overflow checks cost today: in n-body the `i + 1` overflow check lengthens the outer counter's interval and it gets spilled, so `-O2` runs 1.87s vs 1.57s for `-O2 --overflow=wrap`. The inner loop has no extra checks.
   - [ ] use x0–x7 for values that don't cross calls
-- [ ] Leaf functions without a frame
 - [ ] Keep `@Vector` values in SIMD registers between operations (today each operation loads, computes and stores)
 - [ ] Ryu-style shortest float formatting: string building with floats is ~2× slower than Node
 - [ ] An x86-64 / Linux (ELF) backend

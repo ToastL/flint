@@ -95,12 +95,24 @@ fn emitFunc(f: *ir.IRFunc, idx: usize) {
         }
     }
     A.frame_size = (cursor + 15) & ~15;
+    // a leaf with nothing in its frame needs no frame record: nothing is addressed from x29. A
+    // call that never comes back (the panic of a failed check) doesn't stop a function being a
+    // leaf, since what it overwrites (x30, caller-saved registers) is never used again.
+    A.frameless = A.frame_size == 0;
+    for (A.order.items) |b| {
+        let insts = f.blocks.items[b as usize].insts.items;
+        for (0..insts.len) |i| {
+            if (ir.hasArgs(&insts[i]) && !A.diesAt(insts, i)) { A.frameless = false; }
+        }
+    }
 
     A.O.add("\n\t.p2align 2\n");
     if (f.is_main || f.exported) { A.O.addf("\t.globl {s}\n", .{f.sym}); }
     A.O.addf("{s}:\n", .{f.sym});
-    E("stp x29, x30, [sp, #-16]!", .{});
-    E("mov x29, sp", .{});
+    if (!A.frameless) {
+        E("stp x29, x30, [sp, #-16]!", .{});
+        E("mov x29, sp", .{});
+    }
     if (A.frame_size != 0) {
         if (A.frame_size <= 4095) {
             E("sub sp, sp, #{}", .{A.frame_size});
@@ -131,6 +143,7 @@ fn emitFunc(f: *ir.IRFunc, idx: usize) {
             i += 1;
         }
     }
+    if (A.frameless && !(f.is_main && f.retcls == .None)) { return; } // every Ret was a ret
     A.O.addf("Lret{}:\n", .{A.FN});
     if (f.is_main && f.retcls == .None) { E("mov x0, #0", .{}); }
     off = 0;
@@ -142,8 +155,10 @@ fn emitFunc(f: *ir.IRFunc, idx: usize) {
         off += 8;
         E("ldur {s}, [x29, #{}]", .{A.D(r), 0 - off});
     }
-    E("mov sp, x29", .{});
-    E("ldp x29, x30, [sp], #16", .{});
+    if (!A.frameless) {
+        E("mov sp, x29", .{});
+        E("ldp x29, x30, [sp], #16", .{});
+    }
     E("ret", .{});
 }
 

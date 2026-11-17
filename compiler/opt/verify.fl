@@ -58,6 +58,10 @@ fn checkInst(f: *ir.IRFunc, b: usize, in: *const ir.Inst, after: []const u8) {
         if (!targetOk(f, in.t1)) { fail(f, b, after, text.f("jumps to b{}, which isn't a live block", .{in.t1})); }
     }
     if (in.op == .Br && !targetOk(f, in.t2)) { fail(f, b, after, text.f("branches to b{}, which isn't a live block", .{in.t2})); }
+    if (in.op == .Switch) {
+        if (in.regs.len == 0) { fail(f, b, after, "a switch with no targets"); }
+        for (in.regs) |t| { if (!targetOk(f, t)) { fail(f, b, after, text.f("a switch jumps to b{}, which isn't a live block", .{t})); } }
+    }
 }
 
 pub fn func(f: *ir.IRFunc, after: []const u8) {

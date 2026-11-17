@@ -1,0 +1,22 @@
+// Indexing with a loop-invariant offset (xs[i + k]): today every access is bounds checked.
+
+import std.io;
+
+fn smooth(dst: []f64, src: []const f64, k: usize) {
+    for (0..dst.len) |i| {
+        dst[i] = (src[i + k - 1] + src[i + k] + src[i + k + 1]) * (1.0 / 3.0);
+    }
+}
+
+fn main() -> !void {
+    var a: [4096]f64 = undefined;
+    var b: [4096]f64 = undefined;
+    for (0..a.len) |i| { a[i] = (i % 17) as f64; }
+    for (0..60000) |_| {
+        smooth(b[0..4000], &a, 2);
+        smooth(a[0..4000], &b, 2);
+    }
+    var s: f64 = 0.0;
+    for (a) |x| { s += x; }
+    try io.print("{d:.6}\n", .{s});
+}

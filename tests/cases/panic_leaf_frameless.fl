@@ -1,0 +1,13 @@
+// flint: -O2
+// A leaf function without a frame still panics properly: the call to the runtime's panic never
+// comes back, so it needs no frame record.
+
+import std.io;
+
+fn at(xs: []const i64, i: usize) -> i64 { return xs[i] * 2; }
+
+fn main() -> !void {
+    let xs = [_]i64 { 1, 2, 3 };
+    try io.print("{}\n", .{at(&xs, 2)});
+    try io.print("{}\n", .{at(&xs, 3)});
+}

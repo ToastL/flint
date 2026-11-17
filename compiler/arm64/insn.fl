@@ -21,6 +21,13 @@ pub var usecnt: []i32 = @zeroes([]i32);
 pub var saved_int: alloc.Vec(i32) = @zeroes(alloc.Vec(i32));
 pub var saved_fp: alloc.Vec(i32) = @zeroes(alloc.Vec(i32));
 pub var frame_size: i32 = 0;
+pub var frameless: bool = false; // a leaf with nothing in its frame: no frame record, x29 isn't set
+
+// insts[i] is a call that never comes back: the trap that ends the block comes right after it
+// (an asm block never counts: it may be followed by anything)
+pub fn diesAt(insts: []const ir.Inst, i: usize) -> bool {
+    return insts[i].op == .Call && i + 1 < insts.len && insts[i + 1].op == .Trap;
+}
 
 pub let CCN = [_][]const u8 { "eq", "ne", "lt", "le", "gt", "ge", "lo", "ls", "hi", "hs", "mi", "pl" };
 pub let CCINV = [_]ir.CC { .NE, .EQ, .GE, .GT, .LE, .LT, .HS, .HI, .LS, .LO, .PL, .MI };

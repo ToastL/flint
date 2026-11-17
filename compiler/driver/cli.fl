@@ -493,7 +493,7 @@ pub fn main(argv: []const []const u8) -> u8 {
     if (term.when == .Always) { _ = setenv(text.z("FLINT_COLOR"), text.z("always"), 1); }
     if (term.when == .Never) { _ = setenv(text.z("FLINT_COLOR"), text.z("never"), 1); }
     var job = build.Job {
-        asm_text: asm_text, has_asm: m.has_asm, objects: o.objects.items, libs: o.libs.items, cache: o.cache,
+        name: pkg.name, asm_text: asm_text, has_asm: m.has_asm, objects: o.objects.items, libs: o.libs.items, cache: o.cache,
         out: exe, keep: is_build, run: !is_build, prog_args: o.prog_args,
     };
     return build.build(&job);

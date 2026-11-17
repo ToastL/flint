@@ -36,6 +36,8 @@ pub enum Op {
     Asm,     // inline assembly: sym = its text; args[i] (class argcls[i]) is in register regs[i] when
              // it starts. Like a call, it may overwrite every caller-saved register
     AsmOut,  // dst = register imm (x<imm>, or d/s<imm> by cls) as the Asm just before left it
+    Switch,  // jump to block regs[a]: a is an index that's already known to be in range (a
+             // terminator, for dense `switch`es; the backend makes it a jump table)
 }
 
 // Vec operations. Splat: every lane of [a] = b (a scalar of class cls); Neg: [a] = -[b]
@@ -71,7 +73,7 @@ pub struct Inst {
     args: []Opd,
     argcls: []Cls,
     nfixed: i32,   // args past nfixed are C varargs
-    regs: []i32,   // Asm: the register each argument goes in
+    regs: []i32,   // Asm: the register each argument goes in. Switch: the target of each index
     tok: ?*token.Token, // the source it came from (for errors found when it runs at compile time)
 }
 
@@ -151,11 +153,11 @@ pub fn instUses(in: *const Inst, out: *alloc.Vec(i32)) {
     if (in.c.k == .Reg) { out.push(in.c.v as i32); }
 }
 
-pub fn isTerm(in: *const Inst) -> bool { return in.op == .Jmp || in.op == .Br || in.op == .Ret || in.op == .Trap; }
+pub fn isTerm(in: *const Inst) -> bool { return in.op == .Jmp || in.op == .Br || in.op == .Switch || in.op == .Ret || in.op == .Trap; }
 
 pub fn hasEffects(in: *const Inst) -> bool {
     switch (in.op) {
-        .Store, .Call, .Asm, .Memcpy, .Memzero, .Vec, .Jmp, .Br, .Ret, .Trap => { return true; }
+        .Store, .Call, .Asm, .Memcpy, .Memzero, .Vec, .Jmp, .Br, .Switch, .Ret, .Trap => { return true; }
         else => { return false; }
     }
 }
@@ -171,7 +173,20 @@ pub fn succs(b: *const Block, out: *alloc.Vec(i32)) {
     } else if (t.op == .Br) {
         out.push(t.t1);
         if (t.t2 != t.t1) { out.push(t.t2); }
+    } else if (t.op == .Switch) {
+        for (t.regs) |x| {
+            var seen = false;
+            for (out.items) |y| { if (y == x) { seen = true; } }
+            if (!seen) { out.push(x); }
+        }
     }
+}
+
+// changes every jump of terminator t to block `from` into a jump to `to`
+pub fn retarget(t: *Inst, from: i32, to: i32) {
+    if ((t.op == .Jmp || t.op == .Br) && t.t1 == from) { t.t1 = to; }
+    if (t.op == .Br && t.t2 == from) { t.t2 = to; }
+    if (t.op == .Switch) { for (0..t.regs.len) |k| { if (t.regs[k] == from) { t.regs[k] = to; } } }
 }
 
 pub fn newVreg(f: *IRFunc, cls: Cls) -> i32 {

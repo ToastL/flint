@@ -1,0 +1,39 @@
+// A bytecode interpreter: a dense `switch` on the opcode in a hot loop (jump tables).
+
+import std.io;
+
+fn run(code: []const u8, iters: i64) -> i64 {
+    var stack: [16]i64 = undefined;
+    var sp: usize = 0;
+    var pc: usize = 0;
+    var count = iters;
+    var acc: i64 = 0;
+    while (true) {
+        let op = code[pc];
+        pc += 1;
+        switch (op) {
+            0 => { stack[sp] = code[pc] as i64; sp += 1; pc += 1; }
+            1 => { sp -= 1; stack[sp - 1] +%= stack[sp]; }
+            2 => { sp -= 1; stack[sp - 1] -%= stack[sp]; }
+            3 => { sp -= 1; stack[sp - 1] *%= stack[sp]; }
+            4 => { stack[sp] = stack[sp - 1]; sp += 1; }
+            5 => { let t = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = t; }
+            6 => { sp -= 1; acc +%= stack[sp]; }
+            7 => { stack[sp - 1] +%= 1; }
+            8 => { stack[sp - 1] -%= 1; }
+            9 => {
+                count -= 1;
+                if (count > 0) { pc = code[pc] as usize; } else { pc += 1; }
+            }
+            10 => { return acc; }
+            else => {}
+        }
+    }
+    return acc;
+}
+
+fn main() -> !void {
+    // push 3, push 4, mul, dup, inc, add, push 7, swap, sub, dec, nop, drop, jnz 0, halt
+    let code = [_]u8 { 0, 3, 0, 4, 3, 4, 7, 1, 0, 7, 5, 2, 8, 11, 6, 9, 0, 10 };
+    try io.print("{}\n", .{run(&code, 30000000)});
+}

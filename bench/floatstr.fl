@@ -1,0 +1,16 @@
+// Building strings with floats in them: shortest round-trip formatting of f64 (Ryu).
+
+import std.io;
+import std.fmt;
+
+fn main() -> !void {
+    var buf: [256]u8 = undefined;
+    var total: usize = 0;
+    var x: f64 = 0.1;
+    for (0..700000) |i| {
+        let s = try fmt.bufPrint(&buf, "p{}=({d}, {d})", .{ i, x, x * 1e-7 + 3.0 });
+        total += s.len;
+        x = x * 1.0000001 + 0.37;
+    }
+    try io.print("{}\n", .{total});
+}

@@ -12,6 +12,10 @@ struct Acc {
     vreg: i32,
 }
 
+// an access's size and signedness; for 8 bytes the sign means nothing (a slice's length is stored
+// as a usize and read as an i64, and that's still the same value)
+fn kind(mem: i32) -> i32 { return if ((mem & 0x7f) == 8) 8 else mem; }
+
 pub fn promote(f: *ir.IRFunc) {
     let ns = f.slots.items.len;
     if (ns == 0) { return; }
@@ -25,7 +29,7 @@ pub fn promote(f: *ir.IRFunc) {
                 var found: ?usize = null;
                 for (0..acc[s].items.len) |k| { if (found == null && acc[s].items[k].off == in.imm) { found = k; } }
                 if (found) |k| {
-                    if (acc[s].items[k].mem != in.mem || acc[s].items[k].cls != in.cls) { esc[s] = true; }
+                    if (kind(acc[s].items[k].mem) != kind(in.mem) || acc[s].items[k].cls != in.cls) { esc[s] = true; }
                 } else {
                     acc[s].push(Acc { off: in.imm, mem: in.mem, cls: in.cls, vreg: -1 });
                 }

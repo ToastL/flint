@@ -244,11 +244,6 @@ pub fn analyze(f: *ir.IRFunc) -> Info {
     return li;
 }
 
-fn retarget(t: *ir.Inst, from: i32, to: i32) {
-    if ((t.op == .Jmp || t.op == .Br) && t.t1 == from) { t.t1 = to; }
-    if (t.op == .Br && t.t2 == from) { t.t2 = to; }
-}
-
 // The block that every entry into loop l comes through: an existing predecessor outside the loop
 // whose only successor is the header, or a new block that just jumps to it (laid out right before
 // the header). -1 when the header is the entry block, which can't get one. cfg.simplify threads
@@ -282,7 +277,7 @@ pub fn ensurePreheader(f: *ir.IRFunc, li: *const Info, l: usize) -> i32 {
     let pre = (f.blocks.items.len - 1) as i32;
     for (outside.items) |p| {
         let pb = &f.blocks.items[p as usize];
-        retarget(&pb.insts.items[pb.insts.items.len - 1], h, pre);
+        ir.retarget(&pb.insts.items[pb.insts.items.len - 1], h, pre);
     }
     return pre;
 }

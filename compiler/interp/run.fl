@@ -360,6 +360,11 @@ pub fn exec(f: *ir.IRFunc, args: []const i64, argcls: []const ir.Cls, nfixed: us
                 .VReduce => { v[d] = try vecReduce(in, v); }
                 .Jmp => { next = in.t1; }
                 .Br => { next = if (opv(in.a, v) != 0) in.t1 else in.t2; }
+                .Switch => {
+                    let k = @bitcast(u64, opv(in.a, v));
+                    if (k >= in.regs.len as u64) { return mem.fail(null, "internal error: switch index out of range"); }
+                    next = in.regs[k as usize];
+                }
                 .Ret => {
                     if (in.a.k != .None) { result = if (in.cls == .I) opv(in.a, v) else v[in.a.v as usize]; }
                     let reg = mem.regs.items[fr as usize];

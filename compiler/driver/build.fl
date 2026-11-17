@@ -5,6 +5,10 @@
 // With --cache the steps' outputs stay in that directory, and a step whose inputs are the ones
 // it last ran with is skipped (driver.cache). Without it the build happens in a temporary
 // directory that's removed afterwards.
+//
+// The same program builds to the same bytes, wherever it's written: macOS's linker names the
+// code signature after the output file, and the UUID is a hash of the contents, so the program
+// is always linked under its own name (Job.name) and then moved to where it was asked for.
 
 import std.fs;
 import std.hash;
@@ -14,7 +18,10 @@ import base.text;
 import base.cmdline;
 import driver.cache;
 
+extern fn rename(from: cstr, to: cstr) -> i32;
+
 pub struct Job {
+    name: []const u8,    // the program's name: the file it's linked as (see above)
     asm_text: []const u8,
     has_asm: bool, // some of it was written by hand, in asm blocks
     objects: []const []const u8, // --object: linked with the program
@@ -51,19 +58,23 @@ fn assemble(j: *Job, dir: []const u8, cached: bool) -> ?[]const u8 {
     return key;
 }
 
+fn baseName(p: []const u8) -> []const u8 { return if (text.lastIndexOf(p, '/')) |s| p[s + 1..] else p; }
+
 // prog.o and the objects -> the executable; false if the linker failed
 fn link(j: *Job, dir: []const u8, cached: bool, prog_key: []const u8, exe: []const u8) -> bool {
+    let direct = text.eq(baseName(exe), j.name);
+    let target = if (direct) exe else text.f("{s}/{s}", .{dir, j.name});
     var ld: alloc.Vec([]const u8) = .{};
     ld.push("cc");
     ld.push("-o");
-    ld.push(exe);
+    ld.push(target);
     ld.push(text.f("{s}/prog.o", .{dir}));
     for (j.objects) |o| { ld.push(o); }
     for (j.libs) |l| { ld.push(text.f("-l{s}", .{l})); }
     let kpath = text.f("{s}/link.key", .{dir});
     var key: []const u8 = "";
-    if (cached) { // the command, the program, and what's in each object
-        var h = cache.mix(cache.ofStrings(ld.items), prog_key);
+    if (cached) { // the command, where it goes, the program, and what's in each object
+        var h = cache.mix(cache.mix(cache.ofStrings(ld.items), exe), prog_key);
         for (j.objects) |o| { h = cache.mix(h, cache.ofFile(o)); }
         key = cache.hex(h);
         if (fs.exists(exe) && text.eq(cache.read(kpath), key)) { return true; }
@@ -72,6 +83,14 @@ fn link(j: *Job, dir: []const u8, cached: bool, prog_key: []const u8, exe: []con
     if (cmdline.run(ld.items) != 0) {
         _ = cmdline.fail("linking failed", "");
         return false;
+    }
+    if (!direct && rename(text.z(target), text.z(exe)) != 0) {
+        // another file system: copy it (cp keeps it executable)
+        if (cmdline.run(&[_][]const u8 { "cp", target, exe }) != 0) {
+            _ = cmdline.fail(text.f("can't write {s}", .{exe}), "");
+            return false;
+        }
+        fs.remove(target) catch {};
     }
     if (cached) { cache.write(kpath, key); }
     return true;
@@ -88,7 +107,7 @@ pub fn build(j: *Job) -> u8 {
         let tdir = fs.makeTempDir("flint-", tbuf[..]) catch return cmdline.fail("can't create a temp directory", "");
         dir = alloc.dupe(u8, tdir);
     }
-    let exe = if (j.out.len > 0) j.out else text.f("{s}/prog", .{dir});
+    let exe = if (j.out.len > 0) j.out else text.f("{s}/{s}", .{dir, j.name});
     let key = assemble(j, dir, cached) orelse return 1;
     if (!link(j, dir, cached, key, exe)) { return 1; }
     var status: u8 = 0;

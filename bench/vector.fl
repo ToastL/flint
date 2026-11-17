@@ -1,0 +1,27 @@
+// An @Vector kernel: a chain of vector operations per element (SIMD values in registers).
+
+import std.io;
+
+fn kernel(xs: []@Vector(4, f32), iters: usize) -> f32 {
+    let k1: @Vector(4, f32) = @splat(0.999);
+    let k2: @Vector(4, f32) = @splat(0.001);
+    var acc: @Vector(4, f32) = @splat(0.0);
+    for (0..iters) |_| {
+        for (xs) |*x| {
+            let y = x.* * k1 + k2;
+            let z = y * y - y * k2;
+            x.* = y;
+            acc = acc + z;
+        }
+    }
+    return @reduceAdd(acc);
+}
+
+fn main() -> !void {
+    var xs: [256]@Vector(4, f32) = undefined;
+    for (0..xs.len) |i| {
+        let f = i as f32;
+        xs[i] = .{ f, f + 0.25, f + 0.5, f + 0.75 };
+    }
+    try io.print("{d:.3}\n", .{kernel(&xs, 600000)});
+}

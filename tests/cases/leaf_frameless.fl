@@ -1,0 +1,36 @@
+// Leaf functions (no calls, nothing spilled) get no frame record: arguments that came on the stack
+// are read from sp, and every return is just `ret`.
+
+import std.io;
+
+fn add3(a: i64, b: i64, c: i64) -> i64 { return a + b * c; }
+
+// arguments 9 and 10 (integer) and 9 (float) are passed on the stack
+fn many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64) -> i64 {
+    return a + b + c + d + e + f + g + h + i * 100 + j * 1000;
+}
+
+fn fmany(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, i: f64, n: i64) -> f64 {
+    return a + b + c + d + e + f + g + h + i * 10.0 + n as f64;
+}
+
+// several returns, a loop, no calls
+fn classify(x: i64) -> i64 {
+    if (x < 0) { return -1; }
+    var n: i64 = 0;
+    var v = x;
+    while (v > 9) {
+        v /= 10;
+        n += 1;
+    }
+    if (n == 0) { return 0; }
+    return n;
+}
+
+fn main() -> !void {
+    try io.print("{} {}\n", .{ add3(1, 2, 3), many(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) });
+    try io.print("{d}\n", .{fmany(1, 2, 3, 4, 5, 6, 7, 8, 9, 42)});
+    try io.print("{} {} {} {}\n", .{ classify(-5), classify(7), classify(12345), classify(100) });
+    let fp = many;
+    try io.print("{}\n", .{fp(0, 0, 0, 0, 0, 0, 0, 0, 1, 1)});
+}

@@ -136,13 +136,14 @@ pub fn emitInst(in: *const ir.Inst, nx: ?*const ir.Inst, b: i32, last_in_func: b
         .Nop => { return false; }
         .GetArg => {
             if (in.imm >= 1000) { // past the 8 argument registers: on the caller's stack, just above our frame record
-                let off = 16 + 8 * (in.imm - 1000);
+                let off = if (A.frameless) 8 * (in.imm - 1000) else 16 + 8 * (in.imm - 1000);
+                let base = if (A.frameless) "sp" else "x29";
                 if (in.cls == .I) {
                     d = A.di(in.dst);
-                    E("ldr {s}, [x29, #{}]", .{X(d), off});
+                    E("ldr {s}, [{s}, #{}]", .{X(d), base, off});
                 } else {
                     d = A.df(in.dst);
-                    E("ldr {s}, [x29, #{}]", .{A.FR(d, in.cls), off});
+                    E("ldr {s}, [{s}, #{}]", .{A.FR(d, in.cls), base, off});
                 }
                 A.fin(in.dst, d);
                 return false;
@@ -432,7 +433,22 @@ pub fn emitInst(in: *const ir.Inst, nx: ?*const ir.Inst, b: i32, last_in_func: b
             if (in.a.k != .None) {
                 if (in.cls == .I) { A.intoInt(0, in.a); } else { A.intoFp(0, in.a, in.cls); }
             }
-            if (!last_in_func) { E("b Lret{}", .{A.FN}); }
+            if (A.frameless && !(A.F.is_main && A.F.retcls == .None)) {
+                E("ret", .{}); // the whole epilogue (main returning nothing still sets x0 there)
+            } else if (!last_in_func) {
+                E("b Lret{}", .{A.FN});
+            }
+        }
+        .Switch => {
+            // a table of 32-bit offsets from the table to each target, right after the branch
+            let ri = A.gi(in.a, 16);
+            E("adr x17, Ljt{}_{}", .{A.FN, b});
+            E("ldrsw x16, [x17, {s}, lsl #2]", .{X(ri)});
+            E("add x17, x17, x16", .{});
+            E("br x17", .{});
+            A.O.addf("\t.p2align 2\n\t.data_region jt32\nLjt{}_{}:\n", .{A.FN, b});
+            for (in.regs) |t| { A.O.addf("\t.long Lb{}_{} - Ljt{}_{}\n", .{A.FN, t, A.FN, b}); }
+            A.O.add("\t.end_data_region\n");
         }
         .Trap => { E("brk #1", .{}); }
         .Vec => { emitVec(in); }

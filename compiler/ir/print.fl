@@ -12,7 +12,7 @@ let OPNAME = [_][]const u8 {
     "cmp", "fcmp", "sel", "ext", "scvtf", "ucvtf", "fcvtzs", "fcvtzu", "fcvt",
     "load", "store", "addrslot", "addrsym", "call", "memcpy", "memzero",
     "jmp", "br", "ret", "trap",
-    "smulh", "umulh", "vec", "vreduce", "asm", "asmout",
+    "smulh", "umulh", "vec", "vreduce", "asm", "asmout", "switch",
 };
 let VOPNAME = [_][]const u8 { "add", "sub", "mul", "div", "and", "or", "xor", "neg", "splat" };
 let CCNAME = [_][]const u8 { "eq", "ne", "lt", "le", "gt", "ge", "lo", "ls", "hi", "hs", "mi", "pl" };
@@ -79,6 +79,13 @@ fn inst(o: *text.Buf, in: *const ir.Inst) {
             if (in.c.k != .None) { o.add(", "); opd(o, in.c); }
         }
         .Jmp => { o.addf(" b{}", .{in.t1}); }
+        .Switch => {
+            o.add(" ");
+            opd(o, in.a);
+            o.add(", [");
+            for (0..in.regs.len) |k| { o.addf("{s}b{}", .{if (k > 0) " " else "", in.regs[k]}); }
+            o.add("]");
+        }
         .Br => {
             o.add(" ");
             opd(o, in.a);

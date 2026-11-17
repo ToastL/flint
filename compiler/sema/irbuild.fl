@@ -78,6 +78,20 @@ pub fn br(c: ir.Opd, t: i32, f: i32) {
     i.t2 = f;
 }
 
+// jump to targets[idx]; idx must already be known to be in range
+pub fn switchTo(idx: ir.Opd, targets: []i32) {
+    let i = emit(.Switch);
+    i.a = idx;
+    i.regs = targets;
+}
+
+// a block that turned out not to be needed (nothing jumps to it any more)
+pub fn killBlock(b: i32) {
+    let blk = &blocks().items[b as usize];
+    blk.dead = true;
+    blk.insts.truncate(0);
+}
+
 pub fn op1(op: ir.Op, cls: ir.Cls, a: ir.Opd) -> i32 {
     let r = newVreg(cls);
     let i = emit(op);

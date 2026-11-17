@@ -141,7 +141,9 @@ pub fn regalloc() {
             ir.instUses(in, &u);
             for (u.items) |x| { ext(start, end, x as usize, p); }
             if (in.dst >= 0) { ext(start, end, in.dst as usize, p); }
-            if (ir.hasArgs(in)) { calls.push(p); } // an asm block clobbers what a call does
+            // an asm block clobbers what a call does; a call that never comes back clobbers
+            // nothing that's used later
+            if (ir.hasArgs(in) && !A.diesAt(insts, i)) { calls.push(p); }
         }
     }
     var ivs: alloc.Vec(Iv) = .{};

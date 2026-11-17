@@ -44,6 +44,23 @@ pub fn simplify(f: *ir.IRFunc) -> bool {
                 ch = true;
             }
         }
+        if (t.op == .Switch) {
+            var same = true;
+            for (0..t.regs.len) |k| {
+                let nt = thread(f, t.regs[k]);
+                if (nt != t.regs[k]) {
+                    t.regs[k] = nt;
+                    ch = true;
+                }
+                if (t.regs[k] != t.regs[0]) { same = false; }
+            }
+            if (same) { // every index goes to the same place
+                t.op = .Jmp;
+                t.t1 = t.regs[0];
+                t.a.k = .None;
+                ch = true;
+            }
+        }
     }
     let nb = f.blocks.items.len;
     let seen = alloc.make(bool, nb + 1);

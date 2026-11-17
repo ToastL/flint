@@ -130,5 +130,9 @@ pub fn check(mode: []const u8) {
     let a = asmOf(FLINTC, mode, "build/check/stage2.s");
     let b = asmOf("build/check/stage3", mode, "build/check/stage3.s");
     if (!sys.eq(a, b)) { sys.die("not a fixpoint: build/check/stage2.s and build/check/stage3.s differ"); }
-    sys.say("fixpoint: build/flintc and build/check/stage3 produce the same compiler\n", .{});
+    // the same program builds to the same bytes, wherever it's written
+    if (!sys.eq(sys.read(FLINTC), sys.read("build/check/stage3"))) {
+        sys.die("the assembly is a fixpoint, but build/flintc and build/check/stage3 aren't the same file");
+    }
+    sys.say("fixpoint: build/flintc and build/check/stage3 produce the same compiler, and are the same file\n", .{});
 }

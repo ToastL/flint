@@ -202,6 +202,13 @@ pub fn run(f: *ir.IRFunc) -> bool {
                         in.a.k = .None;
                     }
                 }
+                .Switch => {
+                    if (s.sub(&in.a) && in.a.v >= 0 && in.a.v < in.regs.len as i64) {
+                        in.op = .Jmp;
+                        in.t1 = in.regs[in.a.v as usize];
+                        in.a.k = .None;
+                    }
+                }
                 .Sel => {
                     if (s.sub(&in.a)) {
                         in.op = .Mov;

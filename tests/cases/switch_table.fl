@@ -1,0 +1,120 @@
+// Dense switches become jump tables (4 or more cases, at least 40% of the span covered); sparse
+// ones stay a chain of compares. Both must behave the same, at run time and at compile time.
+
+import std.io;
+
+enum Op { Push, Pop, Add, Sub, Mul, Div, Halt }
+
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+    Tri(f64, f64),
+    Dot,
+    Line(f64),
+}
+
+error Fail { A, B, C, D, E }
+
+fn opName(op: Op) -> []const u8 {
+    return switch (op) {
+        .Push => "push", .Pop => "pop", .Add => "add", .Sub => "sub",
+        .Mul => "mul", .Div => "div", .Halt => "halt",
+    };
+}
+
+fn area(s: Shape) -> f64 {
+    return switch (s) {
+        .Circle(r) => 3.0 * r * r,
+        .Rect(rc) => rc.w * rc.h,
+        .Tri(b, h) => b * h / 2.0,
+        .Dot => 0,
+        .Line(_) => 0,
+    };
+}
+
+// negative values, ranges, gaps that go to else
+fn dense(x: i32) -> i32 {
+    switch (x) {
+        -3 => { return 10; }
+        -2, -1 => { return 11; }
+        0..=2 => { return 12; }
+        4 => { return 13; }
+        6..=7 => { return 14; }
+        else => { return -1; }
+    }
+}
+
+// too spread out for a table
+fn sparse(x: u32) -> u32 {
+    return switch (x) {
+        1 => 1, 100 => 2, 10000 => 3, 1000000 => 4, 4000000000 => 5,
+        else => 0,
+    };
+}
+
+// every u8 handled without else: the table covers all 256 values
+fn byteClass(c: u8) -> u8 {
+    return switch (c) {
+        0..=31 => 'c', '0'..='9' => 'd', 'A'..='Z' => 'u', 'a'..='z' => 'l',
+        32..='/', ':'..='@', '['..='`', '{'..=255 => 'p',
+    };
+}
+
+// cases at the top of u64
+fn top(x: u64) -> u64 {
+    return switch (x) {
+        0xfffffffffffffffc => 1, 0xfffffffffffffffd => 2,
+        0xfffffffffffffffe => 3, 0xffffffffffffffff => 4,
+        else => 0,
+    };
+}
+
+fn errName(e: Fail) -> []const u8 {
+    return switch (e) {
+        error.A => "a", error.B => "b", error.C => "c", error.D => "d", error.E => "e",
+    };
+}
+
+// fallthrough between table targets
+fn steps(x: u8) -> i64 {
+    var n: i64 = 0;
+    switch (x) {
+        0 => { n += 1; fallthrough; }
+        1 => { n += 10; fallthrough; }
+        2 => { n += 100; }
+        3 => { n += 1000; }
+        else => {}
+    }
+    return n;
+}
+
+let AT_COMPILE_TIME = comptime dense(-2) * 100 + dense(7);
+let NAME_AT_COMPILE_TIME = comptime opName(.Div);
+
+fn main() -> !void {
+    let ops = [_]Op { .Push, .Pop, .Add, .Sub, .Mul, .Div, .Halt };
+    for (ops) |op| { try io.print("{s} ", .{opName(op)}); }
+    try io.print("\n", .{});
+    let shapes = [_]Shape { .Circle(1.0), .Rect { w: 2, h: 3 }, .Tri(4, 5), .Dot, .Line(9) };
+    for (shapes) |s| { try io.print("{d} ", .{area(s)}); }
+    try io.print("\n", .{});
+    var x: i32 = -5;
+    while (x <= 9) {
+        try io.print("{} ", .{dense(x)});
+        x += 1;
+    }
+    try io.print("\n", .{});
+    let ss = [_]u32 { 0, 1, 2, 100, 10000, 1000000, 4000000000, 4294967295 };
+    for (ss) |s| { try io.print("{} ", .{sparse(s)}); }
+    try io.print("\n", .{});
+    for ("\x07 Az09~\xff") |c| { try io.print("{c}", .{byteClass(c)}); }
+    try io.print("\n", .{});
+    let ts = [_]u64 { 0, 0xfffffffffffffffb, 0xfffffffffffffffc, 0xfffffffffffffffe, 0xffffffffffffffff };
+    for (ts) |t| { try io.print("{} ", .{top(t)}); }
+    try io.print("\n", .{});
+    let es = [_]Fail { error.E, error.A, error.C };
+    for (es) |e| { try io.print("{s} ", .{errName(e)}); }
+    try io.print("\n", .{});
+    for (0..5) |i| { try io.print("{} ", .{steps(i as u8)}); }
+    try io.print("\n{} {s}\n", .{ AT_COMPILE_TIME, NAME_AT_COMPILE_TIME });
+}
